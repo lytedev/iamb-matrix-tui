@@ -172,6 +172,13 @@ impl RoomState {
         }
     }
 
+    pub fn accept_completion(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) -> bool {
+        match self {
+            RoomState::Chat(chat) => chat.accept_completion(ctx, store),
+            RoomState::Space(_) => false,
+        }
+    }
+
     fn draw_invite(
         &self,
         invited: MatrixRoom,

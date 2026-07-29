@@ -427,6 +427,17 @@ impl IambWindow {
         }
     }
 
+    /// Take the highlighted entry from this window's completion popup, if it has one open.
+    ///
+    /// Returns whether there was anything to take, so that a key bound to this can fall back to
+    /// doing whatever it would otherwise have done.
+    pub fn accept_completion(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) -> bool {
+        match self {
+            IambWindow::Room(w) => w.accept_completion(ctx, store),
+            _ => false,
+        }
+    }
+
     pub fn focus_toggle(&mut self) {
         if let IambWindow::Room(w) = self {
             w.focus_toggle()

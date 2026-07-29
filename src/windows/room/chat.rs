@@ -189,6 +189,28 @@ impl ChatState {
         let _ = self.tbox.editor_command(&show, ctx, store);
     }
 
+    /// Take the highlighted entry from the message bar's completion popup, if one is open.
+    ///
+    /// Returns whether there was a popup to take from. This is the same thing `<C-N>` does, so
+    /// that a key can offer it without having to know which popup is showing.
+    pub fn accept_completion(
+        &mut self,
+        ctx: &ProgramContext,
+        store: &mut ProgramStore,
+    ) -> bool {
+        if self.focus != RoomFocus::MessageBar || self.tbox.get_completions().is_none() {
+            return false;
+        }
+
+        let take = EditorAction::Complete(
+            CompletionStyle::List(MoveDir1D::Next),
+            CompletionType::Auto,
+            CompletionDisplay::List,
+        );
+
+        self.tbox.editor_command(&take, ctx, store).is_ok()
+    }
+
     fn get_joined(&self, worker: &Requester) -> Result<MatrixRoom, IambError> {
         let Some(room) = worker.client.get_room(self.id()) else {
             return Err(IambError::NotJoined);

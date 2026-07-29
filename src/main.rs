@@ -585,6 +585,25 @@ impl Application {
         }
 
         let info = match action {
+            IambAction::AcceptCompletion => {
+                let took = match self.screen.current_window_mut() {
+                    Ok(window) => window.accept_completion(&ctx, store),
+                    Err(_) => false,
+                };
+
+                if !took {
+                    // No popup to take anything from, so <Tab> means what it usually means.
+                    let tab = InsertTextAction::Type(
+                        Char::Single('\t').into(),
+                        MoveDir1D::Previous,
+                        1.into(),
+                    );
+
+                    self.action_prepend(vec![(Action::from(tab), ctx)]);
+                }
+
+                None
+            },
             IambAction::ClearUnreads => {
                 let user_id = &store.application.settings.profile.user_id;
 

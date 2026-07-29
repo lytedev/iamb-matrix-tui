@@ -93,6 +93,14 @@ pub const IAMB_BINDINGS: &[IambBinding] = &[
         actions: || vec![IambAction::Room(RoomAction::MarkRead).into()],
     },
     IambBinding {
+        keys: &["<Tab>"],
+        modes: TYPING_MODES,
+        goto: None,
+        command: None,
+        description: "Take the highlighted completion, or type a tab when nothing is offered",
+        actions: || vec![IambAction::AcceptCompletion.into()],
+    },
+    IambBinding {
         keys: &["<C-W>m", "<S-Enter>"],
         modes: TYPING_MODES,
         goto: None,

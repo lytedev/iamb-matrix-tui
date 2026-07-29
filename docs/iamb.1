@@ -357,10 +357,20 @@ so
 will find
 .Dq "Grace Hopper" .
 Press
+.Sy <Tab>
+or
 .Sy <C-N>
-(or
+to take somebody from the list, or
 .Sy <C-P>
-to walk the list backwards) to pick somebody from the list.
+to walk it backwards.
+The list is ordered with the closest match at the top, and that top entry is
+the one taken first, so finishing a name and pressing
+.Sy <Tab>
+picks the person you were typing.
+.Pp
+.Sy <Tab>
+only takes a completion while a list is showing.
+The rest of the time it types a tab, as it always has.
 .Pp
 The list only appears when the
 .Sy @

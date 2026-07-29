@@ -39,7 +39,8 @@ const CONSECUTIVE_MATCH_BONUS: isize = 8;
 /// Added when a needle character matches at the start of the haystack or of a word within it.
 const WORD_START_BONUS: isize = 6;
 
-/// Subtracted for each haystack character skipped over to find a match.
+/// Subtracted for each haystack character that the needle did not match, whether it was skipped
+/// over on the way to a match or left over at the end.
 const SKIPPED_CHAR_PENALTY: isize = 1;
 
 /// The characters that separate words for the purposes of [WORD_START_BONUS].
@@ -94,7 +95,9 @@ impl MentionCandidate {
 ///
 /// This is a subsequence match: every character of the needle has to show up in the haystack, in
 /// order, but not necessarily next to each other. Matches that run together, that start a word, and
-/// that skip less of the haystack score higher. Higher scores are better matches.
+/// that leave less of the haystack unmatched score higher. Higher scores are better matches, so
+/// typing a name in full puts that person at the top: nothing was skipped and nothing was left
+/// over.
 fn fuzzy_score(needle: &str, haystack: &str) -> Option<isize> {
     if needle.is_empty() {
         return Some(0);
@@ -132,7 +135,11 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<isize> {
         }
     }
 
-    Some(score)
+    // Whatever is left of the name after the last match counts against it too, so that a short
+    // name the user has all but finished typing beats a long one that merely starts the same way.
+    let leftover = chars.count() as isize;
+
+    Some(score - leftover * SKIPPED_CHAR_PENALTY)
 }
 
 /// Escape the characters that would otherwise end a Markdown link label early.
@@ -177,7 +184,8 @@ pub fn complete_mentions(needle: &str, candidates: Vec<MentionCandidate>) -> Vec
         .filter_map(|candidate| Some((candidate.score(needle)?, candidate)))
         .collect::<Vec<_>>();
 
-    // Sort by descending score, then by user ID so that equal scores stay in a stable order.
+    // Best match first: that is the one shown at the top of the popup, and the one that <Tab> and
+    // <C-N> take. Equal scores fall back to the user ID so the order is at least stable.
     scored.sort_by(|(a_score, a), (b_score, b)| {
         b_score.cmp(a_score).then_with(|| a.user_id.cmp(&b.user_id))
     });
@@ -293,6 +301,25 @@ mod tests {
         let word_start = fuzzy_score("df", "Daniel Flanagan").unwrap();
         let mid_word = fuzzy_score("df", "Dorothy Vaughan-f").unwrap();
         assert!(word_start > mid_word, "{} should beat {}", word_start, mid_word);
+
+        let whole = fuzzy_score("ada", "ada").unwrap();
+        assert!(whole > prefix, "{} should beat {}", whole, prefix);
+    }
+
+    #[test]
+    fn test_complete_mentions_puts_the_best_match_first() {
+        // The first entry is the one <Tab> and <C-N> take, so the closest match has to be it.
+        let members = vec![
+            candidate(user_id!("@adalovelace:example.com"), None),
+            candidate(user_id!("@ada:example.com"), None),
+            candidate(user_id!("@amanda:example.com"), None),
+        ];
+
+        assert_eq!(complete_mentions("@ada", members), vec![
+            "[@ada:example.com](https://matrix.to/#/@ada:example.com)".to_string(),
+            "[@adalovelace:example.com](https://matrix.to/#/@adalovelace:example.com)".to_string(),
+            "[@amanda:example.com](https://matrix.to/#/@amanda:example.com)".to_string(),
+        ]);
     }
 
     #[test]
