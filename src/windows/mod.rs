@@ -349,6 +349,41 @@ fn thread_prompt(
     }
 }
 
+/// What `:read` should mark read: a room, or one thread within it.
+pub struct ReadTarget {
+    room_id: OwnedRoomId,
+    thread: Option<OwnedEventId>,
+}
+
+/// A list entry that `:read` can act on while it is selected.
+pub trait Readable {
+    fn read_target(&self) -> ReadTarget;
+}
+
+/// Mark the entry selected in a list window read.
+///
+/// This is the list-window counterpart to [RoomState::room_command]'s handling of
+/// [RoomAction::MarkRead], which can only ever act on the focused room.
+fn mark_selection_read<T>(list: &ListState<T, IambInfo>, store: &mut ProgramStore) -> IambResult<()>
+where
+    T: ListItem<IambInfo> + Readable,
+{
+    let Some(item) = list.get() else {
+        return Err(IambError::NoSelectedRoom.into());
+    };
+
+    let ReadTarget { room_id, thread } = item.read_target();
+    let user_id = store.application.settings.profile.user_id.clone();
+
+    let info = store.application.rooms.get_or_default(room_id.clone());
+    info.mark_read(&user_id, thread);
+
+    // Any notification we showed for this room is now stale.
+    store.application.open_notifications.remove(&room_id);
+
+    Ok(())
+}
+
 macro_rules! delegate {
     ($s: expr, $id: ident => $e: expr) => {
         match $s {
@@ -423,10 +458,27 @@ impl IambWindow {
         store: &mut ProgramStore,
     ) -> IambResult<Vec<(Action<IambInfo>, ProgramContext)>> {
         if let IambWindow::Room(w) = self {
-            w.room_command(act, ctx, store).await
-        } else {
-            return Err(IambError::NoSelectedRoomOrSpace.into());
+            return w.room_command(act, ctx, store).await;
         }
+
+        // The list windows have no focused room, but they do have a selected entry, and marking
+        // that entry read is well-defined.
+        if let RoomAction::MarkRead = act {
+            match self {
+                IambWindow::DirectList(l) => mark_selection_read(l, store)?,
+                IambWindow::RoomList(l) => mark_selection_read(l, store)?,
+                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
+                    mark_selection_read(l, store)?
+                },
+                IambWindow::ThreadList(l) => mark_selection_read(l, store)?,
+                IambWindow::UnreadThreadList(l) => mark_selection_read(l, store)?,
+                _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
+            }
+
+            return Ok(vec![]);
+        }
+
+        return Err(IambError::NoSelectedRoomOrSpace.into());
     }
 
     pub async fn send_command(
@@ -1126,6 +1178,15 @@ impl ListItem<IambInfo> for ThreadItem {
     }
 }
 
+impl Readable for ThreadItem {
+    fn read_target(&self) -> ReadTarget {
+        ReadTarget {
+            room_id: self.room_id().to_owned(),
+            thread: Some(self.thread_root.clone()),
+        }
+    }
+}
+
 impl Promptable<ProgramContext, ProgramStore, IambInfo> for ThreadItem {
     fn prompt(
         &mut self,
@@ -1201,6 +1262,12 @@ impl ListItem<IambInfo> for UnreadThreadItem {
 
     fn get_word(&self) -> Option<String> {
         delegate_unread_thread!(self, item => item.get_word())
+    }
+}
+
+impl Readable for UnreadThreadItem {
+    fn read_target(&self) -> ReadTarget {
+        delegate_unread_thread!(self, item => item.read_target())
     }
 }
 
@@ -1324,6 +1391,12 @@ impl ListItem<IambInfo> for GenericChatItem {
     }
 }
 
+impl Readable for GenericChatItem {
+    fn read_target(&self) -> ReadTarget {
+        ReadTarget { room_id: self.room_id().to_owned(), thread: None }
+    }
+}
+
 impl Promptable<ProgramContext, ProgramStore, IambInfo> for GenericChatItem {
     fn prompt(
         &mut self,
@@ -1438,6 +1511,12 @@ impl ListItem<IambInfo> for RoomItem {
     }
 }
 
+impl Readable for RoomItem {
+    fn read_target(&self) -> ReadTarget {
+        ReadTarget { room_id: self.room_id().to_owned(), thread: None }
+    }
+}
+
 impl Promptable<ProgramContext, ProgramStore, IambInfo> for RoomItem {
     fn prompt(
         &mut self,
@@ -1544,6 +1623,12 @@ impl ListItem<IambInfo> for DirectItem {
 
     fn get_word(&self) -> Option<String> {
         self.room_id().to_string().into()
+    }
+}
+
+impl Readable for DirectItem {
+    fn read_target(&self) -> ReadTarget {
+        ReadTarget { room_id: self.room_id().to_owned(), thread: None }
     }
 }
 

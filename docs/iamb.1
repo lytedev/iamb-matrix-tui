@@ -59,6 +59,11 @@ Log out of
 .Nm .
 .It Sy ":read"
 Mark the focused room as read, or just the thread when viewing one.
+In a list window
+.Pq Sy ":rooms" , Sy ":dms" , Sy ":chats" , Sy ":unreads" , Sy ":threads" , Sy ":unreadsandthreads"
+this instead marks the currently selected entry as read.
+Only the selected entry is affected; there is no way to mark a range of entries
+read at once.
 Bound to
 .Sy <C-W>r .
 .It Sy ":read all"
