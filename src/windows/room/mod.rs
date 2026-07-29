@@ -165,6 +165,13 @@ impl RoomState {
         }
     }
 
+    pub fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+        match self {
+            RoomState::Chat(chat) => chat.show_mentions(ctx, store),
+            RoomState::Space(_) => {},
+        }
+    }
+
     fn draw_invite(
         &self,
         invited: MatrixRoom,

@@ -84,9 +84,11 @@ use crate::base::{
     RoomFocus,
     RoomInfo,
     SendAction,
+    MATRIX_ID_WORD,
 };
 
 use crate::config::EncryptionIndicatorLocation;
+use crate::message::mention::MENTION_SIGIL;
 use crate::message::{
     text_to_message,
     Message,
@@ -141,6 +143,50 @@ impl ChatState {
 
     pub fn thread(&self) -> Option<&OwnedEventId> {
         self.scrollback.thread()
+    }
+
+    /// Whether the message bar has a mention part-way typed at the cursor.
+    ///
+    /// This asks the same question of the same text, with the same word boundaries, that
+    /// [crate::base::IambCompleter] does, so the two cannot disagree about whether an `@` starts a
+    /// mention. In particular an `@` in the middle of a word -- an email address, say -- is part of
+    /// that word rather than the start of a mention, and so does not count.
+    fn typing_mention(&mut self) -> bool {
+        if self.focus != RoomFocus::MessageBar {
+            return false;
+        }
+
+        let text = self.tbox.get();
+        let mut cursor = self.tbox.get_cursor();
+
+        let Some(word) = text.get_prefix_word_mut(&mut cursor, &MATRIX_ID_WORD) else {
+            return false;
+        };
+
+        Cow::from(&word).starts_with(MENTION_SIGIL)
+    }
+
+    /// Open or refresh the member completion popup if a mention is being typed.
+    ///
+    /// Running this after every insertion is what makes the popup appear as soon as `@` is typed,
+    /// without the user having to ask for a completion: modalkit throws the completion list away on
+    /// every edit, so it has to be rebuilt each time to keep up with what has been typed.
+    ///
+    /// The action goes straight at the message bar rather than through the screen's focused editor,
+    /// so it cannot disturb the command bar if that happens to be where the typing went.
+    pub fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+        if !self.typing_mention() {
+            return;
+        }
+
+        // Listing the candidates without picking one; the user is still typing.
+        let show = EditorAction::Complete(
+            CompletionStyle::None,
+            CompletionType::Auto,
+            CompletionDisplay::List,
+        );
+
+        let _ = self.tbox.editor_command(&show, ctx, store);
     }
 
     fn get_joined(&self, worker: &Requester) -> Result<MatrixRoom, IambError> {

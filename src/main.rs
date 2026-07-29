@@ -451,6 +451,18 @@ impl Application {
         }
     }
 
+    /// Show the mention completion popup if the typing that just happened was in a message bar and
+    /// started, or continued, a mention.
+    ///
+    /// Completion is normally something the user asks for with a key, but a mention is worth
+    /// offering unprompted, so this runs after every insertion. The window decides whether there is
+    /// anything to show; see [IambWindow::show_mentions].
+    fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+        if let Ok(window) = self.screen.current_window_mut() {
+            window.show_mentions(ctx, store);
+        }
+    }
+
     async fn action_run(
         &mut self,
         action: ProgramAction,
@@ -462,7 +474,7 @@ impl Application {
             Action::NoOp => None,
 
             Action::Editor(act) => {
-                match self.screen.editor_command(&act, &ctx, store) {
+                let info = match self.screen.editor_command(&act, &ctx, store) {
                     Ok(info) => info,
                     Err(EditError::WrongBuffer(content)) if act.is_switchable(&ctx) => {
                         // Switch to the right window.
@@ -478,7 +490,19 @@ impl Application {
                         }
                     },
                     Err(err) => return Err(err.into()),
+                };
+
+                // Typing in a message bar can open the mention popup, and editing what has
+                // already been typed keeps it up to date. Editing outside of insert mode is
+                // somebody moving text around rather than composing, so it is left alone.
+                let composing = ctx.get_insert_style().is_some() &&
+                    matches!(act, EditorAction::InsertText(_) | EditorAction::Edit(_, _));
+
+                if composing {
+                    self.show_mentions(&ctx, store);
                 }
+
+                info
             },
 
             // Simple delegations.

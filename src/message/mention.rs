@@ -16,6 +16,9 @@ use std::collections::BTreeSet;
 use matrix_sdk::ruma::{OwnedUserId, UserId};
 use regex::{Captures, Regex};
 
+/// The character that starts a mention, and also a Matrix user ID.
+pub const MENTION_SIGIL: char = '@';
+
 /// The prefix of a [matrix.to] permalink, which mentions point at.
 ///
 /// [matrix.to]: https://spec.matrix.org/v1.18/appendices/#matrixto-navigation
@@ -166,7 +169,7 @@ fn ambiguous_names(candidates: &[MentionCandidate]) -> BTreeSet<&str> {
 /// `needle` is what the user has typed, including the leading `@` sigil. The returned strings are
 /// mention links ready to be inserted in place of it.
 pub fn complete_mentions(needle: &str, candidates: Vec<MentionCandidate>) -> Vec<String> {
-    let needle = needle.strip_prefix('@').unwrap_or(needle);
+    let needle = needle.strip_prefix(MENTION_SIGIL).unwrap_or(needle);
     let ambiguous_names = ambiguous_names(&candidates);
 
     let mut scored = candidates

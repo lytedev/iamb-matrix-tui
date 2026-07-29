@@ -346,19 +346,36 @@ but will display aliens from Space Invaders in Matrix clients that support doing
 .El
 
 .Sh "MENTIONS"
-While composing a message, type
+While composing a message, typing
 .Sy @
-followed by part of a room member's name and press
-.Sy <C-N>
-(or
-.Sy <C-P>
-to walk the list backwards) to complete a mention.
+brings up a list of the room's members straight away, and typing more
+characters narrows it down.
 Both the localpart of the Matrix user ID and the display name are matched,
 and the match is fuzzy: the characters you type only have to appear in order,
 so
 .Sy @gh
 will find
 .Dq "Grace Hopper" .
+Press
+.Sy <C-N>
+(or
+.Sy <C-P>
+to walk the list backwards) to pick somebody from the list.
+.Pp
+The list only appears when the
+.Sy @
+starts a word, that is, at the beginning of the message or after a space.
+An
+.Sy @
+in the middle of a word belongs to that word, so typing an email address does
+not bring up the list.
+Type a space or press
+.Sy <Esc>
+to dismiss the list without picking anybody; the
+.Sy @
+you typed stays in the message as ordinary text.
+.Pp
+Only members who are in the room or have been invited to it are offered.
 .Pp
 Selecting a member inserts a Markdown link to their
 .Lk https://matrix.to/ matrix.to

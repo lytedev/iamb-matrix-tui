@@ -40,6 +40,7 @@ use matrix_sdk::{
             reaction::ReactionEvent,
             relation::{Replacement, Thread},
             room::encrypted::RoomEncryptedEvent,
+            room::member::MembershipState,
             room::message::{
                 OriginalRoomMessageEvent,
                 Relation,
@@ -91,7 +92,7 @@ use modalkit::{
 };
 
 use crate::config::ImagePreviewProtocolValues;
-use crate::message::mention::{complete_mentions, MentionCandidate};
+use crate::message::mention::{complete_mentions, MentionCandidate, MENTION_SIGIL};
 use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
 use crate::preview::{source_from_event, spawn_insert_preview};
@@ -2354,11 +2355,17 @@ fn complete_users(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Ve
         .collect()
 }
 
+/// Whether somebody with this membership is still around for a mention to reach.
+fn is_mentionable(membership: &MembershipState) -> bool {
+    matches!(membership, MembershipState::Join | MembershipState::Invite)
+}
+
 /// Completion for mentioning somebody in the room being composed in.
 ///
 /// The candidates come from the same place the `:members` window gets its list, so anybody who can
 /// be seen in that window can be mentioned, not just the people who happen to have spoken in the
-/// loaded scrollback.
+/// loaded scrollback. Unlike that window, though, people who have left or been banned are left out:
+/// there is no point offering to notify somebody who is no longer here.
 fn complete_mention(needle: &str, room_id: &RoomId, store: &ChatStore) -> Vec<String> {
     let Ok(members) = store.worker.members(room_id.to_owned()) else {
         return vec![];
@@ -2366,6 +2373,7 @@ fn complete_mention(needle: &str, room_id: &RoomId, store: &ChatStore) -> Vec<St
 
     let candidates = members
         .into_iter()
+        .filter(|member| is_mentionable(member.membership()))
         .map(|member| {
             let display_name = member.display_name().map(ToString::to_string);
 
@@ -2417,7 +2425,7 @@ fn complete_msgbar(
         },
 
         // Complete a mention of somebody in this room.
-        Some('@') => {
+        Some(MENTION_SIGIL) => {
             return complete_mention(id.as_ref(), room_id, store);
         },
 
@@ -2865,8 +2873,15 @@ pub mod tests {
         assert_eq!(res, vec![":walking:", ":walking_man:", ":walking_woman:"]);
         assert_eq!(cursor, Cursor::new(0, 17));
 
-        // Completing "@" is mention completion now, which needs the worker thread to hand over the
-        // room's members. See [crate::message::mention] for its tests.
+        // An "@" in the middle of a word belongs to that word, so an email address is not a
+        // mention and does not go looking for room members.
+        let text = EditRope::from("mail me at daniel@lyte.dev ");
+        let mut cursor = Cursor::new(0, 25);
+        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
+        assert_eq!(res, Vec::<String>::new());
+
+        // Completing a real "@" is mention completion, which needs the worker thread to hand over
+        // the room's members. See [crate::message::mention] for its tests.
 
         let text = EditRope::from("see #room ");
         let mut cursor = Cursor::new(0, 9);
