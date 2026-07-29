@@ -1969,6 +1969,9 @@ pub enum IambId {
 
     /// The `:threads` window.
     ThreadList,
+
+    /// The `:unreads-and-threads` window.
+    UnreadThreadList,
 }
 
 impl Display for IambId {
@@ -1991,6 +1994,7 @@ impl Display for IambId {
             IambId::ChatList => f.write_str("iamb://chats"),
             IambId::UnreadList => f.write_str("iamb://unreads"),
             IambId::ThreadList => f.write_str("iamb://threads"),
+            IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
         }
     }
 }
@@ -2136,6 +2140,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::ThreadList)
             },
+            Some("unreads-and-threads") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://unreads-and-threads takes no path"));
+                }
+
+                Ok(IambId::UnreadThreadList)
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2209,6 +2220,9 @@ pub enum IambBufferId {
 
     /// The `:threads` window.
     ThreadList,
+
+    /// The `:unreads-and-threads` window.
+    UnreadThreadList,
 }
 
 impl IambBufferId {
@@ -2226,6 +2240,7 @@ impl IambBufferId {
             IambBufferId::ChatList => IambId::ChatList,
             IambBufferId::UnreadList => IambId::UnreadList,
             IambBufferId::ThreadList => IambId::ThreadList,
+            IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
         };
 
         Some(id)
@@ -2271,6 +2286,7 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::ChatList => vec![],
             IambBufferId::UnreadList => vec![],
             IambBufferId::ThreadList => vec![],
+            IambBufferId::UnreadThreadList => vec![],
         }
     }
 }
@@ -2563,7 +2579,10 @@ pub mod tests {
 
     #[test]
     fn test_thread_window_urls() {
-        for (id, url) in [(IambId::ThreadList, "iamb://threads")] {
+        for (id, url) in [
+            (IambId::ThreadList, "iamb://threads"),
+            (IambId::UnreadThreadList, "iamb://unreads-and-threads"),
+        ] {
             assert_eq!(id.to_string(), url);
 
             let json = serde_json::to_string(&id).unwrap();

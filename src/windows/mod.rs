@@ -362,6 +362,7 @@ macro_rules! delegate {
             IambWindow::ChatList($id) => $e,
             IambWindow::UnreadList($id) => $e,
             IambWindow::ThreadList($id) => $e,
+            IambWindow::UnreadThreadList($id) => $e,
         }
     };
 }
@@ -377,6 +378,7 @@ pub enum IambWindow {
     ChatList(ChatListState),
     UnreadList(UnreadListState),
     ThreadList(ThreadListState),
+    UnreadThreadList(UnreadThreadListState),
 }
 
 impl IambWindow {
@@ -447,6 +449,7 @@ pub type RoomListState = ListState<RoomItem, IambInfo>;
 pub type ChatListState = ListState<GenericChatItem, IambInfo>;
 pub type UnreadListState = ListState<GenericChatItem, IambInfo>;
 pub type ThreadListState = ListState<ThreadItem, IambInfo>;
+pub type UnreadThreadListState = ListState<UnreadThreadItem, IambInfo>;
 pub type SpaceListState = ListState<SpaceItem, IambInfo>;
 pub type VerifyListState = ListState<VerifyItem, IambInfo>;
 
@@ -695,6 +698,50 @@ impl WindowOps<IambInfo> for IambWindow {
                     .focus(focused)
                     .render(area, buf, state);
             },
+            IambWindow::UnreadThreadList(state) => {
+                let mut items = store
+                    .application
+                    .sync_info
+                    .rooms
+                    .clone()
+                    .into_iter()
+                    .map(|room_info| GenericChatItem::new(room_info, store, false))
+                    .filter(RoomLikeItem::is_unread)
+                    .map(UnreadThreadItem::Chat)
+                    .collect::<Vec<_>>();
+
+                let dms = store
+                    .application
+                    .sync_info
+                    .dms
+                    .clone()
+                    .into_iter()
+                    .map(|room_info| GenericChatItem::new(room_info, store, true))
+                    .filter(RoomLikeItem::is_unread)
+                    .map(UnreadThreadItem::Chat)
+                    .collect::<Vec<_>>();
+
+                items.extend(dms);
+
+                let threads = followed_thread_items(store)
+                    .into_iter()
+                    .filter(RoomLikeItem::is_unread)
+                    .map(UnreadThreadItem::Thread);
+
+                items.extend(threads);
+
+                let fields = &store.application.settings.tunables.sort.chats;
+                let collator = &mut store.application.collator;
+                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
+
+                state.set(items);
+
+                List::new(store)
+                    .empty_message("You do not have any unread rooms or threads yet")
+                    .empty_alignment(Alignment::Center)
+                    .focus(focused)
+                    .render(area, buf, state);
+            },
             IambWindow::SpaceList(state) => {
                 let mut items = store
                     .application
@@ -749,6 +796,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::ChatList(w) => w.dup(store).into(),
             IambWindow::UnreadList(w) => w.dup(store).into(),
             IambWindow::ThreadList(w) => IambWindow::ThreadList(w.dup(store)),
+            IambWindow::UnreadThreadList(w) => IambWindow::UnreadThreadList(w.dup(store)),
         }
     }
 
@@ -791,6 +839,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => IambId::ChatList,
             IambWindow::UnreadList(_) => IambId::UnreadList,
             IambWindow::ThreadList(_) => IambId::ThreadList,
+            IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
         }
     }
 
@@ -804,6 +853,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
+            IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -833,6 +883,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
+            IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
@@ -903,6 +954,11 @@ impl Window<IambInfo> for IambWindow {
                 let list = ThreadListState::new(IambBufferId::ThreadList, vec![]);
 
                 Ok(IambWindow::ThreadList(list))
+            },
+            IambId::UnreadThreadList => {
+                let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
+
+                Ok(IambWindow::UnreadThreadList(list))
             },
         }
     }
@@ -1078,6 +1134,84 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for ThreadItem {
         _: &mut ProgramStore,
     ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
         thread_prompt(self.room_id(), &self.thread_root, act, ctx)
+    }
+}
+
+/// An entry in the `:unreads-and-threads` window, which intermixes rooms and threads.
+#[derive(Clone)]
+pub enum UnreadThreadItem {
+    Chat(GenericChatItem),
+    Thread(ThreadItem),
+}
+
+macro_rules! delegate_unread_thread {
+    ($s: expr, $item: ident => $e: expr) => {
+        match $s {
+            UnreadThreadItem::Chat($item) => $e,
+            UnreadThreadItem::Thread($item) => $e,
+        }
+    };
+}
+
+impl RoomLikeItem for UnreadThreadItem {
+    fn name(&self) -> &str {
+        delegate_unread_thread!(self, item => item.name())
+    }
+
+    fn alias(&self) -> Option<&RoomAliasId> {
+        delegate_unread_thread!(self, item => item.alias())
+    }
+
+    fn room_id(&self) -> &RoomId {
+        delegate_unread_thread!(self, item => item.room_id())
+    }
+
+    fn has_tag(&self, tag: TagName) -> bool {
+        delegate_unread_thread!(self, item => item.has_tag(tag))
+    }
+
+    fn recent_ts(&self) -> Option<&MessageTimeStamp> {
+        delegate_unread_thread!(self, item => item.recent_ts())
+    }
+
+    fn is_unread(&self) -> bool {
+        delegate_unread_thread!(self, item => item.is_unread())
+    }
+
+    fn is_invite(&self) -> bool {
+        delegate_unread_thread!(self, item => item.is_invite())
+    }
+}
+
+impl Display for UnreadThreadItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        delegate_unread_thread!(self, item => Display::fmt(item, f))
+    }
+}
+
+impl ListItem<IambInfo> for UnreadThreadItem {
+    fn show(
+        &self,
+        selected: bool,
+        vctx: &ViewportContext<ListCursor>,
+        store: &mut ProgramStore,
+    ) -> Text<'_> {
+        delegate_unread_thread!(self, item => item.show(selected, vctx, store))
+    }
+
+    fn get_word(&self) -> Option<String> {
+        delegate_unread_thread!(self, item => item.get_word())
+    }
+}
+
+impl Promptable<ProgramContext, ProgramStore, IambInfo> for UnreadThreadItem {
+    fn prompt(
+        &mut self,
+        act: &PromptAction,
+        ctx: &ProgramContext,
+        store: &mut ProgramStore,
+    ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
+        delegate_unread_thread!(self, item => item.prompt(act, ctx, store))
     }
 }
 

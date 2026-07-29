@@ -341,6 +341,17 @@ fn iamb_threads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_unreads_and_threads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::UnreadThreadList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_unreads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
@@ -352,6 +363,12 @@ fn iamb_unreads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
         Some("clear") => {
             let clear = IambAction::ClearUnreads;
             let step = CommandStep::Continue(clear.into(), ctx.context.clone());
+
+            return Ok(step);
+        },
+        Some("threads") => {
+            let open = ctx.switch(OpenTarget::Application(IambId::UnreadThreadList));
+            let step = CommandStep::Continue(open, ctx.context.clone());
 
             return Ok(step);
         },
@@ -821,6 +838,11 @@ fn add_iamb_commands(cmds: &mut ProgramCommands) {
         f: iamb_unreads,
     });
     cmds.add_command(ProgramCommand {
+        name: "unreadsandthreads".into(),
+        aliases: vec![],
+        f: iamb_unreads_and_threads,
+    });
+    cmds.add_command(ProgramCommand {
         name: "unreact".into(),
         aliases: vec![],
         f: iamb_unreact,
@@ -877,7 +899,18 @@ mod tests {
         let act = WindowAction::Switch(OpenTarget::Application(IambId::ThreadList));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
-        assert!(cmds.input_cmd(":threads foo", ctx).is_err());
+        // Command names can't contain `-`, so the intermixed window is reachable both as
+        // `:unreadsandthreads` and as a subcommand of the existing `:unreads`.
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::UnreadThreadList));
+
+        let res = cmds.input_cmd(":unreadsandthreads", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.clone().into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":unreads threads", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":threads foo", ctx.clone()).is_err());
+        assert!(cmds.input_cmd(":unreadsandthreads foo", ctx).is_err());
     }
 
     #[test]
