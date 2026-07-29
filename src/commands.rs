@@ -330,6 +330,17 @@ fn iamb_chats(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_threads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::ThreadList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_unreads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
@@ -800,6 +811,11 @@ fn add_iamb_commands(cmds: &mut ProgramCommands) {
         f: iamb_spaces,
     });
     cmds.add_command(ProgramCommand {
+        name: "threads".into(),
+        aliases: vec![],
+        f: iamb_threads,
+    });
+    cmds.add_command(ProgramCommand {
         name: "unreads".into(),
         aliases: vec![],
         f: iamb_unreads,
@@ -851,6 +867,18 @@ mod tests {
     use matrix_sdk::ruma::{room_id, user_id};
     use modalkit::actions::WindowAction;
     use modalkit::editing::context::EditContext;
+
+    #[test]
+    fn test_cmd_threads() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let res = cmds.input_cmd(":threads", ctx.clone()).unwrap();
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::ThreadList));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":threads foo", ctx).is_err());
+    }
 
     #[test]
     fn test_cmd_verify() {

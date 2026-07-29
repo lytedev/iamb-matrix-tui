@@ -879,6 +879,28 @@ impl UnreadInfo {
     }
 }
 
+/// How much of a thread's root message to show in a thread list.
+const THREAD_PREVIEW_CHARS: usize = 60;
+
+/// Appended to a thread preview that was cut short at [THREAD_PREVIEW_CHARS].
+const THREAD_PREVIEW_ELLIPSIS: &str = "…";
+
+/// Shown for a thread whose root message hasn't been loaded into scrollback.
+const THREAD_PREVIEW_UNAVAILABLE: &str = "<unloaded thread root>";
+
+/// A thread the user follows, as shown in the `:threads` and `:unreads-and-threads` windows.
+#[derive(Clone)]
+pub struct ThreadSummary {
+    /// The event that started the thread.
+    pub root: OwnedEventId,
+
+    /// A short preview of the thread's root message.
+    pub preview: String,
+
+    /// Whether the thread has activity the user hasn't read yet.
+    pub unread: UnreadInfo,
+}
+
 /// Track the display names for users and render any needed disambiguation for
 /// those with overlapping names.
 #[derive(Default)]
@@ -1049,6 +1071,116 @@ impl RoomInfo {
                 .or_insert_with(|| Messages::thread(thread_root))
         } else {
             &mut self.messages
+        }
+    }
+
+    /// The threads in this room that the user follows, with their unread state.
+    ///
+    /// See [ThreadSummary] for what "follows" means here.
+    pub fn followed_threads(&self, settings: &ApplicationSettings) -> Vec<ThreadSummary> {
+        let user_id = &settings.profile.user_id;
+
+        self.threads
+            .keys()
+            .filter(|root| self.follows_thread(root, user_id))
+            .map(|root| {
+                ThreadSummary {
+                    root: root.clone(),
+                    preview: self.thread_preview(root),
+                    unread: self.thread_unreads(root, settings),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the user follows the thread rooted at `root`.
+    ///
+    /// Matrix thread subscriptions (MSC4308) are not plumbed through iamb's sync worker, so
+    /// following is derived from evidence we already track:
+    ///
+    /// - the user started the thread, or replied in it (participation), or
+    /// - the user has a thread-scoped read receipt for it, which is how another client records
+    ///   that it was tracking the thread on their behalf (subscription proxy).
+    fn follows_thread(&self, root: &EventId, user_id: &UserId) -> bool {
+        let sent_root = self.get_event(root).is_some_and(|msg| msg.sender == user_id);
+
+        let sent_reply = self
+            .threads
+            .get(root)
+            .is_some_and(|replies| replies.values().any(|msg| msg.sender == user_id));
+
+        let has_thread_receipt = self
+            .user_receipts
+            .get(&ReceiptThread::Thread(root.to_owned()))
+            .is_some_and(|receipts| receipts.contains_key(user_id));
+
+        sent_root || sent_reply || has_thread_receipt
+    }
+
+    /// A short, single-line preview of the message that started a thread.
+    fn thread_preview(&self, root: &EventId) -> String {
+        let Some(msg) = self.get_event(root) else {
+            return String::from(THREAD_PREVIEW_UNAVAILABLE);
+        };
+
+        let body = msg.event.body();
+        let mut preview = String::new();
+
+        for c in body.chars().take(THREAD_PREVIEW_CHARS) {
+            preview.push(if c.is_control() { ' ' } else { c });
+        }
+
+        if body.chars().nth(THREAD_PREVIEW_CHARS).is_some() {
+            preview.push_str(THREAD_PREVIEW_ELLIPSIS);
+        }
+
+        preview
+    }
+
+    /// Indicates whether the thread rooted at `root` has unread messages.
+    ///
+    /// The user's thread-scoped receipt is the authority, but clients that don't send threaded
+    /// receipts advance only the main or unthreaded receipt, so those count as reading the thread
+    /// too: we compare against whichever of the three is newest.
+    pub fn thread_unreads(&self, root: &EventId, settings: &ApplicationSettings) -> UnreadInfo {
+        let user_id = &settings.profile.user_id;
+        let last_message = self
+            .threads
+            .get(root)
+            .and_then(|replies| replies.last_key_value())
+            .map(|(key, _)| key)
+            .or_else(|| self.get_message_key(root));
+
+        let last_receipt = [
+            ReceiptThread::Thread(root.to_owned()),
+            ReceiptThread::Main,
+            ReceiptThread::Unthreaded,
+        ]
+        .iter()
+        .filter_map(|thread| self.receipt_key(thread, user_id))
+        .max();
+
+        match (last_message, last_receipt) {
+            (Some((ts, _)), Some((read_ts, _))) => {
+                UnreadInfo { unread: ts > read_ts, latest: Some(*ts) }
+            },
+            (Some((ts, _)), None) => UnreadInfo { unread: true, latest: Some(*ts) },
+            (None, _) => UnreadInfo::default(),
+        }
+    }
+
+    /// Where a user's most recent read receipt for a receipt thread sits in the scrollback.
+    ///
+    /// This is `None` when the user has no such receipt, or when the event it points at is older
+    /// than the oldest event we've loaded.
+    fn receipt_key(&self, thread: &ReceiptThread, user_id: &UserId) -> Option<&MessageKey> {
+        let event_id = self.user_receipts.get(thread)?.get(user_id)?;
+
+        match self.keys.get(event_id)? {
+            EventLocation::Message(_, key) |
+            EventLocation::State(key) |
+            EventLocation::Sticker(key) => Some(key),
+            EventLocation::Reaction(_) => None,
         }
     }
 
@@ -1280,31 +1412,9 @@ impl RoomInfo {
     pub fn unreads(&self, settings: &ApplicationSettings) -> UnreadInfo {
         let last_message = self.messages.last_key_value();
 
-        let last_receipt = self
-            .user_receipts
-            .get(&ReceiptThread::Main)
-            .and_then(|receipts| receipts.get(&settings.profile.user_id));
-        let last_receipt = last_receipt.as_ref().and_then(|event_id| {
-            match &self.keys.get(*event_id)? {
-                EventLocation::Message(_, key) |
-                EventLocation::State(key) |
-                EventLocation::Sticker(key) => Some(key),
-                EventLocation::Reaction(_) => None,
-            }
-        });
-
-        let last_unthreaded = self
-            .user_receipts
-            .get(&ReceiptThread::Unthreaded)
-            .and_then(|receipts| receipts.get(&settings.profile.user_id));
-        let last_unthreaded = last_unthreaded.as_ref().and_then(|event_id| {
-            match &self.keys.get(*event_id)? {
-                EventLocation::Message(_, key) |
-                EventLocation::State(key) |
-                EventLocation::Sticker(key) => Some(key),
-                EventLocation::Reaction(_) => None,
-            }
-        });
+        let user_id = &settings.profile.user_id;
+        let last_receipt = self.receipt_key(&ReceiptThread::Main, user_id);
+        let last_unthreaded = self.receipt_key(&ReceiptThread::Unthreaded, user_id);
 
         let last_receipt = std::cmp::max(last_receipt, last_unthreaded);
 
@@ -1856,6 +1966,9 @@ pub enum IambId {
 
     /// The `:unreads` window.
     UnreadList,
+
+    /// The `:threads` window.
+    ThreadList,
 }
 
 impl Display for IambId {
@@ -1877,6 +1990,7 @@ impl Display for IambId {
             IambId::Welcome => f.write_str("iamb://welcome"),
             IambId::ChatList => f.write_str("iamb://chats"),
             IambId::UnreadList => f.write_str("iamb://unreads"),
+            IambId::ThreadList => f.write_str("iamb://threads"),
         }
     }
 }
@@ -2015,6 +2129,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::UnreadList)
             },
+            Some("threads") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://threads takes no path"));
+                }
+
+                Ok(IambId::ThreadList)
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2085,6 +2206,9 @@ pub enum IambBufferId {
 
     /// The `:unreads` window.
     UnreadList,
+
+    /// The `:threads` window.
+    ThreadList,
 }
 
 impl IambBufferId {
@@ -2101,6 +2225,7 @@ impl IambBufferId {
             IambBufferId::Welcome => IambId::Welcome,
             IambBufferId::ChatList => IambId::ChatList,
             IambBufferId::UnreadList => IambId::UnreadList,
+            IambBufferId::ThreadList => IambId::ThreadList,
         };
 
         Some(id)
@@ -2145,6 +2270,7 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::Welcome => vec![],
             IambBufferId::ChatList => vec![],
             IambBufferId::UnreadList => vec![],
+            IambBufferId::ThreadList => vec![],
         }
     }
 }
@@ -2321,11 +2447,132 @@ pub mod tests {
     use matrix_sdk::ruma::{
         events::{reaction::ReactionEventContent, relation::Annotation},
         owned_event_id,
+        server_name,
         MilliSecondsSinceUnixEpoch,
+        UInt,
     };
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
     use serde_json::{Map, Value};
+
+    /// A room with two threads: one the test user replied in, and one they never touched.
+    fn mock_room_with_threads() -> (RoomInfo, ApplicationSettings, OwnedEventId, OwnedEventId) {
+        let settings = mock_settings();
+        let user_id = settings.profile.user_id.clone();
+        let stranger = TEST_USER2.clone();
+
+        let followed_root = EventId::new_v1(server_name!("example.com"));
+        let ignored_root = EventId::new_v1(server_name!("example.com"));
+
+        let mut room = RoomInfo::default();
+
+        let insert = |info: &mut RoomInfo, key: MessageKey, sender: OwnedUserId, body: &str| {
+            let content = MessageEvent::Local(
+                key.1.clone(),
+                RoomMessageEventContent::text_plain(body).into(),
+            );
+            let root = match info.keys.get(&key.1) {
+                Some(EventLocation::Message(root, _)) => root.clone(),
+                _ => None,
+            };
+            info.get_thread_mut(root)
+                .insert(key.clone(), Message::new(content, sender, key.0));
+        };
+
+        // Both thread roots live in the main scrollback.
+        let roots: Vec<OwnedEventId> = vec![followed_root.clone(), ignored_root.clone()];
+
+        for (i, root) in roots.iter().enumerate() {
+            let ts = MessageTimeStamp::OriginServer(UInt::new(i as u64 + 1).unwrap());
+            let key: MessageKey = (ts, root.clone());
+            room.keys.insert(root.clone(), EventLocation::Message(None, key.clone()));
+            insert(&mut room, key, stranger.clone(), "thread root");
+        }
+
+        // A reply from the test user in the first thread, and from someone else in the second.
+        let repliers: Vec<OwnedUserId> = vec![user_id, stranger];
+
+        for (i, (root, sender)) in roots.iter().zip(repliers).enumerate() {
+            let reply_id = EventId::new_v1(server_name!("example.com"));
+            let ts = MessageTimeStamp::OriginServer(UInt::new(i as u64 + 10).unwrap());
+            let key: MessageKey = (ts, reply_id.clone());
+            room.keys
+                .insert(reply_id, EventLocation::Message(Some(root.clone()), key.clone()));
+            insert(&mut room, key, sender, "reply");
+        }
+
+        (room, settings, followed_root, ignored_root)
+    }
+
+    #[test]
+    fn test_followed_threads_requires_participation() {
+        let (room, settings, followed_root, ignored_root) = mock_room_with_threads();
+
+        let followed = room.followed_threads(&settings);
+        let roots = followed.iter().map(|t| t.root.clone()).collect::<Vec<_>>();
+
+        assert_eq!(roots, vec![followed_root]);
+        assert!(!roots.contains(&ignored_root));
+
+        // With no receipts at all, a followed thread reads as unread.
+        assert!(followed[0].unread.is_unread());
+        assert_eq!(followed[0].preview, "thread root");
+    }
+
+    #[test]
+    fn test_followed_threads_includes_subscribed_thread() {
+        let (mut room, settings, _, ignored_root) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        // A thread-scoped receipt stands in for a thread subscription, even though the user
+        // never posted in the thread.
+        let last_reply = room
+            .get_thread(Some(&ignored_root))
+            .and_then(|t| t.last_key_value())
+            .map(|((_, event_id), _)| event_id.clone())
+            .unwrap();
+        room.set_receipt(ReceiptThread::Thread(ignored_root.clone()), user_id, last_reply);
+
+        let followed = room.followed_threads(&settings);
+        let roots = followed.iter().map(|t| t.root.clone()).collect::<Vec<_>>();
+
+        assert!(roots.contains(&ignored_root));
+
+        let subscribed = followed.iter().find(|t| t.root == ignored_root).unwrap();
+        assert!(!subscribed.unread.is_unread());
+    }
+
+    #[test]
+    fn test_thread_unreads_honors_main_receipt() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // A client that doesn't send threaded receipts advances only the main receipt, which
+        // still counts as having read the thread.
+        let last_reply = room
+            .get_thread(Some(&followed_root))
+            .and_then(|t| t.last_key_value())
+            .map(|((_, event_id), _)| event_id.clone())
+            .unwrap();
+        room.set_receipt(ReceiptThread::Main, user_id, last_reply);
+
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+    }
+
+    #[test]
+    fn test_thread_window_urls() {
+        for (id, url) in [(IambId::ThreadList, "iamb://threads")] {
+            assert_eq!(id.to_string(), url);
+
+            let json = serde_json::to_string(&id).unwrap();
+            let parsed: IambId = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, id);
+        }
+
+        assert!(serde_json::from_str::<IambId>("\"iamb://threads/extra\"").is_err());
+    }
 
     fn create_reaction_event(
         content: &ReactionEventContent,
