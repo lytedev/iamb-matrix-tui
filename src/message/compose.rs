@@ -9,12 +9,17 @@ use nom::{
     Parser as _,
 };
 
-use matrix_sdk::ruma::events::room::message::{
-    EmoteMessageEventContent,
-    MessageType,
-    RoomMessageEventContent,
-    TextMessageEventContent,
+use matrix_sdk::ruma::events::{
+    room::message::{
+        EmoteMessageEventContent,
+        MessageType,
+        RoomMessageEventContent,
+        TextMessageEventContent,
+    },
+    Mentions,
 };
+
+use super::mention::parse_mentions;
 
 #[derive(Clone, Debug, Default)]
 enum SlashCommand {
@@ -51,13 +56,23 @@ enum SlashCommand {
 }
 
 impl SlashCommand {
-    fn to_message(&self, input: &str) -> anyhow::Result<MessageType> {
+    /// Turn the message text into content to send, along with the users it mentions.
+    ///
+    /// Only the commands that run the text through the Markdown pipeline can carry mentions, since
+    /// that is what turns a mention's link syntax into the anchor that makes it a pill. The
+    /// commands that send the text verbatim leave it — and `m.mentions` — untouched.
+    fn to_message(&self, input: &str) -> anyhow::Result<(MessageType, Mentions)> {
+        let mut mentions = Mentions::new();
+
         let msgtype = match self {
             SlashCommand::Emote => {
+                let parsed = parse_mentions(input);
+                mentions.user_ids = parsed.user_ids;
+
                 let msg = if let Some(html) = text_to_html(input) {
-                    EmoteMessageEventContent::html(input, html)
+                    EmoteMessageEventContent::html(parsed.body, html)
                 } else {
-                    EmoteMessageEventContent::plain(input)
+                    EmoteMessageEventContent::plain(parsed.body)
                 };
 
                 MessageType::Emote(msg)
@@ -71,6 +86,8 @@ impl SlashCommand {
                 MessageType::Text(msg)
             },
             SlashCommand::Markdown => {
+                mentions.user_ids = parse_mentions(input).user_ids;
+
                 let msg = text_to_message_content(input.to_string());
                 MessageType::Text(msg)
             },
@@ -98,7 +115,7 @@ impl SlashCommand {
             },
         };
 
-        Ok(msgtype)
+        Ok((msgtype, mentions))
     }
 }
 
@@ -235,19 +252,31 @@ fn text_to_html(input: &str) -> Option<String> {
 }
 
 fn text_to_message_content(input: String) -> TextMessageEventContent {
+    let body = parse_mentions(input.as_str()).body;
+
     if let Some(html) = text_to_html(input.as_str()) {
-        TextMessageEventContent::html(input, html)
+        TextMessageEventContent::html(body, html)
     } else {
-        TextMessageEventContent::plain(input)
+        TextMessageEventContent::plain(body)
     }
 }
 
 pub fn text_to_message(input: String) -> RoomMessageEventContent {
-    let msg = parse_slash_command(input.as_str())
+    let (msg, mentions) = parse_slash_command(input.as_str())
         .and_then(|(input, slash)| slash.to_message(input))
-        .unwrap_or_else(|_| MessageType::Text(text_to_message_content(input)));
+        .unwrap_or_else(|_| {
+            let mentions = Mentions::with_user_ids(parse_mentions(input.as_str()).user_ids);
 
-    RoomMessageEventContent::new(msg)
+            (MessageType::Text(text_to_message_content(input)), mentions)
+        });
+
+    let mut content = RoomMessageEventContent::new(msg);
+
+    if !mentions.user_ids.is_empty() {
+        content.mentions = Some(mentions);
+    }
+
+    content
 }
 
 #[cfg(test)]
@@ -444,6 +473,58 @@ pub mod tests {
         let content = text_to_message("/spaceinvaders hello".into()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effects.space_invaders");
         assert_eq!(content.body(), "hello");
+    }
+
+    #[test]
+    fn test_mention_becomes_a_pill() {
+        let input = "hi [Ada](https://matrix.to/#/@ada:example.com), how goes it?";
+        let content = text_to_message(input.into());
+
+        let MessageType::Text(msg) = &content.msgtype else {
+            panic!("Expected MessageType::Text");
+        };
+
+        assert_eq!(msg.body, "hi Ada, how goes it?");
+        assert_eq!(
+            msg.formatted.as_ref().unwrap().body,
+            "<p>hi <a href=\"https://matrix.to/#/@ada:example.com\">Ada</a>, how goes it?</p>\n"
+        );
+
+        let mentions = content.mentions.unwrap();
+        assert!(!mentions.room);
+        assert_eq!(
+            mentions.user_ids,
+            std::collections::BTreeSet::from([
+                matrix_sdk::ruma::user_id!("@ada:example.com").to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_mention_in_an_emote() {
+        let input = "/me waves at [Ada](https://matrix.to/#/@ada:example.com)";
+        let content = text_to_message(input.into());
+
+        let MessageType::Emote(msg) = &content.msgtype else {
+            panic!("Expected MessageType::Emote");
+        };
+
+        assert_eq!(msg.body, "waves at Ada");
+        assert_eq!(
+            msg.formatted.as_ref().unwrap().body,
+            "<p>waves at <a href=\"https://matrix.to/#/@ada:example.com\">Ada</a></p>\n"
+        );
+        assert!(content.mentions.is_some());
+    }
+
+    #[test]
+    fn test_no_mentions_field_without_mentions() {
+        assert!(text_to_message("just talking".into()).mentions.is_none());
+
+        // Sending text verbatim means sending it verbatim, mention syntax included.
+        let content = text_to_message("/p [Ada](https://matrix.to/#/@ada:example.com)".into());
+        assert_eq!(content.msgtype.body(), "[Ada](https://matrix.to/#/@ada:example.com)");
+        assert!(content.mentions.is_none());
     }
 
     #[test]

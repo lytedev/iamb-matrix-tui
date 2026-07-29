@@ -91,6 +91,7 @@ use modalkit::{
 };
 
 use crate::config::ImagePreviewProtocolValues;
+use crate::message::mention::{complete_mentions, MentionCandidate};
 use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
 use crate::preview::{source_from_event, spawn_insert_preview};
@@ -2317,7 +2318,9 @@ impl Completer<IambInfo> for IambCompleter {
         match content {
             IambBufferId::Command(CommandType::Command) => complete_cmdbar(text, cursor, store),
             IambBufferId::Command(CommandType::Search) => vec![],
-            IambBufferId::Room(_, _, RoomFocus::MessageBar) => complete_msgbar(text, cursor, store),
+            IambBufferId::Room(room_id, _, RoomFocus::MessageBar) => {
+                complete_msgbar(text, cursor, room_id, store)
+            },
             IambBufferId::Room(_, _, RoomFocus::Scrollback) => vec![],
 
             IambBufferId::DirectList => vec![],
@@ -2351,8 +2354,39 @@ fn complete_users(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Ve
         .collect()
 }
 
+/// Completion for mentioning somebody in the room being composed in.
+///
+/// The candidates come from the same place the `:members` window gets its list, so anybody who can
+/// be seen in that window can be mentioned, not just the people who happen to have spoken in the
+/// loaded scrollback.
+fn complete_mention(needle: &str, room_id: &RoomId, store: &ChatStore) -> Vec<String> {
+    let Ok(members) = store.worker.members(room_id.to_owned()) else {
+        return vec![];
+    };
+
+    let candidates = members
+        .into_iter()
+        .map(|member| {
+            let display_name = member.display_name().map(ToString::to_string);
+
+            MentionCandidate::new(
+                member.user_id().to_owned(),
+                display_name,
+                member.name_ambiguous(),
+            )
+        })
+        .collect();
+
+    complete_mentions(needle, candidates)
+}
+
 /// Tab completion within the message bar.
-fn complete_msgbar(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
+fn complete_msgbar(
+    text: &EditRope,
+    cursor: &mut Cursor,
+    room_id: &RoomId,
+    store: &ChatStore,
+) -> Vec<String> {
     let id = text
         .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
         .unwrap_or_else(EditRope::empty);
@@ -2382,8 +2416,13 @@ fn complete_msgbar(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> V
             return iter.collect();
         },
 
-        // Complete usernames for @ and empty strings.
-        Some('@') | None => {
+        // Complete a mention of somebody in this room.
+        Some('@') => {
+            return complete_mention(id.as_ref(), room_id, store);
+        },
+
+        // Complete usernames when there's nothing to go on but the cursor position.
+        None => {
             return store
                 .presences
                 .complete(id.as_ref())
@@ -2818,21 +2857,20 @@ pub mod tests {
         let store = mock_store().await;
         let store = store.application;
 
+        let room_id = TEST_ROOM1_ID.as_ref();
+
         let text = EditRope::from("going for a walk :walk ");
         let mut cursor = Cursor::new(0, 22);
-        let res = complete_msgbar(&text, &mut cursor, &store);
+        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
         assert_eq!(res, vec![":walking:", ":walking_man:", ":walking_woman:"]);
         assert_eq!(cursor, Cursor::new(0, 17));
 
-        let text = EditRope::from("hello @user1 ");
-        let mut cursor = Cursor::new(0, 12);
-        let res = complete_msgbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["@user1:example.com"]);
-        assert_eq!(cursor, Cursor::new(0, 6));
+        // Completing "@" is mention completion now, which needs the worker thread to hand over the
+        // room's members. See [crate::message::mention] for its tests.
 
         let text = EditRope::from("see #room ");
         let mut cursor = Cursor::new(0, 9);
-        let res = complete_msgbar(&text, &mut cursor, &store);
+        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
         assert_eq!(res, vec!["#room1:example.com"]);
         assert_eq!(cursor, Cursor::new(0, 4));
     }

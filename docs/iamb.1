@@ -345,6 +345,50 @@ Produces no effect in
 but will display aliens from Space Invaders in Matrix clients that support doing so.
 .El
 
+.Sh "MENTIONS"
+While composing a message, type
+.Sy @
+followed by part of a room member's name and press
+.Sy <C-N>
+(or
+.Sy <C-P>
+to walk the list backwards) to complete a mention.
+Both the localpart of the Matrix user ID and the display name are matched,
+and the match is fuzzy: the characters you type only have to appear in order,
+so
+.Sy @gh
+will find
+.Dq "Grace Hopper" .
+.Pp
+Selecting a member inserts a Markdown link to their
+.Lk https://matrix.to/ matrix.to
+permalink, such as
+.Bd -literal -offset indent
+[Grace Hopper](https://matrix.to/#/@grace:example.com)
+.Ed
+.Pp
+The link is ordinary editable text, so it can be reworded or removed like
+anything else in the message bar.
+When the message is sent, it becomes a pill: the formatted body carries an
+anchor pointing at the user, the plain-text fallback carries just the name,
+and the mentioned users are listed in the
+.Sy m.mentions
+field of the event so that other clients notify them.
+.Pp
+Members who share a display name with somebody else in the room are labelled
+with their user ID as well, and members who have not set a display name are
+labelled with their user ID.
+The permalink is always built from the user ID, so a mention resolves to the
+right person even when two people go by the same name.
+.Pp
+Mentions are only turned into pills for messages that are interpreted as
+markup, which is the default and
+.Sy /me .
+.Sy /plaintext
+and
+.Sy /html
+send what you typed as you typed it.
+
 .Sh "ENVIRONMENT"
 The behaviour of
 .Nm
