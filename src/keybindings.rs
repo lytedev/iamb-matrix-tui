@@ -12,7 +12,7 @@ use modalkit::{
     prelude::*,
 };
 
-use crate::base::{IambAction, IambInfo, Keybindings, MATRIX_ID_WORD};
+use crate::base::{IambAction, IambInfo, Keybindings, RoomAction, MATRIX_ID_WORD};
 use crate::config::{ApplicationSettings, Keys};
 
 pub type IambStep = InputStep<IambInfo>;
@@ -34,7 +34,9 @@ pub fn setup_keybindings() -> Keybindings {
     let ctrl_w = "<C-W>".parse::<TerminalKey>().unwrap();
     let ctrl_m = "<C-M>".parse::<TerminalKey>().unwrap();
     let ctrl_z = "<C-Z>".parse::<TerminalKey>().unwrap();
+    let ctrl_r = "<C-R>".parse::<TerminalKey>().unwrap();
     let key_m_lc = "m".parse::<TerminalKey>().unwrap();
+    let key_r_lc = "r".parse::<TerminalKey>().unwrap();
     let key_z_lc = "z".parse::<TerminalKey>().unwrap();
     let shift_enter = "<S-Enter>".parse::<TerminalKey>().unwrap();
 
@@ -58,6 +60,16 @@ pub fn setup_keybindings() -> Keybindings {
     ism.add_mapping(VimMode::Visual, &cwm, &stoggle);
     ism.add_mapping(VimMode::Normal, &cwcm, &stoggle);
     ism.add_mapping(VimMode::Visual, &cwcm, &stoggle);
+
+    let cwr = vec![once(&ctrl_w), once(&key_r_lc)];
+    let cwcr = vec![once(&ctrl_w), once(&ctrl_r)];
+    let mark_read = IambStep::new()
+        .actions(vec![IambAction::Room(RoomAction::MarkRead).into()])
+        .goto(VimMode::Normal);
+    ism.add_mapping(VimMode::Normal, &cwr, &mark_read);
+    ism.add_mapping(VimMode::Visual, &cwr, &mark_read);
+    ism.add_mapping(VimMode::Normal, &cwcr, &mark_read);
+    ism.add_mapping(VimMode::Visual, &cwcr, &mark_read);
 
     let shift_enter = vec![once(&shift_enter)];
     let newline = IambStep::new().actions(vec![InsertTextAction::Type(

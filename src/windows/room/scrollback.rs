@@ -1420,9 +1420,12 @@ impl StatefulWidget for Scrollback<'_> {
 
         if self.room_focused &&
             settings.tunables.read_receipt_send &&
+            !settings.tunables.read_receipt_manual &&
             state.cursor.timestamp.is_none()
         {
-            // If the cursor is at the last message, then update the read marker.
+            // If the cursor is at the last message, then update the read marker. When
+            // `read_receipt_manual` is set, viewing never does this, and the marker only moves
+            // when the user runs `:read`.
             if let Some((k, _)) = thread.last_key_value() {
                 info.set_receipt(thread.1.clone(), settings.profile.user_id.clone(), k.1.clone());
             }

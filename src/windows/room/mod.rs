@@ -267,6 +267,19 @@ impl RoomState {
                     Err(IambError::NotJoined.into())
                 }
             },
+            RoomAction::MarkRead => {
+                let room_id = self.id().to_owned();
+                let thread = self.thread().cloned();
+                let user_id = store.application.settings.profile.user_id.clone();
+
+                let info = store.application.rooms.get_or_default(room_id.clone());
+                info.mark_read(&user_id, thread);
+
+                // Any notification we showed for this room is now stale.
+                store.application.open_notifications.remove(&room_id);
+
+                Ok(vec![])
+            },
             RoomAction::Leave(skip_confirm) => {
                 if let Some(room) = store.application.worker.client.get_room(self.id()) {
                     if skip_confirm {

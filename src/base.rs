@@ -450,6 +450,9 @@ pub enum RoomAction {
     /// Leave this room.
     Leave(bool),
 
+    /// Mark this room, or the thread being viewed, as read.
+    MarkRead,
+
     /// Update a user's membership in this room.
     MemberUpdate(MemberUpdateAction, String, Option<String>, bool),
 
@@ -1553,6 +1556,27 @@ impl RoomInfo {
         self.user_receipts.entry(thread).or_default().insert(user_id, event_id);
     }
 
+    /// Mark a thread as read, or the whole room when `thread` is `None`.
+    ///
+    /// This is what `:read` drives, and it is the only thing that advances the read marker when
+    /// `read_receipt_manual` is set.
+    pub fn mark_read(&mut self, user_id: &UserId, thread: Option<OwnedEventId>) {
+        let Some(root) = thread else {
+            self.fully_read(user_id);
+            return;
+        };
+
+        // Fall back to the root itself for a thread whose replies aren't loaded.
+        let last = self
+            .threads
+            .get(&root)
+            .and_then(|replies| replies.last_key_value())
+            .map(|((_, event_id), _)| event_id.clone())
+            .unwrap_or_else(|| root.clone());
+
+        self.set_receipt(ReceiptThread::Thread(root), user_id.to_owned(), last);
+    }
+
     pub fn fully_read(&mut self, user_id: &UserId) {
         let Some(((_, event_id), _)) = self.messages.last_key_value() else {
             return;
@@ -2575,6 +2599,32 @@ pub mod tests {
         room.set_receipt(ReceiptThread::Main, user_id, last_reply);
 
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+    }
+
+    #[test]
+    fn test_mark_read_scopes_to_thread() {
+        let (mut room, settings, followed_root, ignored_root) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        // Subscribe to the second thread so that both show up as followed and unread.
+        room.set_receipt(
+            ReceiptThread::Thread(ignored_root.clone()),
+            user_id.clone(),
+            ignored_root.clone(),
+        );
+
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+        assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
+
+        // Marking one thread read leaves the other alone.
+        room.mark_read(&user_id, Some(followed_root.clone()));
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+        assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
+
+        // Marking the room read with no thread covers every thread in it.
+        room.mark_read(&user_id, None);
+        assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
+        assert!(!room.unreads(&settings).is_unread());
     }
 
     #[test]

@@ -330,6 +330,28 @@ fn iamb_chats(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut args = desc.arg.strings()?;
+
+    if args.len() > 1 {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = match args.pop().as_deref() {
+        // Mark the focused room read, or just the thread when viewing one.
+        None => IambAction::Room(RoomAction::MarkRead),
+
+        // Mark every room and thread read.
+        Some("all") => IambAction::ClearUnreads,
+
+        Some(_) => return Result::Err(CommandError::InvalidArgument),
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_threads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -827,6 +849,7 @@ fn add_iamb_commands(cmds: &mut ProgramCommands) {
         aliases: vec![],
         f: iamb_spaces,
     });
+    cmds.add_command(ProgramCommand { name: "read".into(), aliases: vec![], f: iamb_read });
     cmds.add_command(ProgramCommand {
         name: "threads".into(),
         aliases: vec![],
@@ -889,6 +912,23 @@ mod tests {
     use matrix_sdk::ruma::{room_id, user_id};
     use modalkit::actions::WindowAction;
     use modalkit::editing::context::EditContext;
+
+    #[test]
+    fn test_cmd_read() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        // This shadows modalkit's unimplemented Vim `:read`, which has no meaning in iamb.
+        let res = cmds.input_cmd(":read", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::MarkRead);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":read all", ctx.clone()).unwrap();
+        let act = IambAction::ClearUnreads;
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":read bogus", ctx).is_err());
+    }
 
     #[test]
     fn test_cmd_threads() {

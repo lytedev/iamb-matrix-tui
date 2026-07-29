@@ -209,6 +209,15 @@ Defines whether or not reactions should be shown as their respective shortcode.
 Defines whether or not read confirmations are sent.
 .It Sy read_receipt_display
 Defines whether or not read confirmations are displayed.
+.It Sy read_receipt_manual
+Defines whether rooms and threads must be marked read explicitly with
+.Sy :read .
+When
+.Sy true ,
+simply viewing a room or thread no longer advances your read marker, so unreads
+persist until you dismiss them.
+Defaults to
+.Sy false .
 .It Sy request_timeout
 Defines the maximum time per request in seconds.
 .It Sy sort
