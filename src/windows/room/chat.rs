@@ -101,6 +101,28 @@ use crate::worker::Requester;
 
 use super::scrollback::{Scrollback, ScrollbackState};
 
+/// Where the closest match sits in a completion list, which orders itself best first.
+const BEST_MATCH_INDEX: usize = 0;
+
+/// Point a completion popup at its best match, so that the user can see which one it is.
+///
+/// A popup that nobody has picked from yet has nothing selected, and so draws every entry the
+/// same, leaving no clue which one is the closest match or which one a keypress will take. Saying
+/// the best match is selected gets it drawn highlighted.
+///
+/// This only ever touches a *copy* of the completion list: [EditBuffer::get_completions] hands out
+/// a clone, and it is that clone which gets rendered. The editing state keeps its own notion of
+/// what is selected, so nothing here can cause text to be inserted. Which matters, because in
+/// modalkit selecting an entry for real is the same operation as typing it into the buffer.
+///
+/// The highlight does not lie about what will happen. With nothing really selected, modalkit
+/// resolves "take the next entry" by starting at the last index and wrapping, which lands on the
+/// first one -- so the entry highlighted here is exactly what the first `<Tab>` or `<C-N>` takes.
+/// Once something has genuinely been selected, that selection is left alone.
+fn highlight_best_match(list: &mut CompletionList) {
+    list.selected = list.selected.or(Some(BEST_MATCH_INDEX));
+}
+
 /// State needed for rendering [Chat].
 pub struct ChatState {
     room_id: OwnedRoomId,
@@ -839,7 +861,10 @@ impl WindowOps<IambInfo> for ChatState {
     }
 
     fn get_completions(&self) -> Option<CompletionList> {
-        delegate!(self, w => w.get_completions())
+        let mut list = delegate!(self, w => w.get_completions())?;
+        highlight_best_match(&mut list);
+
+        Some(list)
     }
 
     fn get_cursor_word(&self, style: &WordStyle) -> Option<String> {
@@ -1190,6 +1215,7 @@ mod tests {
     use super::*;
 
     use modalkit::actions::{EditAction, InsertTextAction};
+    use modalkit::editing::cursor::Cursor;
 
     use crate::tests::{mock_store, TEST_ROOM1_ID};
 
@@ -1200,6 +1226,41 @@ mod tests {
                 EditTarget::Motion(MoveType::Line($dir), $count.into()),
             )
         };
+    }
+
+    fn completion_list(selected: Option<usize>) -> CompletionList {
+        CompletionList {
+            prefix: "@a".into(),
+            candidates: std::sync::Arc::new(vec!["@ada".into(), "@adam".into()]),
+            selected,
+            display: CompletionDisplay::List,
+            cursor: Cursor::new(0, 2),
+            start: Cursor::new(0, 0),
+        }
+    }
+
+    #[test]
+    fn test_highlight_best_match() {
+        let mut list = completion_list(None);
+        highlight_best_match(&mut list);
+        assert_eq!(list.selected, Some(0));
+
+        // Somebody walking the list has picked an entry for real; leave it be.
+        let mut list = completion_list(Some(1));
+        highlight_best_match(&mut list);
+        assert_eq!(list.selected, Some(1));
+    }
+
+    #[test]
+    fn test_highlight_matches_what_the_first_keypress_takes() {
+        // The highlight is drawn from a copy of the list, so the editing state still has nothing
+        // selected when the key arrives. Taking "the next entry" from there has to land on the
+        // entry that was highlighted, or the highlight would be pointing at the wrong person.
+        let mut list = completion_list(None);
+        let taken = list.select(&CompletionStyle::List(MoveDir1D::Next));
+
+        assert_eq!(taken.as_deref(), Some("@ada"));
+        assert_eq!(list.selected, Some(BEST_MATCH_INDEX));
     }
 
     #[tokio::test]
