@@ -53,8 +53,10 @@ use crate::base::{
     ProgramContext,
     ProgramStore,
 };
-use crate::commands::IAMB_COMMANDS;
+use crate::commands::{CommandForm, IAMB_COMMANDS};
+use crate::config::Keys;
 use crate::keybindings::{keys_for_command, IAMB_BINDINGS};
+use crate::message::compose::SLASH_COMMANDS;
 
 /// How many rows at the top of the window the filter bar takes up.
 const FILTER_BAR_HEIGHT: u16 = 1;
@@ -62,73 +64,188 @@ const FILTER_BAR_HEIGHT: u16 = 1;
 /// The text shown in front of whatever has been typed to filter the palette.
 const FILTER_BAR_PROMPT: &str = "filter: ";
 
-/// The width the `:command` column is padded out to, so that descriptions line up.
-const NAME_COLUMN_WIDTH: usize = 22;
+/// The width the what-you-type column is padded out to, so that the rest lines up.
+const LABEL_COLUMN_WIDTH: usize = 32;
 
 /// The width the key column is padded out to.
 const KEYS_COLUMN_WIDTH: usize = 12;
 
+/// The width the description column is padded out to.
+const DESCRIPTION_COLUMN_WIDTH: usize = 52;
+
 pub type CommandListState = ListState<PaletteItem, IambInfo>;
 
-/// One row in the palette: something the user can run, and how to run it.
+/// Where a palette row came from, which is also what its keys mean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaletteKind {
+    /// A command typed in the command bar.
+    Command,
+
+    /// A keybinding that has no command of its own.
+    Binding,
+
+    /// A keybinding from the user's own configuration.
+    UserMacro,
+
+    /// Markup typed at the start of a message, which the palette can only describe.
+    Slash,
+}
+
+impl PaletteKind {
+    /// The label shown in the palette's rightmost column.
+    fn label(&self) -> &'static str {
+        match self {
+            PaletteKind::Command => "command",
+            PaletteKind::Binding => "key",
+            PaletteKind::UserMacro => "your config",
+            PaletteKind::Slash => "message",
+        }
+    }
+}
+
+/// One row in the palette.
 #[derive(Clone)]
 pub struct PaletteItem {
-    /// The command with its arguments (`:read [all]`), or the keys for a binding that has no
-    /// command of its own.
+    /// What you type: the command with its arguments (`:room notify set <level>`), a key
+    /// sequence, or a slash command.
     label: String,
 
     /// The key sequence bound to this, if there is one.
-    keys: Option<&'static str>,
+    keys: Option<String>,
 
     /// What it does.
-    description: &'static str,
+    description: String,
 
-    /// The keys to feed back into the keymap to run it.
+    /// Where this row came from.
+    kind: PaletteKind,
+
+    /// The keys to feed back into the keymap to run it, if it can be run from here.
     ///
-    /// A command that takes arguments cannot just be run, so it is typed into the command bar and
-    /// left there for the user to finish; anything else is submitted outright.
-    run: String,
+    /// A form that still needs an argument is typed into the command bar and left there for the
+    /// user to finish rather than being submitted with a placeholder in it.
+    run: Option<String>,
+}
+
+/// Everything from `<` or `[` onwards is for the user to fill in, so it cannot be typed for them.
+const PLACEHOLDER_START: [char; 2] = ['<', '['];
+
+/// Split what follows a command name into the part that can be typed and whether any of it was a
+/// placeholder the user still has to fill in.
+fn literal_prefix(args: &str) -> (&str, bool) {
+    match args.find(PLACEHOLDER_START) {
+        Some(at) => (args[..at].trim_end(), true),
+        None => (args, false),
+    }
 }
 
 impl PaletteItem {
-    /// Every command iamb registers, paired up with the key bound to it where there is one,
-    /// followed by iamb's bindings that have no command.
-    fn all() -> Vec<PaletteItem> {
-        let commands = IAMB_COMMANDS.iter().map(|cmd| {
-            let label = match cmd.args {
-                Some(args) => format!(":{} {args}", cmd.name),
-                None => format!(":{}", cmd.name),
-            };
-            let run = match cmd.args {
-                Some(_) => format!(":{} ", cmd.name),
-                None => format!(":{}<Enter>", cmd.name),
-            };
+    /// Every row the palette shows, in the order it shows them.
+    fn all(store: &ProgramStore) -> Vec<PaletteItem> {
+        let mut items = PaletteItem::builtins();
 
-            PaletteItem {
-                label,
-                keys: keys_for_command(cmd.name),
-                description: cmd.description,
-                run,
-            }
-        });
+        items.extend(PaletteItem::user_macros(store));
 
-        let keys_only = IAMB_BINDINGS.iter().filter(|b| b.command.is_none()).map(|binding| {
-            PaletteItem {
-                label: binding.display_keys().to_string(),
-                keys: Some(binding.display_keys()),
-                description: binding.description,
-                run: binding.display_keys().to_string(),
-            }
-        });
-
-        commands.chain(keys_only).collect()
+        items
     }
 
-    /// Whether this entry should be shown when the user has typed `needle`.
+    /// The rows that come from iamb itself, independent of the user's configuration.
+    fn builtins() -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+
+        for cmd in IAMB_COMMANDS {
+            for form in cmd.forms {
+                items.push(PaletteItem::from_command(cmd.name, form));
+            }
+        }
+
+        for binding in IAMB_BINDINGS.iter().filter(|b| b.command.is_none()) {
+            let keys = binding.display_keys();
+
+            items.push(PaletteItem {
+                label: keys.to_string(),
+                keys: Some(keys.to_string()),
+                description: binding.description.to_string(),
+                kind: PaletteKind::Binding,
+                run: Some(keys.to_string()),
+            });
+        }
+
+        for slash in SLASH_COMMANDS {
+            let label = match slash.aliases {
+                [] => slash.trigger.to_string(),
+                aliases => format!("{} ({})", slash.trigger, aliases.join(", ")),
+            };
+
+            items.push(PaletteItem {
+                label,
+                keys: None,
+                description: slash.description.to_string(),
+                kind: PaletteKind::Slash,
+                run: None,
+            });
+        }
+
+        items
+    }
+
+    /// The rows that come from keybindings in the user's own configuration.
+    fn user_macros(store: &ProgramStore) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+
+        for (modes, keys) in &store.application.settings.macros {
+            for (Keys(_, input), Keys(_, run)) in keys {
+                let modes = modes
+                    .0
+                    .iter()
+                    .map(|mode| format!("{mode:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                items.push(PaletteItem {
+                    label: input.clone(),
+                    keys: Some(input.clone()),
+                    description: format!("Your macro ({modes} mode): types {run}"),
+                    kind: PaletteKind::UserMacro,
+                    run: Some(run.clone()),
+                });
+            }
+        }
+
+        items
+    }
+
+    /// Build the row for one form of one command.
+    fn from_command(name: &'static str, form: &'static CommandForm) -> PaletteItem {
+        let (label, run) = match form.args {
+            None => (format!(":{name}"), format!(":{name}<Enter>")),
+            Some(args) => {
+                let (literal, needs_input) = literal_prefix(args);
+                let typed = format!(":{name} {literal}");
+                let run = if needs_input {
+                    // Leave the command bar open on the part the user still has to fill in.
+                    format!("{}<Space>", typed.trim_end())
+                } else {
+                    format!("{typed}<Enter>")
+                };
+
+                (format!(":{name} {args}"), run)
+            },
+        };
+
+        PaletteItem {
+            label,
+            keys: keys_for_command(name).map(str::to_string),
+            description: form.description.to_string(),
+            kind: PaletteKind::Command,
+            run: Some(run),
+        }
+    }
+
+    /// Whether this row should be shown when the user has typed `needle`.
     fn matches(&self, needle: &str) -> bool {
         self.label.to_lowercase().contains(needle) ||
             self.description.to_lowercase().contains(needle) ||
-            self.keys.is_some_and(|keys| keys.to_lowercase().contains(needle))
+            self.keys.as_ref().is_some_and(|keys| keys.to_lowercase().contains(needle))
     }
 }
 
@@ -151,13 +268,15 @@ impl ListItem<IambInfo> for PaletteItem {
             Style::default()
         };
 
-        let label = format!("{:NAME_COLUMN_WIDTH$} ", self.label);
-        let keys = format!("{:KEYS_COLUMN_WIDTH$} ", self.keys.unwrap_or(""));
+        let label = format!("{:LABEL_COLUMN_WIDTH$} ", self.label);
+        let keys = format!("{:KEYS_COLUMN_WIDTH$} ", self.keys.as_deref().unwrap_or(""));
+        let description = format!("{:DESCRIPTION_COLUMN_WIDTH$} ", self.description);
 
         let spans = vec![
             Span::styled(label, style.add_modifier(StyleModifier::BOLD)),
             Span::styled(keys, style),
-            Span::styled(self.description, style),
+            Span::styled(description, style),
+            Span::styled(self.kind.label(), style.add_modifier(StyleModifier::DIM)),
         ];
 
         Text::from(Line::from(spans))
@@ -177,7 +296,13 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for PaletteItem {
     ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
         match act {
             PromptAction::Submit => {
-                let run = MacroAction::Run(self.run.clone(), Count::Exact(1));
+                let Some(run) = self.run.clone() else {
+                    let msg = format!("{} is typed at the start of a message", self.label);
+
+                    return Err(EditError::Failure(msg));
+                };
+
+                let run = MacroAction::Run(run, Count::Exact(1));
 
                 Ok(vec![(run.into(), ctx.clone())])
             },
@@ -211,20 +336,20 @@ impl CommandPaletteState {
     pub fn new(store: &mut ProgramStore) -> Self {
         let buffer = store.load_buffer(IambBufferId::CommandPaletteFilter);
         let filter = TextBoxState::new(buffer);
-        let list = CommandListState::new(IambBufferId::CommandPaletteList, PaletteItem::all());
+        let list = CommandListState::new(IambBufferId::CommandPaletteList, PaletteItem::all(store));
 
         CommandPaletteState { filter, list, filtered_by: String::new() }
     }
 
     /// Rebuild the list if what the user typed has changed since it was last built.
-    fn refilter(&mut self) {
+    fn refilter(&mut self, store: &ProgramStore) {
         let needle = self.filter.get().to_string().trim().to_lowercase();
 
         if needle == self.filtered_by {
             return;
         }
 
-        let items = PaletteItem::all()
+        let items = PaletteItem::all(store)
             .into_iter()
             .filter(|item| item.matches(&needle))
             .collect::<Vec<_>>();
@@ -262,7 +387,7 @@ impl Editable<ProgramContext, ProgramStore, IambInfo> for CommandPaletteState {
         }
 
         let res = self.filter.editor_command(act, ctx, store);
-        self.refilter();
+        self.refilter(store);
 
         res
     }
@@ -310,7 +435,7 @@ impl TerminalCursor for CommandPaletteState {
 
 impl WindowOps<IambInfo> for CommandPaletteState {
     fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
-        self.refilter();
+        self.refilter(store);
 
         let prompt_width = FILTER_BAR_PROMPT.len() as u16;
         let bar = Rect { height: area.height.min(FILTER_BAR_HEIGHT), ..area };
@@ -371,11 +496,12 @@ impl WindowOps<IambInfo> for CommandPaletteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::setup_commands;
     use modalkit::key::TerminalKey;
     use modalkit::keybindings::InputKey;
 
     fn find(label: &str) -> PaletteItem {
-        let found = PaletteItem::all().into_iter().find(|item| item.label == label);
+        let found = PaletteItem::builtins().into_iter().find(|item| item.label == label);
 
         assert!(found.is_some(), "{:?} should be listed in the palette", label);
 
@@ -383,16 +509,48 @@ mod tests {
     }
 
     #[test]
-    fn test_everything_is_listed() {
-        let items = PaletteItem::all();
+    fn test_every_command_form_is_listed() {
+        let forms = IAMB_COMMANDS.iter().map(|cmd| cmd.forms.len()).sum::<usize>();
         let keys_only = IAMB_BINDINGS.iter().filter(|b| b.command.is_none()).count();
+        let expected = forms + keys_only + SLASH_COMMANDS.len();
 
-        assert_eq!(items.len(), IAMB_COMMANDS.len() + keys_only);
+        assert_eq!(PaletteItem::builtins().len(), expected);
+    }
+
+    #[test]
+    fn test_every_listed_command_is_registered() {
+        let cmds = setup_commands();
+        let registered = cmds.complete_name("");
+
+        for cmd in IAMB_COMMANDS {
+            assert!(
+                registered.contains(&cmd.name.to_string()),
+                "{:?} is listed in the palette but not registered",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_subcommands_are_listed_individually() {
+        // The whole point of the rewrite: `:room` has many forms, not one.
+        for label in [
+            ":room notify set <level>",
+            ":room notify show",
+            ":room kick <user> <reason>",
+            ":verify confirm <key>",
+            ":invite accept",
+            ":keys export <path> <passphrase>",
+            ":read all",
+            ":unreads clear",
+        ] {
+            find(label);
+        }
     }
 
     #[test]
     fn test_bound_keys_are_shown() {
-        assert_eq!(find(":read [all]").keys, Some("<C-W>r"));
+        assert_eq!(find(":read").keys.as_deref(), Some("<C-W>r"));
         assert_eq!(find(":rooms").keys, None);
     }
 
@@ -400,13 +558,21 @@ mod tests {
     fn test_bindings_without_a_command_are_listed() {
         let zoom = find("<C-W>z");
 
-        assert_eq!(zoom.keys, Some("<C-W>z"));
-        assert_eq!(zoom.run, "<C-W>z");
+        assert_eq!(zoom.keys.as_deref(), Some("<C-W>z"));
+        assert_eq!(zoom.run.as_deref(), Some("<C-W>z"));
+    }
+
+    #[test]
+    fn test_slash_commands_are_listed_but_not_runnable() {
+        let me = find("/me");
+
+        assert_eq!(me.kind, PaletteKind::Slash);
+        assert_eq!(me.run, None);
     }
 
     #[test]
     fn test_filtering() {
-        let items = PaletteItem::all();
+        let items = PaletteItem::builtins();
         let matched = |needle: &str| items.iter().filter(|item| item.matches(needle)).count();
 
         assert!(matched("read") > 0);
@@ -414,13 +580,15 @@ mod tests {
 
         // Descriptions and keys are searched too, not just names.
         assert!(find(":dms").matches("direct"));
-        assert!(find(":read [all]").matches("<c-w>r"));
+        assert!(find(":read").matches("<c-w>r"));
     }
 
     #[test]
     fn test_run_keys_parse() {
-        for item in PaletteItem::all() {
-            let run = item.run;
+        for item in PaletteItem::builtins() {
+            let Some(run) = item.run else {
+                continue;
+            };
 
             assert!(
                 TerminalKey::from_macro_str(&run).is_ok(),
@@ -431,8 +599,24 @@ mod tests {
     }
 
     #[test]
-    fn test_commands_taking_arguments_are_left_for_the_user_to_finish() {
-        assert_eq!(find(":read [all]").run, ":read ");
-        assert_eq!(find(":rooms").run, ":rooms<Enter>");
+    fn test_forms_are_typed_up_to_the_first_placeholder() {
+        // Complete on its own, so it gets submitted.
+        assert_eq!(find(":room notify show").run.as_deref(), Some(":room notify show<Enter>"));
+
+        // Still needs a level, so the literal part is typed and the bar left open.
+        let notify_set = find(":room notify set <level>");
+
+        assert_eq!(notify_set.run.as_deref(), Some(":room notify set<Space>"));
+
+        // Nothing literal to type beyond the command name.
+        assert_eq!(find(":join <room>").run.as_deref(), Some(":join<Space>"));
+    }
+
+    #[test]
+    fn test_literal_prefix() {
+        assert_eq!(literal_prefix("notify show"), ("notify show", false));
+        assert_eq!(literal_prefix("notify set <level>"), ("notify set", true));
+        assert_eq!(literal_prefix("<room>"), ("", true));
+        assert_eq!(literal_prefix("[all]"), ("", true));
     }
 }

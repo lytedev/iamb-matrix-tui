@@ -102,6 +102,76 @@ impl SlashCommand {
     }
 }
 
+/// A slash command as the command palette shows it.
+///
+/// These are typed at the start of a message rather than in the command bar, so the palette lists
+/// them for reference but cannot run them. A test checks every trigger here still parses, so the
+/// list cannot drift away from [parse_slash_command_inner].
+pub struct SlashCommandDoc {
+    /// What you type at the start of the message.
+    pub trigger: &'static str,
+
+    /// Shorter spellings of the same thing.
+    pub aliases: &'static [&'static str],
+
+    /// What it does.
+    pub description: &'static str,
+}
+
+/// Every slash command, for the command palette.
+pub const SLASH_COMMANDS: &[SlashCommandDoc] = &[
+    SlashCommandDoc {
+        trigger: "/markdown",
+        aliases: &["/md"],
+        description: "Interpret the message as Markdown (the default)",
+    },
+    SlashCommandDoc {
+        trigger: "/html",
+        aliases: &["/h"],
+        description: "Send the message as literal HTML",
+    },
+    SlashCommandDoc {
+        trigger: "/plaintext",
+        aliases: &["/plain", "/p"],
+        description: "Send the message as-is, with no markup",
+    },
+    SlashCommandDoc {
+        trigger: "/me",
+        aliases: &[],
+        description: "Send an emote message",
+    },
+    SlashCommandDoc {
+        trigger: "/confetti",
+        aliases: &[],
+        description: "Send with confetti, in clients that show it",
+    },
+    SlashCommandDoc {
+        trigger: "/fireworks",
+        aliases: &[],
+        description: "Send with fireworks, in clients that show it",
+    },
+    SlashCommandDoc {
+        trigger: "/hearts",
+        aliases: &[],
+        description: "Send with floating hearts, in clients that show it",
+    },
+    SlashCommandDoc {
+        trigger: "/rainfall",
+        aliases: &[],
+        description: "Send with rainfall, in clients that show it",
+    },
+    SlashCommandDoc {
+        trigger: "/snowfall",
+        aliases: &[],
+        description: "Send with snowfall, in clients that show it",
+    },
+    SlashCommandDoc {
+        trigger: "/spaceinvaders",
+        aliases: &[],
+        description: "Send with space invaders, in clients that show it",
+    },
+];
+
 fn parse_slash_command_inner(input: &str) -> IResult<&str, SlashCommand> {
     let (input, _) = space0(input)?;
     let (input, slash) = alt((
@@ -374,5 +444,20 @@ pub mod tests {
         let content = text_to_message("/spaceinvaders hello".into()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effects.space_invaders");
         assert_eq!(content.body(), "hello");
+    }
+
+    #[test]
+    fn test_documented_slash_commands_parse() {
+        for cmd in SLASH_COMMANDS {
+            for trigger in std::iter::once(&cmd.trigger).chain(cmd.aliases.iter()) {
+                let input = format!("{trigger} hello");
+
+                assert!(
+                    parse_slash_command(&input).is_ok(),
+                    "{:?} should be a working slash command",
+                    trigger
+                );
+            }
+        }
     }
 }

@@ -64,7 +64,7 @@ use crate::{
     util::{replace_emojis_in_str, space, space_span, take_width, wrapped_text},
 };
 
-mod compose;
+pub mod compose;
 mod html;
 mod printer;
 mod state;

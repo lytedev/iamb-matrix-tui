@@ -53,20 +53,38 @@ version and quit.
 .It Sy ":chats"
 View a list of joined rooms and direct messages.
 .It Sy ":commands" , Sy ":palette"
-Open the command palette: a searchable list of
+Open the command palette: a searchable list of what
 .Nm
-commands and keybindings, showing what each one does and which keys run it.
-Type to filter the list, move through it with the usual movement keys, and press
+can do, showing which keys run it.
+Type to filter, move through the list with the usual movement keys, and press
 .Sy <Enter>
 to run the selected entry.
-Entries that take arguments are typed into the command bar and left for you to
-finish rather than being run straight away.
 .Pp
-The palette covers
+It lists every form of every
 .Nm
-commands and keybindings only.
-The Vim motions and operators that come from the underlying editor library are
-not listed, since there is no way to enumerate them.
+command, including subcommands such as
+.Sy ":room notify set"
+and
+.Sy ":verify confirm" ;
+the keybindings
+.Nm
+defines; any keybindings from your own
+.Xr iamb 5
+configuration; and the slash commands.
+An entry that still needs an argument is typed into the command bar and left for
+you to finish rather than being run straight away.
+Slash commands are listed for reference only, since they are typed at the start
+of a message rather than run from here.
+.Pp
+Window and tab commands
+.Pq Sy ":split" , Sy ":tabnext" , and so on
+come from the underlying editor library along with the Vim motions and
+operators.
+Those cannot be enumerated, so they are not in the palette; see
+.Sx "WINDOW COMMANDS"
+and
+.Sx "TAB COMMANDS"
+below.
 .It Sy ":dms"
 View a list of direct messages.
 .It Sy ":logout [user id]"

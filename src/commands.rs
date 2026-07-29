@@ -779,7 +779,29 @@ fn iamb_logout(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
-/// One of iamb's own commands: how it gets registered, and how the command palette describes it.
+/// One usable form of a command: what you type after the name, and what it does.
+pub struct CommandForm {
+    /// What follows the command name, e.g. `"notify set <level>"`.
+    ///
+    /// Anything in `<>` or `[]` is a placeholder the user has to fill in; everything before the
+    /// first placeholder is literal, and is what the palette can type for them.
+    pub args: Option<&'static str>,
+
+    /// What this form does.
+    pub description: &'static str,
+}
+
+/// A form of a command that takes something after the command name.
+const fn form(args: &'static str, description: &'static str) -> CommandForm {
+    CommandForm { args: Some(args), description }
+}
+
+/// A form of a command that is just the command name.
+const fn bare(description: &'static str) -> CommandForm {
+    CommandForm { args: None, description }
+}
+
+/// One of iamb's own commands: how it gets registered, and every form the palette should list.
 pub struct IambCommandInfo {
     /// The name typed after `:`.
     pub name: &'static str,
@@ -787,246 +809,277 @@ pub struct IambCommandInfo {
     /// Other names that run the same command.
     pub aliases: &'static [&'static str],
 
-    /// A synopsis of the arguments, if the command takes any.
-    pub args: Option<&'static str>,
-
-    /// What the command does, for the command palette.
-    pub description: &'static str,
-
     /// The handler that parses the command and produces actions.
     pub f: CommandFunc<IambInfo>,
+
+    /// Every usable form of the command, for the palette.
+    pub forms: &'static [CommandForm],
 }
 
 /// Every command that iamb itself defines.
 ///
 /// This is both what [setup_commands] registers and what the
-/// [command palette][crate::windows::CommandPaletteState] lists, so that the palette cannot drift
-/// out of sync with what is actually runnable. modalkit's own Vim commands are not listed here,
-/// and so are not shown in the palette.
+/// [command palette][crate::windows::palette] lists, so the palette cannot drift out of sync with
+/// what is actually runnable. Subcommands live in `forms` rather than getting their own entry,
+/// since they all go through one handler.
 pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
     IambCommandInfo {
         name: "cancel",
         aliases: &[],
-        args: None,
-        description: "Cancel the in-progress reply or edit",
         f: iamb_cancel,
+        forms: &[bare("Cancel the drafted message, including any reply")],
     },
     IambCommandInfo {
         name: "chats",
         aliases: &[],
-        args: None,
-        description: "List every direct message and room together",
         f: iamb_chats,
+        forms: &[bare("List joined rooms and direct messages together")],
     },
     IambCommandInfo {
         name: "commands",
         aliases: &["palette"],
-        args: None,
-        description: "List iamb's commands and the keys bound to them",
         f: iamb_commands,
+        forms: &[bare("List iamb's commands and the keys bound to them")],
     },
     IambCommandInfo {
         name: "create",
         aliases: &[],
-        args: Some("[++alias=] [++public] [++space] [++encrypted]"),
-        description: "Create a new room or space",
         f: iamb_create,
+        forms: &[
+            bare("Create a new room"),
+            form("++alias=<alias>", "Create a room with the given alias"),
+            form("++public", "Create a room anyone can join"),
+            form("++space", "Create a space instead of a room"),
+            form("++encrypted", "Create a room with encryption enabled"),
+        ],
     },
     IambCommandInfo {
         name: "dms",
         aliases: &[],
-        args: None,
-        description: "List your direct messages",
         f: iamb_dms,
+        forms: &[bare("List your direct messages")],
     },
     IambCommandInfo {
         name: "download",
         aliases: &[],
-        args: Some("[path] [!]"),
-        description: "Download the attachment on the selected message",
         f: iamb_download,
+        forms: &[
+            bare("Download the attachment on the selected message"),
+            form("<path>", "Download the attachment to a specific path"),
+        ],
     },
     IambCommandInfo {
         name: "edit",
         aliases: &[],
-        args: None,
-        description: "Edit the selected message",
         f: iamb_edit,
+        forms: &[bare("Edit the selected message")],
     },
     IambCommandInfo {
         name: "editor",
         aliases: &[],
-        args: None,
-        description: "Compose the message in your $EDITOR",
         f: iamb_editor,
+        forms: &[bare("Compose the message in your $EDITOR")],
     },
     IambCommandInfo {
         name: "forget",
         aliases: &[],
-        args: Some("[!]"),
-        description: "Forget the focused room",
         f: iamb_forget,
+        forms: &[bare("Remove all left rooms from the internal database")],
     },
     IambCommandInfo {
         name: "invite",
         aliases: &[],
-        args: Some("accept | reject | send <user>"),
-        description: "Accept, reject, or send a room invitation",
         f: iamb_invite,
+        forms: &[
+            bare("Accept, reject, or send an invitation to the focused room"),
+            form("accept", "Accept the invitation to the focused room"),
+            form("reject", "Reject the invitation to the focused room"),
+            form("send <user>", "Invite a user to the focused room"),
+        ],
     },
     IambCommandInfo {
         name: "join",
         aliases: &[],
-        args: Some("<room>"),
-        description: "Join a room, or open it if already joined",
         f: iamb_join,
+        forms: &[form("<room>", "Join a room, or open it if already joined")],
     },
     IambCommandInfo {
         name: "keys",
         aliases: &[],
-        args: Some("import | export <path> <passphrase>"),
-        description: "Import or export your E2EE room keys",
         f: iamb_keys,
+        forms: &[
+            form("export <path> <passphrase>", "Export and encrypt your E2EE room keys"),
+            form("import <path> <passphrase>", "Import and decrypt E2EE room keys"),
+        ],
     },
     IambCommandInfo {
         name: "leave",
         aliases: &[],
-        args: Some("[!]"),
-        description: "Leave the focused room",
         f: iamb_leave,
+        forms: &[bare("Leave the focused room")],
     },
     IambCommandInfo {
         name: "logout",
         aliases: &[],
-        args: Some("<user> [!]"),
-        description: "Log out of the current profile",
         f: iamb_logout,
+        forms: &[form("<user id>", "Log out of the current profile")],
     },
     IambCommandInfo {
         name: "members",
         aliases: &[],
-        args: None,
-        description: "List the members of the focused room",
         f: iamb_members,
+        forms: &[bare("List the members of the focused room")],
     },
     IambCommandInfo {
         name: "open",
         aliases: &[],
-        args: Some("[target]"),
-        description: "Open the link or attachment under the cursor",
         f: iamb_open,
+        forms: &[
+            bare("Open the link, or download and open the attachment"),
+            form("<path>", "Download the attachment to a path, then open it"),
+        ],
     },
     IambCommandInfo {
         name: "react",
         aliases: &[],
-        args: Some("<emoji>"),
-        description: "React to the selected message",
         f: iamb_react,
+        forms: &[form("<shortcode>", "React to the selected message with an emoji")],
     },
     IambCommandInfo {
         name: "read",
         aliases: &[],
-        args: Some("[all]"),
-        description: "Mark the focused room, thread, or selected list entry as read",
         f: iamb_read,
+        forms: &[
+            bare("Mark the focused room, thread, or selected list entry as read"),
+            form("all", "Mark every room and thread as read"),
+        ],
     },
     IambCommandInfo {
         name: "redact",
         aliases: &[],
-        args: Some("[reason] [!]"),
-        description: "Redact the selected message",
         f: iamb_redact,
+        forms: &[
+            bare("Redact the selected message"),
+            form("<reason>", "Redact the selected message with a reason"),
+        ],
     },
     IambCommandInfo {
         name: "replied",
         aliases: &[],
-        args: None,
-        description: "Jump to the message the selected one replies to",
         f: iamb_replied,
+        forms: &[bare("Jump to the message the selected one replied to")],
     },
     IambCommandInfo {
         name: "reply",
         aliases: &[],
-        args: None,
-        description: "Reply to the selected message",
         f: iamb_reply,
+        forms: &[bare("Reply to the selected message")],
     },
     IambCommandInfo {
         name: "room",
         aliases: &[],
-        args: Some("<field> <action> [value]"),
-        description: "Inspect or change a setting on the focused room",
         f: iamb_room,
+        forms: &[
+            form("name set <name>", "Set the name of the focused room"),
+            form("name unset", "Unset the name of the focused room"),
+            form("dm set", "Mark the focused room as a direct message"),
+            form("dm unset", "Mark the focused room as a normal room"),
+            form("notify set <level>", "Set the notification level: mute, mentions, keywords, all"),
+            form("notify unset", "Clear the room's notification setting"),
+            form("notify show", "Show the room's notification setting"),
+            form("tag set <tag>", "Add a tag to the focused room"),
+            form("tag unset <tag>", "Remove a tag from the focused room"),
+            form("topic set <topic>", "Set the topic of the focused room"),
+            form("topic unset", "Unset the topic of the focused room"),
+            form("topic show", "Show the topic of the focused room"),
+            form("alias set <alias>", "Point a new alternative alias at the room"),
+            form("alias unset <alias>", "Delete an alternative alias from the room"),
+            form("alias show", "Show the room's alternative aliases"),
+            form("id show", "Show the Matrix identifier for the room"),
+            form("canon set <alias>", "Make an alias the room's canonical one"),
+            form("canon unset <alias>", "Delete the room's canonical alias"),
+            form("canon show", "Show the room's canonical alias"),
+            form("ban <user> <reason>", "Ban a user from the room"),
+            form("unban <user> <reason>", "Unban a user from the room"),
+            form("kick <user> <reason>", "Kick a user from the room"),
+        ],
     },
     IambCommandInfo {
         name: "rooms",
         aliases: &[],
-        args: None,
-        description: "List the rooms you have joined",
         f: iamb_rooms,
+        forms: &[bare("List the rooms you have joined")],
     },
     IambCommandInfo {
         name: "space",
         aliases: &[],
-        args: Some("child <action>"),
-        description: "Inspect or change the focused space",
         f: iamb_space,
+        forms: &[
+            form("child set <room id>", "Add a room to the focused space"),
+            form("child remove", "Remove the selected room from the focused space"),
+        ],
     },
     IambCommandInfo {
         name: "spaces",
         aliases: &[],
-        args: None,
-        description: "List the spaces you have joined",
         f: iamb_spaces,
+        forms: &[bare("List the spaces you have joined")],
     },
     IambCommandInfo {
         name: "threads",
         aliases: &[],
-        args: None,
-        description: "List the threads you follow across all rooms",
         f: iamb_threads,
+        forms: &[bare("List the threads you follow across all rooms")],
     },
     IambCommandInfo {
         name: "unreact",
         aliases: &[],
-        args: Some("[emoji]"),
-        description: "Remove your reaction from the selected message",
         f: iamb_unreact,
+        forms: &[
+            bare("Remove all of your reactions from the selected message"),
+            form("<shortcode>", "Remove one of your reactions from the selected message"),
+        ],
     },
     IambCommandInfo {
         name: "unreads",
         aliases: &[],
-        args: Some("[clear | threads]"),
-        description: "List unread rooms, or mark them all read",
         f: iamb_unreads,
+        forms: &[
+            bare("List unread rooms"),
+            form("clear", "Mark all rooms as read"),
+            form("threads", "List unread rooms and unread followed threads together"),
+        ],
     },
     IambCommandInfo {
         name: "unreadsandthreads",
         aliases: &[],
-        args: None,
-        description: "List unread rooms and unread followed threads together",
         f: iamb_unreads_and_threads,
+        forms: &[bare("List unread rooms and unread followed threads together")],
     },
     IambCommandInfo {
         name: "upload",
         aliases: &[],
-        args: Some("<path>"),
-        description: "Upload a file to the focused room",
         f: iamb_upload,
+        forms: &[form("<path>", "Upload a file to the focused room")],
     },
     IambCommandInfo {
         name: "verify",
         aliases: &[],
-        args: Some("[request | confirm | cancel | mismatch] [id]"),
-        description: "List or act on device verifications",
         f: iamb_verify,
+        forms: &[
+            bare("List ongoing E2EE verifications"),
+            form("request <user id>", "Request a new verification with a user"),
+            form("accept <key>", "Accept a verification request"),
+            form("confirm <key>", "Confirm an in-progress verification"),
+            form("cancel <key>", "Cancel an in-progress verification"),
+            form("mismatch <key>", "Reject a verification because the emoji do not match"),
+        ],
     },
     IambCommandInfo {
         name: "welcome",
         aliases: &[],
-        args: None,
-        description: "Show the iamb welcome window",
         f: iamb_welcome,
+        forms: &[bare("Show the iamb welcome window")],
     },
 ];
 
