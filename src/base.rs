@@ -1996,6 +1996,9 @@ pub enum IambId {
 
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
+
+    /// The `:commands` window.
+    CommandPalette,
 }
 
 impl Display for IambId {
@@ -2019,6 +2022,7 @@ impl Display for IambId {
             IambId::UnreadList => f.write_str("iamb://unreads"),
             IambId::ThreadList => f.write_str("iamb://threads"),
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
+            IambId::CommandPalette => f.write_str("iamb://commands"),
         }
     }
 }
@@ -2171,6 +2175,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::UnreadThreadList)
             },
+            Some("commands") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://commands takes no path"));
+                }
+
+                Ok(IambId::CommandPalette)
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2247,6 +2258,12 @@ pub enum IambBufferId {
 
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
+
+    /// The command palette's entry list.
+    CommandPaletteList,
+
+    /// The command palette's filter bar.
+    CommandPaletteFilter,
 }
 
 impl IambBufferId {
@@ -2265,6 +2282,8 @@ impl IambBufferId {
             IambBufferId::UnreadList => IambId::UnreadList,
             IambBufferId::ThreadList => IambId::ThreadList,
             IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
+            IambBufferId::CommandPaletteList => IambId::CommandPalette,
+            IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
         };
 
         Some(id)
@@ -2311,6 +2330,8 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::UnreadList => vec![],
             IambBufferId::ThreadList => vec![],
             IambBufferId::UnreadThreadList => vec![],
+            IambBufferId::CommandPaletteList => vec![],
+            IambBufferId::CommandPaletteFilter => vec![],
         }
     }
 }

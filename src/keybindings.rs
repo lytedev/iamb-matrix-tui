@@ -2,13 +2,21 @@
 //!
 //! The keybindings are set up here. We define some iamb-specific keybindings, but the default Vim
 //! keys come from [modalkit::env::vim::keybindings].
+//!
+//! iamb's own bindings live in a single table, [IAMB_BINDINGS], which is both what installs them
+//! into the keymap and what the [command palette][crate::windows::CommandPaletteState] reads to
+//! show users which key runs which command. modalkit's keymap is write-only -- there is no way to
+//! ask it which keys map to an action -- so the table has to be the source of truth for both.
+//!
+//! Only iamb's own bindings are listed. The Vim motions and operators that modalkit provides are
+//! not in the table, and so are not discoverable through the palette.
 use modalkit::{
-    actions::{InsertTextAction, MacroAction, WindowAction},
+    actions::{Action, InsertTextAction, MacroAction, WindowAction},
     env::vim::keybindings::{InputStep, VimBindings},
     env::vim::VimMode,
     env::CommonKeyClass,
     key::TerminalKey,
-    keybindings::{EdgeEvent, EdgeRepeat, InputBindings},
+    keybindings::{EdgeEvent, EdgeRepeat, InputBindings, InputKey},
     prelude::*,
 };
 
@@ -21,6 +29,94 @@ fn once(key: &TerminalKey) -> (EdgeRepeat, EdgeEvent<TerminalKey, CommonKeyClass
     (EdgeRepeat::Once, EdgeEvent::Key(*key))
 }
 
+/// One of iamb's own keybindings.
+pub struct IambBinding {
+    /// The key sequences that run this binding, in the notation [TerminalKey::from_macro_str]
+    /// parses. The first is the one shown to users; the rest are equivalent aliases.
+    pub keys: &'static [&'static str],
+
+    /// The modes the binding is active in.
+    pub modes: &'static [VimMode],
+
+    /// The mode to switch to after running the binding, if it should change.
+    pub goto: Option<VimMode>,
+
+    /// The name of the iamb command that does the same thing, if there is one. This is how the
+    /// command palette pairs a command up with its key.
+    pub command: Option<&'static str>,
+
+    /// What the binding does, for the command palette.
+    pub description: &'static str,
+
+    /// The actions to run. This is a function because [Action] values cannot be built in a
+    /// constant.
+    pub actions: fn() -> Vec<Action<IambInfo>>,
+}
+
+impl IambBinding {
+    /// The key sequence to show users for this binding.
+    pub fn display_keys(&self) -> &'static str {
+        self.keys[0]
+    }
+}
+
+/// The modes that iamb's window-management bindings are available in.
+const WINDOW_MODES: &[VimMode] = &[VimMode::Normal, VimMode::Visual];
+
+/// The modes that the newline binding is available in.
+const TYPING_MODES: &[VimMode] = &[VimMode::Insert];
+
+/// Every keybinding that iamb itself defines.
+pub const IAMB_BINDINGS: &[IambBinding] = &[
+    IambBinding {
+        keys: &["<C-W>z", "<C-W><C-Z>"],
+        modes: WINDOW_MODES,
+        goto: Some(VimMode::Normal),
+        command: None,
+        description: "Toggle zooming in on the focused window",
+        actions: || vec![WindowAction::ZoomToggle.into()],
+    },
+    IambBinding {
+        keys: &["<C-W>m", "<C-W><C-M>"],
+        modes: WINDOW_MODES,
+        goto: Some(VimMode::Normal),
+        command: None,
+        description: "Toggle focus between the message bar and the scrollback",
+        actions: || vec![IambAction::ToggleScrollbackFocus.into()],
+    },
+    IambBinding {
+        keys: &["<C-W>r", "<C-W><C-R>"],
+        modes: WINDOW_MODES,
+        goto: Some(VimMode::Normal),
+        command: Some("read"),
+        description: "Mark the focused room, thread, or selected list entry as read",
+        actions: || vec![IambAction::Room(RoomAction::MarkRead).into()],
+    },
+    IambBinding {
+        keys: &["<C-W>m", "<S-Enter>"],
+        modes: TYPING_MODES,
+        goto: None,
+        command: None,
+        description: "Insert a newline without sending the message",
+        actions: || {
+            vec![InsertTextAction::Type(
+                Char::Single('\n').into(),
+                MoveDir1D::Previous,
+                1.into(),
+            )
+            .into()]
+        },
+    },
+];
+
+/// Look up the key sequence to show for an iamb command, if one is bound to it.
+pub fn keys_for_command(name: &str) -> Option<&'static str> {
+    IAMB_BINDINGS
+        .iter()
+        .find(|binding| binding.command == Some(name))
+        .map(IambBinding::display_keys)
+}
+
 /// Initialize the default keybinding state.
 pub fn setup_keybindings() -> Keybindings {
     let mut ism = Keybindings::empty();
@@ -31,55 +127,23 @@ pub fn setup_keybindings() -> Keybindings {
 
     vim.setup(&mut ism);
 
-    let ctrl_w = "<C-W>".parse::<TerminalKey>().unwrap();
-    let ctrl_m = "<C-M>".parse::<TerminalKey>().unwrap();
-    let ctrl_z = "<C-Z>".parse::<TerminalKey>().unwrap();
-    let ctrl_r = "<C-R>".parse::<TerminalKey>().unwrap();
-    let key_m_lc = "m".parse::<TerminalKey>().unwrap();
-    let key_r_lc = "r".parse::<TerminalKey>().unwrap();
-    let key_z_lc = "z".parse::<TerminalKey>().unwrap();
-    let shift_enter = "<S-Enter>".parse::<TerminalKey>().unwrap();
+    for binding in IAMB_BINDINGS {
+        let mut step = IambStep::new().actions((binding.actions)());
 
-    let cwz = vec![once(&ctrl_w), once(&key_z_lc)];
-    let cwcz = vec![once(&ctrl_w), once(&ctrl_z)];
-    let zoom = IambStep::new()
-        .actions(vec![WindowAction::ZoomToggle.into()])
-        .goto(VimMode::Normal);
+        if let Some(mode) = binding.goto {
+            step = step.goto(mode);
+        }
 
-    ism.add_mapping(VimMode::Normal, &cwz, &zoom);
-    ism.add_mapping(VimMode::Visual, &cwz, &zoom);
-    ism.add_mapping(VimMode::Normal, &cwcz, &zoom);
-    ism.add_mapping(VimMode::Visual, &cwcz, &zoom);
+        for keys in binding.keys {
+            let keys = TerminalKey::from_macro_str(keys)
+                .expect("iamb's own keybindings should always parse");
+            let input = keys.iter().map(once).collect::<Vec<_>>();
 
-    let cwm = vec![once(&ctrl_w), once(&key_m_lc)];
-    let cwcm = vec![once(&ctrl_w), once(&ctrl_m)];
-    let stoggle = IambStep::new()
-        .actions(vec![IambAction::ToggleScrollbackFocus.into()])
-        .goto(VimMode::Normal);
-    ism.add_mapping(VimMode::Normal, &cwm, &stoggle);
-    ism.add_mapping(VimMode::Visual, &cwm, &stoggle);
-    ism.add_mapping(VimMode::Normal, &cwcm, &stoggle);
-    ism.add_mapping(VimMode::Visual, &cwcm, &stoggle);
-
-    let cwr = vec![once(&ctrl_w), once(&key_r_lc)];
-    let cwcr = vec![once(&ctrl_w), once(&ctrl_r)];
-    let mark_read = IambStep::new()
-        .actions(vec![IambAction::Room(RoomAction::MarkRead).into()])
-        .goto(VimMode::Normal);
-    ism.add_mapping(VimMode::Normal, &cwr, &mark_read);
-    ism.add_mapping(VimMode::Visual, &cwr, &mark_read);
-    ism.add_mapping(VimMode::Normal, &cwcr, &mark_read);
-    ism.add_mapping(VimMode::Visual, &cwcr, &mark_read);
-
-    let shift_enter = vec![once(&shift_enter)];
-    let newline = IambStep::new().actions(vec![InsertTextAction::Type(
-        Char::Single('\n').into(),
-        MoveDir1D::Previous,
-        1.into(),
-    )
-    .into()]);
-    ism.add_mapping(VimMode::Insert, &cwm, &newline);
-    ism.add_mapping(VimMode::Insert, &shift_enter, &newline);
+            for mode in binding.modes {
+                ism.add_mapping(*mode, &input, &step);
+            }
+        }
+    }
 
     ism
 }
@@ -97,5 +161,28 @@ impl InputBindings<TerminalKey, IambStep> for ApplicationSettings {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_binding_keys_parse() {
+        for binding in IAMB_BINDINGS {
+            for keys in binding.keys {
+                let parsed = TerminalKey::from_macro_str(keys);
+
+                assert!(parsed.is_ok(), "{:?} should parse as a key sequence", keys);
+                assert!(!parsed.unwrap().is_empty(), "{:?} should not be empty", keys);
+            }
+        }
+    }
+
+    #[test]
+    fn test_keys_for_command() {
+        assert_eq!(keys_for_command("read"), Some("<C-W>r"));
+        assert_eq!(keys_for_command("rooms"), None);
     }
 }

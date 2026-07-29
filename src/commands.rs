@@ -8,7 +8,7 @@ use matrix_sdk::ruma::{events::tag::TagName, OwnedRoomId, OwnedUserId};
 
 use modalkit::{
     commands::{CommandError, CommandResult, CommandStep},
-    env::vim::command::{CommandContext, CommandDescription, OptionType},
+    env::vim::command::{CommandContext, CommandDescription, CommandFunc, OptionType},
     prelude::OpenTarget,
 };
 
@@ -19,6 +19,7 @@ use crate::base::{
     HomeserverAction,
     IambAction,
     IambId,
+    IambInfo,
     KeysAction,
     MemberUpdateAction,
     MessageAction,
@@ -348,6 +349,17 @@ fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     };
 
     let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_commands(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::CommandPalette));
+    let step = CommandStep::Continue(open, ctx.context.clone());
 
     return Ok(step);
 }
@@ -767,134 +779,265 @@ fn iamb_logout(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
-fn add_iamb_commands(cmds: &mut ProgramCommands) {
-    cmds.add_command(ProgramCommand {
-        name: "cancel".into(),
-        aliases: vec![],
+/// One of iamb's own commands: how it gets registered, and how the command palette describes it.
+pub struct IambCommandInfo {
+    /// The name typed after `:`.
+    pub name: &'static str,
+
+    /// Other names that run the same command.
+    pub aliases: &'static [&'static str],
+
+    /// A synopsis of the arguments, if the command takes any.
+    pub args: Option<&'static str>,
+
+    /// What the command does, for the command palette.
+    pub description: &'static str,
+
+    /// The handler that parses the command and produces actions.
+    pub f: CommandFunc<IambInfo>,
+}
+
+/// Every command that iamb itself defines.
+///
+/// This is both what [setup_commands] registers and what the
+/// [command palette][crate::windows::CommandPaletteState] lists, so that the palette cannot drift
+/// out of sync with what is actually runnable. modalkit's own Vim commands are not listed here,
+/// and so are not shown in the palette.
+pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
+    IambCommandInfo {
+        name: "cancel",
+        aliases: &[],
+        args: None,
+        description: "Cancel the in-progress reply or edit",
         f: iamb_cancel,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "create".into(),
-        aliases: vec![],
-        f: iamb_create,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "chats".into(),
-        aliases: vec![],
+    },
+    IambCommandInfo {
+        name: "chats",
+        aliases: &[],
+        args: None,
+        description: "List every direct message and room together",
         f: iamb_chats,
-    });
-    cmds.add_command(ProgramCommand { name: "dms".into(), aliases: vec![], f: iamb_dms });
-    cmds.add_command(ProgramCommand {
-        name: "download".into(),
-        aliases: vec![],
+    },
+    IambCommandInfo {
+        name: "commands",
+        aliases: &["palette"],
+        args: None,
+        description: "List iamb's commands and the keys bound to them",
+        f: iamb_commands,
+    },
+    IambCommandInfo {
+        name: "create",
+        aliases: &[],
+        args: Some("[++alias=] [++public] [++space] [++encrypted]"),
+        description: "Create a new room or space",
+        f: iamb_create,
+    },
+    IambCommandInfo {
+        name: "dms",
+        aliases: &[],
+        args: None,
+        description: "List your direct messages",
+        f: iamb_dms,
+    },
+    IambCommandInfo {
+        name: "download",
+        aliases: &[],
+        args: Some("[path] [!]"),
+        description: "Download the attachment on the selected message",
         f: iamb_download,
-    });
-    cmds.add_command(ProgramCommand { name: "open".into(), aliases: vec![], f: iamb_open });
-    cmds.add_command(ProgramCommand { name: "edit".into(), aliases: vec![], f: iamb_edit });
-    cmds.add_command(ProgramCommand {
-        name: "invite".into(),
-        aliases: vec![],
-        f: iamb_invite,
-    });
-    cmds.add_command(ProgramCommand { name: "join".into(), aliases: vec![], f: iamb_join });
-    cmds.add_command(ProgramCommand { name: "keys".into(), aliases: vec![], f: iamb_keys });
-    cmds.add_command(ProgramCommand {
-        name: "leave".into(),
-        aliases: vec![],
-        f: iamb_leave,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "forget".into(),
-        aliases: vec![],
-        f: iamb_forget,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "members".into(),
-        aliases: vec![],
-        f: iamb_members,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "react".into(),
-        aliases: vec![],
-        f: iamb_react,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "redact".into(),
-        aliases: vec![],
-        f: iamb_redact,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "reply".into(),
-        aliases: vec![],
-        f: iamb_reply,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "replied".into(),
-        aliases: vec![],
-        f: iamb_replied,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "rooms".into(),
-        aliases: vec![],
-        f: iamb_rooms,
-    });
-    cmds.add_command(ProgramCommand { name: "room".into(), aliases: vec![], f: iamb_room });
-    cmds.add_command(ProgramCommand {
-        name: "space".into(),
-        aliases: vec![],
-        f: iamb_space,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "spaces".into(),
-        aliases: vec![],
-        f: iamb_spaces,
-    });
-    cmds.add_command(ProgramCommand { name: "read".into(), aliases: vec![], f: iamb_read });
-    cmds.add_command(ProgramCommand {
-        name: "threads".into(),
-        aliases: vec![],
-        f: iamb_threads,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "unreads".into(),
-        aliases: vec![],
-        f: iamb_unreads,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "unreadsandthreads".into(),
-        aliases: vec![],
-        f: iamb_unreads_and_threads,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "unreact".into(),
-        aliases: vec![],
-        f: iamb_unreact,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "upload".into(),
-        aliases: vec![],
-        f: iamb_upload,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "verify".into(),
-        aliases: vec![],
-        f: iamb_verify,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "welcome".into(),
-        aliases: vec![],
-        f: iamb_welcome,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "editor".into(),
-        aliases: vec![],
+    },
+    IambCommandInfo {
+        name: "edit",
+        aliases: &[],
+        args: None,
+        description: "Edit the selected message",
+        f: iamb_edit,
+    },
+    IambCommandInfo {
+        name: "editor",
+        aliases: &[],
+        args: None,
+        description: "Compose the message in your $EDITOR",
         f: iamb_editor,
-    });
-    cmds.add_command(ProgramCommand {
-        name: "logout".into(),
-        aliases: vec![],
+    },
+    IambCommandInfo {
+        name: "forget",
+        aliases: &[],
+        args: Some("[!]"),
+        description: "Forget the focused room",
+        f: iamb_forget,
+    },
+    IambCommandInfo {
+        name: "invite",
+        aliases: &[],
+        args: Some("accept | reject | send <user>"),
+        description: "Accept, reject, or send a room invitation",
+        f: iamb_invite,
+    },
+    IambCommandInfo {
+        name: "join",
+        aliases: &[],
+        args: Some("<room>"),
+        description: "Join a room, or open it if already joined",
+        f: iamb_join,
+    },
+    IambCommandInfo {
+        name: "keys",
+        aliases: &[],
+        args: Some("import | export <path> <passphrase>"),
+        description: "Import or export your E2EE room keys",
+        f: iamb_keys,
+    },
+    IambCommandInfo {
+        name: "leave",
+        aliases: &[],
+        args: Some("[!]"),
+        description: "Leave the focused room",
+        f: iamb_leave,
+    },
+    IambCommandInfo {
+        name: "logout",
+        aliases: &[],
+        args: Some("<user> [!]"),
+        description: "Log out of the current profile",
         f: iamb_logout,
-    });
+    },
+    IambCommandInfo {
+        name: "members",
+        aliases: &[],
+        args: None,
+        description: "List the members of the focused room",
+        f: iamb_members,
+    },
+    IambCommandInfo {
+        name: "open",
+        aliases: &[],
+        args: Some("[target]"),
+        description: "Open the link or attachment under the cursor",
+        f: iamb_open,
+    },
+    IambCommandInfo {
+        name: "react",
+        aliases: &[],
+        args: Some("<emoji>"),
+        description: "React to the selected message",
+        f: iamb_react,
+    },
+    IambCommandInfo {
+        name: "read",
+        aliases: &[],
+        args: Some("[all]"),
+        description: "Mark the focused room, thread, or selected list entry as read",
+        f: iamb_read,
+    },
+    IambCommandInfo {
+        name: "redact",
+        aliases: &[],
+        args: Some("[reason] [!]"),
+        description: "Redact the selected message",
+        f: iamb_redact,
+    },
+    IambCommandInfo {
+        name: "replied",
+        aliases: &[],
+        args: None,
+        description: "Jump to the message the selected one replies to",
+        f: iamb_replied,
+    },
+    IambCommandInfo {
+        name: "reply",
+        aliases: &[],
+        args: None,
+        description: "Reply to the selected message",
+        f: iamb_reply,
+    },
+    IambCommandInfo {
+        name: "room",
+        aliases: &[],
+        args: Some("<field> <action> [value]"),
+        description: "Inspect or change a setting on the focused room",
+        f: iamb_room,
+    },
+    IambCommandInfo {
+        name: "rooms",
+        aliases: &[],
+        args: None,
+        description: "List the rooms you have joined",
+        f: iamb_rooms,
+    },
+    IambCommandInfo {
+        name: "space",
+        aliases: &[],
+        args: Some("child <action>"),
+        description: "Inspect or change the focused space",
+        f: iamb_space,
+    },
+    IambCommandInfo {
+        name: "spaces",
+        aliases: &[],
+        args: None,
+        description: "List the spaces you have joined",
+        f: iamb_spaces,
+    },
+    IambCommandInfo {
+        name: "threads",
+        aliases: &[],
+        args: None,
+        description: "List the threads you follow across all rooms",
+        f: iamb_threads,
+    },
+    IambCommandInfo {
+        name: "unreact",
+        aliases: &[],
+        args: Some("[emoji]"),
+        description: "Remove your reaction from the selected message",
+        f: iamb_unreact,
+    },
+    IambCommandInfo {
+        name: "unreads",
+        aliases: &[],
+        args: Some("[clear | threads]"),
+        description: "List unread rooms, or mark them all read",
+        f: iamb_unreads,
+    },
+    IambCommandInfo {
+        name: "unreadsandthreads",
+        aliases: &[],
+        args: None,
+        description: "List unread rooms and unread followed threads together",
+        f: iamb_unreads_and_threads,
+    },
+    IambCommandInfo {
+        name: "upload",
+        aliases: &[],
+        args: Some("<path>"),
+        description: "Upload a file to the focused room",
+        f: iamb_upload,
+    },
+    IambCommandInfo {
+        name: "verify",
+        aliases: &[],
+        args: Some("[request | confirm | cancel | mismatch] [id]"),
+        description: "List or act on device verifications",
+        f: iamb_verify,
+    },
+    IambCommandInfo {
+        name: "welcome",
+        aliases: &[],
+        args: None,
+        description: "Show the iamb welcome window",
+        f: iamb_welcome,
+    },
+];
+
+fn add_iamb_commands(cmds: &mut ProgramCommands) {
+    for cmd in IAMB_COMMANDS {
+        cmds.add_command(ProgramCommand {
+            name: cmd.name.into(),
+            aliases: cmd.aliases.iter().map(|a| (*a).into()).collect(),
+            f: cmd.f,
+        });
+    }
 }
 
 /// Initialize the default command state.
@@ -928,6 +1071,22 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         assert!(cmds.input_cmd(":read bogus", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_commands() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::CommandPalette));
+
+        let res = cmds.input_cmd(":commands", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.clone().into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":palette", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":commands bogus", ctx).is_err());
     }
 
     #[test]

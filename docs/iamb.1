@@ -52,6 +52,21 @@ version and quit.
 .Bl -tag -width Ds
 .It Sy ":chats"
 View a list of joined rooms and direct messages.
+.It Sy ":commands" , Sy ":palette"
+Open the command palette: a searchable list of
+.Nm
+commands and keybindings, showing what each one does and which keys run it.
+Type to filter the list, move through it with the usual movement keys, and press
+.Sy <Enter>
+to run the selected entry.
+Entries that take arguments are typed into the command bar and left for you to
+finish rather than being run straight away.
+.Pp
+The palette covers
+.Nm
+commands and keybindings only.
+The Vim motions and operators that come from the underlying editor library are
+not listed, since there is no way to enumerate them.
 .It Sy ":dms"
 View a list of direct messages.
 .It Sy ":logout [user id]"

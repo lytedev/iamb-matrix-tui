@@ -81,10 +81,11 @@ use crate::base::{
     UnreadInfo,
 };
 
-use self::{room::RoomState, welcome::WelcomeState};
+use self::{palette::CommandPaletteState, room::RoomState, welcome::WelcomeState};
 use crate::message::MessageTimeStamp;
 use feruca::Collator;
 
+pub mod palette;
 pub mod room;
 pub mod welcome;
 
@@ -398,6 +399,7 @@ macro_rules! delegate {
             IambWindow::UnreadList($id) => $e,
             IambWindow::ThreadList($id) => $e,
             IambWindow::UnreadThreadList($id) => $e,
+            IambWindow::CommandPalette($id) => $e,
         }
     };
 }
@@ -414,6 +416,7 @@ pub enum IambWindow {
     UnreadList(UnreadListState),
     ThreadList(ThreadListState),
     UnreadThreadList(UnreadThreadListState),
+    CommandPalette(CommandPaletteState),
 }
 
 impl IambWindow {
@@ -602,6 +605,7 @@ impl WindowOps<IambInfo> for IambWindow {
     fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
         match self {
             IambWindow::Room(state) => state.draw(area, buf, focused, store),
+            IambWindow::CommandPalette(state) => state.draw(area, buf, focused, store),
             IambWindow::DirectList(state) => {
                 let mut items = store
                     .application
@@ -837,6 +841,7 @@ impl WindowOps<IambInfo> for IambWindow {
     fn dup(&self, store: &mut ProgramStore) -> Self {
         match self {
             IambWindow::Room(w) => w.dup(store).into(),
+            IambWindow::CommandPalette(w) => IambWindow::CommandPalette(w.dup(store)),
             IambWindow::DirectList(w) => w.dup(store).into(),
             IambWindow::MemberList(w, room_id, last_fetch) => {
                 IambWindow::MemberList(w.dup(store), room_id.clone(), *last_fetch)
@@ -892,6 +897,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadList(_) => IambId::UnreadList,
             IambWindow::ThreadList(_) => IambId::ThreadList,
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
+            IambWindow::CommandPalette(_) => IambId::CommandPalette,
         }
     }
 
@@ -906,6 +912,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
+            IambWindow::CommandPalette(_) => bold_spans("Commands"),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -936,6 +943,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
+            IambWindow::CommandPalette(_) => bold_spans("Commands"),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
@@ -1006,6 +1014,11 @@ impl Window<IambInfo> for IambWindow {
                 let list = ThreadListState::new(IambBufferId::ThreadList, vec![]);
 
                 Ok(IambWindow::ThreadList(list))
+            },
+            IambId::CommandPalette => {
+                let win = CommandPaletteState::new(store);
+
+                Ok(IambWindow::CommandPalette(win))
             },
             IambId::UnreadThreadList => {
                 let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
