@@ -150,6 +150,30 @@ key while you are typing a message.
 View a list of threads you follow across all rooms.
 A thread counts as followed if you started it, replied in it, or have a
 thread-scoped read receipt for it.
+.It Sy ":undoread"
+Undo the most recent read, putting the read markers it moved back where they
+were.
+Repeating this walks back through earlier reads, most recent first.
+A bulk read
+.Pq Sy ":read all" , Sy ":unreads clear"
+counts as one step, so a single
+.Sy ":undoread"
+reverses all of it.
+Undoing a read of one thread affects only that thread, never the rest of its
+room.
+Bound to
+.Sy <C-W>u .
+.Pp
+Only explicit reads are recorded.
+If
+.Sy read_receipt_manual
+is off, merely viewing a room advances your read marker, and those advances are
+not undoable.
+.Pp
+The undo history lives in memory and is not kept across restarts.
+Restoring a read marker also cannot always be made to stick on the server:
+Synapse ignores a read receipt that points at an event older than the one it
+already has for you, so after a restart the room may read as read again.
 .It Sy ":unreads"
 View a list of unread rooms.
 .It Sy ":unreads clear"

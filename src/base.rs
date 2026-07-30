@@ -555,6 +555,9 @@ pub enum IambAction {
 
     /// Clear all unread messages.
     ClearUnreads,
+
+    /// Put the receipts moved by the most recent read operation back where they were.
+    UndoRead,
 }
 
 impl IambAction {
@@ -599,6 +602,7 @@ impl ApplicationAction for IambAction {
         match self {
             IambAction::AcceptCompletion => SequenceStatus::Track,
             IambAction::ClearUnreads => SequenceStatus::Break,
+            IambAction::UndoRead => SequenceStatus::Break,
             IambAction::Homeserver(..) => SequenceStatus::Break,
             IambAction::Keys(..) => SequenceStatus::Break,
             IambAction::Message(..) => SequenceStatus::Break,
@@ -616,6 +620,7 @@ impl ApplicationAction for IambAction {
         match self {
             IambAction::AcceptCompletion => SequenceStatus::Atom,
             IambAction::ClearUnreads => SequenceStatus::Atom,
+            IambAction::UndoRead => SequenceStatus::Atom,
             IambAction::Homeserver(..) => SequenceStatus::Atom,
             IambAction::Keys(..) => SequenceStatus::Atom,
             IambAction::Message(..) => SequenceStatus::Atom,
@@ -633,6 +638,7 @@ impl ApplicationAction for IambAction {
         match self {
             IambAction::AcceptCompletion => SequenceStatus::Ignore,
             IambAction::ClearUnreads => SequenceStatus::Ignore,
+            IambAction::UndoRead => SequenceStatus::Ignore,
             IambAction::Homeserver(..) => SequenceStatus::Ignore,
             IambAction::Keys(..) => SequenceStatus::Ignore,
             IambAction::Message(..) => SequenceStatus::Ignore,
@@ -650,6 +656,7 @@ impl ApplicationAction for IambAction {
         match self {
             IambAction::AcceptCompletion => false,
             IambAction::ClearUnreads => false,
+            IambAction::UndoRead => false,
             IambAction::Homeserver(..) => false,
             IambAction::Message(..) => false,
             IambAction::Space(..) => false,
@@ -778,6 +785,10 @@ pub enum IambError {
     /// A failure due to not having a room selected.
     #[error("Current window is not a room")]
     NoSelectedRoom,
+
+    /// A failure due to there being no recorded read operation left to undo.
+    #[error("No read left to undo")]
+    NothingToUndoRead,
 
     /// A failure due to not having a space selected.
     #[error("Current window is not a space")]
@@ -1588,6 +1599,49 @@ impl RoomInfo {
         new_key <= old_key
     }
 
+    /// Where the user's receipt currently sits in each thread of this room.
+    pub fn receipt_snapshot(&self, user_id: &UserId) -> HashMap<ReceiptThread, OwnedEventId> {
+        self.receipts(user_id).map(|(t, e)| (t.clone(), e.clone())).collect()
+    }
+
+    /// Move the user's receipt for `thread` back to `event_id`, or drop it entirely when `None`.
+    ///
+    /// This deliberately skips the [RoomInfo::receipt_is_stale] check that [RoomInfo::set_receipt]
+    /// applies. That check discards receipts the *server* hands back out of order, which is a
+    /// different situation from this one: the only caller here is `:undoread` restoring a position
+    /// the user explicitly asked to go back to. Code handling a receipt that came from the server
+    /// must go through [RoomInfo::set_receipt] so that it stays guarded.
+    pub fn rewind_receipt(
+        &mut self,
+        thread: ReceiptThread,
+        user_id: OwnedUserId,
+        event_id: Option<OwnedEventId>,
+    ) {
+        self.clear_receipt(&thread, &user_id);
+
+        let Some(event_id) = event_id else {
+            // `clear_receipt` only prunes `event_receipts`; `set_receipt` always overwrites the
+            // `user_receipts` entry afterwards, but there is nothing to put back here.
+            if let Some(users) = self.user_receipts.get_mut(&thread) {
+                users.remove(&user_id);
+
+                if users.is_empty() {
+                    self.user_receipts.remove(&thread);
+                }
+            }
+
+            return;
+        };
+
+        self.event_receipts
+            .entry(thread.clone())
+            .or_default()
+            .entry(event_id.clone())
+            .or_default()
+            .insert(user_id.clone());
+        self.user_receipts.entry(thread).or_default().insert(user_id, event_id);
+    }
+
     pub fn set_receipt(
         &mut self,
         thread: ReceiptThread,
@@ -1945,6 +1999,34 @@ pub struct ChatStore {
 
     /// Notifications that should be dismissed when the user opens the room.
     pub open_notifications: HashMap<OwnedRoomId, Vec<NotificationHandle>>,
+
+    /// Read operations that `:undoread` can walk back through, oldest first.
+    pub read_undos: Vec<ReadUndoEntry>,
+}
+
+/// How many read operations `:undoread` can walk back through.
+///
+/// The stack lives in memory only, so this exists to bound it over a long-running session rather
+/// than to enforce any policy.
+pub const READ_UNDO_STACK_LIMIT: usize = 64;
+
+/// One receipt that a read operation moved, and where it sat beforehand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadUndoTarget {
+    pub room_id: OwnedRoomId,
+    pub thread: ReceiptThread,
+
+    /// Where the receipt was before the read, or `None` when there was no receipt at all.
+    pub previous: Option<OwnedEventId>,
+}
+
+/// One undoable read operation.
+///
+/// A bulk read (`:read all`, `:unreads clear`) touches many receipts across many rooms, but it is
+/// a single thing the user did, so it becomes a single entry that one `:undoread` reverses.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReadUndoEntry {
+    pub targets: Vec<ReadUndoTarget>,
 }
 
 impl ChatStore {
@@ -1970,7 +2052,82 @@ impl ChatStore {
             ring_bell: false,
             focused: true,
             open_notifications: Default::default(),
+            read_undos: Default::default(),
         }
+    }
+
+    /// Snapshot the receipts in `room_ids`, run `apply`, and record what moved for `:undoread`.
+    ///
+    /// Only receipts that actually changed are recorded, so a bulk read over mostly-read rooms
+    /// still produces one small entry, and a read that changed nothing produces no entry at all.
+    ///
+    /// This wraps the user-initiated read paths only. Receipts that advance because the user
+    /// merely looked at a room are not recorded: with `read_receipt_manual` off that happens
+    /// constantly, and burying the deliberate reads under it would make the stack useless.
+    pub fn record_read<F>(&mut self, room_ids: Vec<OwnedRoomId>, apply: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let user_id = self.settings.profile.user_id.clone();
+        let before = room_ids
+            .into_iter()
+            .map(|room_id| {
+                let snapshot = self
+                    .rooms
+                    .get(&room_id)
+                    .map(|i| i.receipt_snapshot(&user_id))
+                    .unwrap_or_default();
+
+                (room_id, snapshot)
+            })
+            .collect::<Vec<_>>();
+
+        apply(self);
+
+        let mut targets = Vec::new();
+
+        for (room_id, before) in before {
+            let Some(info) = self.rooms.get(&room_id) else {
+                continue;
+            };
+
+            for (thread, current) in info.receipts(&user_id) {
+                let previous = before.get(thread);
+
+                if previous == Some(current) {
+                    continue;
+                }
+
+                targets.push(ReadUndoTarget {
+                    room_id: room_id.clone(),
+                    thread: thread.clone(),
+                    previous: previous.cloned(),
+                });
+            }
+        }
+
+        if targets.is_empty() {
+            return;
+        }
+
+        if self.read_undos.len() >= READ_UNDO_STACK_LIMIT {
+            self.read_undos.remove(0);
+        }
+
+        self.read_undos.push(ReadUndoEntry { targets });
+    }
+
+    /// Put the receipts moved by the most recent recorded read operation back where they were.
+    pub fn undo_read(&mut self) -> Option<ReadUndoEntry> {
+        let entry = self.read_undos.pop()?;
+        let user_id = self.settings.profile.user_id.clone();
+
+        for target in entry.targets.iter() {
+            let info = self.rooms.get_or_default(target.room_id.clone());
+            info.rewind_receipt(target.thread.clone(), user_id.clone(), target.previous.clone());
+        }
+
+        Some(entry)
     }
 
     /// Get a joined room.
@@ -2827,6 +2984,142 @@ pub mod tests {
         // A restore that races a newer local `:read` must not drag the marker backwards.
         room.set_receipt(thread, user_id, followed_root.clone());
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+    }
+
+    /// A [ChatStore] holding a single room with two followed threads.
+    async fn mock_store_with_threads() -> (ChatStore, OwnedRoomId, OwnedEventId, OwnedEventId) {
+        let (room, _, followed_root, ignored_root) = mock_room_with_threads();
+        let mut store = mock_store().await.application;
+        let room_id = TEST_ROOM1_ID.clone();
+
+        store.rooms.insert(room_id.clone(), room);
+
+        (store, room_id, followed_root, ignored_root)
+    }
+
+    #[test]
+    fn test_rewind_receipt_bypasses_stale_guard() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+        let thread = ReceiptThread::Thread(followed_root.clone());
+
+        room.mark_read(&user_id, Some(followed_root.clone()));
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // `set_receipt` still refuses to walk the marker back, because that is what protects us
+        // from receipts the server replays out of order.
+        room.set_receipt(thread.clone(), user_id.clone(), followed_root.clone());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // The explicit rewind path does move it back.
+        room.rewind_receipt(thread.clone(), user_id.clone(), Some(followed_root.clone()));
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // Rewinding to `None` drops the receipt entirely.
+        room.rewind_receipt(thread.clone(), user_id.clone(), None);
+        assert_eq!(room.receipt_snapshot(&user_id).get(&thread), None);
+    }
+
+    #[tokio::test]
+    async fn test_undo_read_is_scoped_to_the_thread_that_was_read() {
+        let (mut store, room_id, followed_root, ignored_root) = mock_store_with_threads().await;
+        let user_id = store.settings.profile.user_id.clone();
+        let settings = store.settings.clone();
+
+        // Subscribe to the second thread so both are followed and unread.
+        store.rooms.get_or_default(room_id.clone()).set_receipt(
+            ReceiptThread::Thread(ignored_root.clone()),
+            user_id.clone(),
+            ignored_root.clone(),
+        );
+
+        store.record_read(vec![room_id.clone()], |app| {
+            app.rooms
+                .get_or_default(room_id.clone())
+                .mark_read(&user_id, Some(followed_root.clone()));
+        });
+
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        let entry = store.undo_read().unwrap();
+        assert_eq!(entry.targets.len(), 1);
+        assert_eq!(entry.targets[0].thread, ReceiptThread::Thread(followed_root.clone()));
+        assert_eq!(entry.targets[0].previous, None);
+
+        // The read is undone, and the room's other threads and its main timeline are untouched.
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+
+        let snapshot = room.receipt_snapshot(&user_id);
+        assert_eq!(snapshot.get(&ReceiptThread::Thread(ignored_root.clone())), Some(&ignored_root));
+        assert_eq!(snapshot.get(&ReceiptThread::Main), None);
+
+        // The stack is now empty.
+        assert_eq!(store.undo_read(), None);
+    }
+
+    #[tokio::test]
+    async fn test_undo_read_reverses_a_bulk_read_in_one_step() {
+        let (mut store, room_id, followed_root, ignored_root) = mock_store_with_threads().await;
+        let user_id = store.settings.profile.user_id.clone();
+        let settings = store.settings.clone();
+
+        store.record_read(vec![room_id.clone()], |app| {
+            app.rooms.get_or_default(room_id.clone()).fully_read(&user_id);
+        });
+
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+        assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
+
+        // One bulk read is one entry, however many receipts it moved.
+        assert_eq!(store.read_undos.len(), 1);
+        assert!(store.read_undos[0].targets.len() > 1);
+
+        let entry = store.undo_read().unwrap();
+        assert!(entry.targets.iter().all(|t| t.previous.is_none()));
+
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(room.unreads(&settings).is_unread());
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+        assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
+    }
+
+    #[tokio::test]
+    async fn test_repeated_reads_undo_one_at_a_time() {
+        let (mut store, room_id, followed_root, ignored_root) = mock_store_with_threads().await;
+        let user_id = store.settings.profile.user_id.clone();
+        let settings = store.settings.clone();
+
+        for root in [&followed_root, &ignored_root] {
+            store.record_read(vec![room_id.clone()], |app| {
+                app.rooms
+                    .get_or_default(room_id.clone())
+                    .mark_read(&user_id, Some(root.clone()));
+            });
+        }
+
+        assert_eq!(store.read_undos.len(), 2);
+
+        // Reading a thread that is already read moves nothing, so it records nothing.
+        store.record_read(vec![room_id.clone()], |app| {
+            app.rooms
+                .get_or_default(room_id.clone())
+                .mark_read(&user_id, Some(ignored_root.clone()));
+        });
+        assert_eq!(store.read_undos.len(), 2);
+
+        // Undoing walks back through the reads in reverse order.
+        store.undo_read().unwrap();
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        store.undo_read().unwrap();
+        let room = store.rooms.get(&room_id).unwrap();
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
     }
 
     #[test]

@@ -383,8 +383,9 @@ where
     let ReadTarget { room_id, thread } = item.read_target();
     let user_id = store.application.settings.profile.user_id.clone();
 
-    let info = store.application.rooms.get_or_default(room_id.clone());
-    info.mark_read(&user_id, thread);
+    store.application.record_read(vec![room_id.clone()], |app| {
+        app.rooms.get_or_default(room_id.clone()).mark_read(&user_id, thread);
+    });
 
     // Any notification we showed for this room is now stale.
     store.application.open_notifications.remove(&room_id);

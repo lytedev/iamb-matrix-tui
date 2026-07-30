@@ -605,18 +605,37 @@ impl Application {
                 None
             },
             IambAction::ClearUnreads => {
-                let user_id = &store.application.settings.profile.user_id;
-
                 // Clear any notifications we displayed:
                 store.application.open_notifications.clear();
 
-                for room_id in store.application.sync_info.chats() {
-                    if let Some(room) = store.application.rooms.get_mut(room_id) {
-                        room.fully_read(user_id);
+                let chats = store
+                    .application
+                    .sync_info
+                    .chats()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+
+                store.application.record_read(chats.clone(), |app| {
+                    let user_id = &app.settings.profile.user_id;
+
+                    for room_id in chats.iter() {
+                        if let Some(room) = app.rooms.get_mut(room_id) {
+                            room.fully_read(user_id);
+                        }
                     }
-                }
+                });
 
                 None
+            },
+            IambAction::UndoRead => {
+                let Some(entry) = store.application.undo_read() else {
+                    return Err(IambError::NothingToUndoRead.into());
+                };
+
+                let restored = entry.targets.len();
+                let plural = if restored == 1 { "marker" } else { "markers" };
+
+                Some(InfoMessage::from(format!("Restored {restored} read {plural}")))
             },
 
             IambAction::ToggleScrollbackFocus => {

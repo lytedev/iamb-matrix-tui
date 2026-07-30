@@ -93,6 +93,14 @@ pub const IAMB_BINDINGS: &[IambBinding] = &[
         actions: || vec![IambAction::Room(RoomAction::MarkRead).into()],
     },
     IambBinding {
+        keys: &["<C-W>u", "<C-W><C-U>"],
+        modes: WINDOW_MODES,
+        goto: Some(VimMode::Normal),
+        command: Some("undoread"),
+        description: "Undo the most recent read, restoring the previous read markers",
+        actions: || vec![IambAction::UndoRead.into()],
+    },
+    IambBinding {
         // Vim leaves <C-K> alone outside of insert and command mode, where it starts a digraph;
         // this only takes the normal and visual mode key, so digraphs still work while typing.
         keys: &["<C-K>"],

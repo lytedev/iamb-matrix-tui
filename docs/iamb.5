@@ -216,6 +216,10 @@ When
 .Sy true ,
 simply viewing a room or thread no longer advances your read marker, so unreads
 persist until you dismiss them.
+It also makes
+.Sy :undoread
+useful, since every read is then something you did deliberately; only explicit
+reads are recorded for undo.
 Defaults to
 .Sy false .
 .It Sy request_timeout

@@ -353,6 +353,17 @@ fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_undoread(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = IambAction::UndoRead;
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_commands(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -1082,6 +1093,12 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         ],
     },
     IambCommandInfo {
+        name: "undoread",
+        aliases: &[],
+        f: iamb_undoread,
+        forms: &[bare("Undo the most recent read, restoring the previous read markers")],
+    },
+    IambCommandInfo {
         name: "unreads",
         aliases: &[],
         f: iamb_unreads,
@@ -1178,6 +1195,18 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         assert!(cmds.input_cmd(":read bogus", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_undoread() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let act = IambAction::UndoRead;
+        let res = cmds.input_cmd(":undoread", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":undoread all", ctx).is_err());
     }
 
     #[test]
