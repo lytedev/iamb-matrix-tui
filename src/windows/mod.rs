@@ -85,6 +85,7 @@ use self::{palette::CommandPaletteState, room::RoomState, welcome::WelcomeState}
 use crate::message::MessageTimeStamp;
 use feruca::Collator;
 
+pub mod filtered;
 pub mod palette;
 pub mod room;
 pub mod welcome;

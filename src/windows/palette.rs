@@ -13,56 +13,24 @@
 use std::fmt::{self, Display};
 
 use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
     style::{Modifier as StyleModifier, Style},
     text::{Line, Span, Text},
-    widgets::StatefulWidget,
 };
 
 use modalkit::{
-    actions::{
-        EditAction,
-        Editable,
-        EditorAction,
-        Jumpable,
-        MacroAction,
-        PromptAction,
-        Promptable,
-        Scrollable,
-    },
-    editing::completion::CompletionList,
-    editing::context::Resolve,
+    actions::{MacroAction, PromptAction, Promptable},
     errors::{EditError, EditResult},
     prelude::*,
 };
 
-use modalkit_ratatui::{
-    list::{List, ListCursor, ListItem, ListState},
-    textbox::{TextBox, TextBoxState},
-    TermOffset,
-    TerminalCursor,
-    WindowOps,
-};
+use modalkit_ratatui::list::{ListCursor, ListItem};
 
-use crate::base::{
-    IambBufferId,
-    IambInfo,
-    IambResult,
-    ProgramAction,
-    ProgramContext,
-    ProgramStore,
-};
+use crate::base::{IambBufferId, IambInfo, ProgramAction, ProgramContext, ProgramStore};
 use crate::commands::{CommandForm, IAMB_COMMANDS};
 use crate::config::Keys;
 use crate::keybindings::{keys_for_command, IAMB_BINDINGS};
 use crate::message::compose::SLASH_COMMANDS;
-
-/// How many rows at the top of the window the filter bar takes up.
-const FILTER_BAR_HEIGHT: u16 = 1;
-
-/// The text shown in front of whatever has been typed to filter the palette.
-const FILTER_BAR_PROMPT: &str = "filter: ";
+use crate::windows::filtered::{FilteredItem, FilteredListState};
 
 /// The width the what-you-type column is padded out to, so that the rest lines up.
 const LABEL_COLUMN_WIDTH: usize = 32;
@@ -73,7 +41,8 @@ const KEYS_COLUMN_WIDTH: usize = 12;
 /// The width the description column is padded out to.
 const DESCRIPTION_COLUMN_WIDTH: usize = 52;
 
-pub type CommandListState = ListState<PaletteItem, IambInfo>;
+/// The `:commands` window.
+pub type CommandPaletteState = FilteredListState<PaletteItem>;
 
 /// Where a palette row came from, which is also what its keys mean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,6 +224,29 @@ impl Display for PaletteItem {
     }
 }
 
+impl FilteredItem for PaletteItem {
+    fn filter_buffer() -> IambBufferId {
+        IambBufferId::CommandPaletteFilter
+    }
+
+    fn list_buffer() -> IambBufferId {
+        IambBufferId::CommandPaletteList
+    }
+
+    fn matching(needle: &str, store: &mut ProgramStore) -> Vec<PaletteItem> {
+        let needle = needle.to_lowercase();
+
+        PaletteItem::all(store)
+            .into_iter()
+            .filter(|item| item.matches(&needle))
+            .collect()
+    }
+
+    fn empty_message() -> &'static str {
+        "No commands match that filter"
+    }
+}
+
 impl ListItem<IambInfo> for PaletteItem {
     fn show(
         &self,
@@ -317,179 +309,6 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for PaletteItem {
                 Err(EditError::Failure(msg.into()))
             },
         }
-    }
-}
-
-/// State for the `:commands` window.
-pub struct CommandPaletteState {
-    /// What the user has typed to narrow the list down.
-    filter: TextBoxState<IambInfo>,
-
-    /// The commands matching the filter.
-    list: CommandListState,
-
-    /// The filter text the list was last rebuilt for.
-    filtered_by: String,
-}
-
-impl CommandPaletteState {
-    pub fn new(store: &mut ProgramStore) -> Self {
-        let buffer = store.load_buffer(IambBufferId::CommandPaletteFilter);
-        let filter = TextBoxState::new(buffer);
-        let list = CommandListState::new(IambBufferId::CommandPaletteList, PaletteItem::all(store));
-
-        CommandPaletteState { filter, list, filtered_by: String::new() }
-    }
-
-    /// Rebuild the list if what the user typed has changed since it was last built.
-    fn refilter(&mut self, store: &ProgramStore) {
-        let needle = self.filter.get().to_string().trim().to_lowercase();
-
-        if needle == self.filtered_by {
-            return;
-        }
-
-        let items = PaletteItem::all(store)
-            .into_iter()
-            .filter(|item| item.matches(&needle))
-            .collect::<Vec<_>>();
-
-        self.list.set(items);
-        self.filtered_by = needle;
-    }
-}
-
-/// Whether an editing action should move through the list rather than edit the filter text.
-///
-/// Vertical movement is how a palette is navigated, and there is nothing vertical to do in a
-/// one-line filter bar, so line motions belong to the list and everything else to the text box.
-fn moves_through_list(act: &EditorAction, ctx: &ProgramContext) -> bool {
-    let EditorAction::Edit(action, EditTarget::Motion(motion, _)) = act else {
-        return false;
-    };
-
-    if !matches!(ctx.resolve(action), EditAction::Motion) {
-        return false;
-    }
-
-    matches!(motion, MoveType::Line(_) | MoveType::BufferPos(_) | MoveType::ViewportPos(_))
-}
-
-impl Editable<ProgramContext, ProgramStore, IambInfo> for CommandPaletteState {
-    fn editor_command(
-        &mut self,
-        act: &EditorAction,
-        ctx: &ProgramContext,
-        store: &mut ProgramStore,
-    ) -> EditResult<EditInfo, IambInfo> {
-        if moves_through_list(act, ctx) {
-            return self.list.editor_command(act, ctx, store);
-        }
-
-        let res = self.filter.editor_command(act, ctx, store);
-        self.refilter(store);
-
-        res
-    }
-}
-
-impl Jumpable<ProgramContext, IambInfo> for CommandPaletteState {
-    fn jump(
-        &mut self,
-        list: PositionList,
-        dir: MoveDir1D,
-        count: usize,
-        ctx: &ProgramContext,
-    ) -> IambResult<usize> {
-        self.list.jump(list, dir, count, ctx)
-    }
-}
-
-impl Scrollable<ProgramContext, ProgramStore, IambInfo> for CommandPaletteState {
-    fn scroll(
-        &mut self,
-        style: &ScrollStyle,
-        ctx: &ProgramContext,
-        store: &mut ProgramStore,
-    ) -> EditResult<EditInfo, IambInfo> {
-        self.list.scroll(style, ctx, store)
-    }
-}
-
-impl Promptable<ProgramContext, ProgramStore, IambInfo> for CommandPaletteState {
-    fn prompt(
-        &mut self,
-        act: &PromptAction,
-        ctx: &ProgramContext,
-        store: &mut ProgramStore,
-    ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
-        self.list.prompt(act, ctx, store)
-    }
-}
-
-impl TerminalCursor for CommandPaletteState {
-    fn get_term_cursor(&self) -> Option<TermOffset> {
-        self.filter.get_term_cursor()
-    }
-}
-
-impl WindowOps<IambInfo> for CommandPaletteState {
-    fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
-        self.refilter(store);
-
-        let prompt_width = FILTER_BAR_PROMPT.len() as u16;
-        let bar = Rect { height: area.height.min(FILTER_BAR_HEIGHT), ..area };
-        let text = Rect {
-            x: bar.x.saturating_add(prompt_width),
-            width: bar.width.saturating_sub(prompt_width),
-            ..bar
-        };
-        let below = Rect {
-            y: area.y.saturating_add(bar.height),
-            height: area.height.saturating_sub(bar.height),
-            ..area
-        };
-
-        buf.set_string(bar.x, bar.y, FILTER_BAR_PROMPT, Style::default());
-        TextBox::new().render(text, buf, &mut self.filter);
-
-        List::new(store)
-            .empty_message("No commands match that filter")
-            .focus(focused)
-            .render(below, buf, &mut self.list);
-    }
-
-    fn dup(&self, store: &mut ProgramStore) -> Self {
-        CommandPaletteState {
-            filter: self.filter.dup(store),
-            list: self.list.dup(store),
-            filtered_by: self.filtered_by.clone(),
-        }
-    }
-
-    fn close(&mut self, flags: CloseFlags, store: &mut ProgramStore) -> bool {
-        self.list.close(flags, store)
-    }
-
-    fn write(
-        &mut self,
-        _: Option<&str>,
-        _: WriteFlags,
-        _: &mut ProgramStore,
-    ) -> IambResult<EditInfo> {
-        Ok(None)
-    }
-
-    fn get_completions(&self) -> Option<CompletionList> {
-        self.filter.get_completions()
-    }
-
-    fn get_cursor_word(&self, style: &WordStyle) -> Option<String> {
-        self.list.get_cursor_word(style)
-    }
-
-    fn get_selected_word(&self) -> Option<String> {
-        self.list.get_selected_word()
     }
 }
 
