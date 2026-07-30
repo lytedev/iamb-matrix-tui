@@ -1079,6 +1079,11 @@ impl RoomInfo {
         }
     }
 
+    /// The roots of every thread we've loaded messages for in this room.
+    pub fn thread_roots(&self) -> impl Iterator<Item = &OwnedEventId> + '_ {
+        self.threads.keys()
+    }
+
     pub fn get_thread_mut(&mut self, root: Option<OwnedEventId>) -> &mut Messages {
         if let Some(thread_root) = root {
             self.threads
@@ -2762,6 +2767,38 @@ pub mod tests {
 
         room.set_receipt(ReceiptThread::Main, user_id, ignored_root);
         assert!(!room.unreads(&settings).is_unread());
+    }
+
+    #[test]
+    fn test_thread_receipt_survives_reload() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        room.mark_read(&user_id, Some(followed_root.clone()));
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // What the worker pushes to the server, and what it later reads back out of the client's
+        // local store, is keyed by thread.
+        let sent = room.receipts(&user_id).collect::<HashMap<_, _>>();
+        let thread = ReceiptThread::Thread(followed_root.clone());
+        let stored = sent.get(&thread).cloned().cloned().unwrap();
+
+        // Restarting rebuilds the scrollback from scratch and keeps no receipts: an incremental
+        // sync won't repeat them, so the thread is unread again until we load them back.
+        room.user_receipts.clear();
+        room.event_receipts.clear();
+        assert!(room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // The worker only asks the store about threads it knows the roots of.
+        let roots = room.thread_roots().cloned().collect::<Vec<_>>();
+        assert!(roots.contains(&followed_root));
+
+        room.set_receipt(thread.clone(), user_id.clone(), stored.clone());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // A restore that races a newer local `:read` must not drag the marker backwards.
+        room.set_receipt(thread, user_id, followed_root.clone());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
     }
 
     #[test]

@@ -186,6 +186,53 @@ async fn update_event_receipts(info: &mut RoomInfo, room: &MatrixRoom, event_id:
     }
 }
 
+/// Restore the user's own thread-scoped read receipts from the client's local store.
+///
+/// Thread receipts only ever reach us through the sync stream, and the sync after a restart is
+/// incremental: the homeserver won't repeat receipts we already acknowledged, so a thread we
+/// marked read in an earlier session would come back unread. The receipts are durable in the
+/// client's state store, though, so we read them back from there — this costs no requests.
+///
+/// Only threads we've loaded messages for are worth asking about, which keeps this proportional
+/// to the number of threads in the room rather than the number of events in it.
+async fn load_thread_receipts(client: &Client, store: &AsyncProgramStore, room_id: &RoomId) {
+    let Some(room) = client.get_room(room_id) else {
+        return;
+    };
+
+    let (user_id, roots) = {
+        let mut locked = store.lock().await;
+        let ChatStore { settings, rooms, .. } = &mut locked.application;
+        let user_id = settings.profile.user_id.clone();
+        let info = rooms.get_or_default(room_id.to_owned());
+
+        (user_id, info.thread_roots().cloned().collect::<Vec<_>>())
+    };
+
+    let mut loaded = Vec::new();
+
+    for root in roots {
+        let thread = ReceiptThread::Thread(root);
+
+        match room.load_user_receipt(ReceiptType::Read, thread.clone(), &user_id).await {
+            Ok(Some((event_id, _))) => loaded.push((thread, event_id)),
+            Ok(None) => continue,
+            Err(e) => tracing::warn!(?room_id, "failed to load thread receipt: {e}"),
+        }
+    }
+
+    if loaded.is_empty() {
+        return;
+    }
+
+    let mut locked = store.lock().await;
+    let info = locked.application.get_room_info(room_id.to_owned());
+
+    for (thread, event_id) in loaded {
+        info.set_receipt(thread, user_id.clone(), event_id);
+    }
+}
+
 #[derive(Debug)]
 enum Plan {
     Messages(OwnedRoomId, Option<String>, Vec<MessageNeed>),
@@ -231,8 +278,11 @@ async fn run_plan(client: &Client, store: &AsyncProgramStore, plan: Plan, permit
             let store_clone = store.clone();
 
             let res = load_older_one(&client, &room_id, fetch_id, limit).await;
-            let mut locked = store.lock().await;
-            load_insert(room_id, res, locked.deref_mut(), store_clone, message_need);
+            {
+                let mut locked = store.lock().await;
+                load_insert(room_id.clone(), res, locked.deref_mut(), store_clone, message_need);
+            }
+            load_thread_receipts(&client, store, &room_id).await;
         },
         Plan::Members(room_id) => {
             let res = members_load(client, &room_id).await;
