@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier as StyleModifier, Style};
 use ratatui::text::Span;
 use ratatui_image::picker::ProtocolType;
 use serde::{de::Error as SerdeError, de::Visitor, Deserialize, Deserializer, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use modalkit::{env::vim::VimMode, key::TerminalKey, keybindings::InputKey};
@@ -57,6 +58,9 @@ const DEFAULT_ROOM_SORT: [SortColumn<SortFieldRoom>; 5] = [
 const DEFAULT_ENABLE_TITLE: bool = true;
 const DEFAULT_ENC_INDICATOR_LOC: EncryptionIndicatorLocation = EncryptionIndicatorLocation::PROMPT;
 const DEFAULT_REQ_TIMEOUT: u64 = 120;
+
+/// Rendered in the read receipt gutter when a user has no usable name.
+const EMPTY_USER_CHAR: &str = " ";
 
 const COLORS: [Color; 13] = [
     Color::Blue,
@@ -1223,23 +1227,25 @@ impl ApplicationSettings {
         Ok(())
     }
 
-    pub fn get_user_char_span(&self, user_id: &UserId) -> Span<'_> {
-        let (color, c) = self
-            .tunables
-            .users
-            .get(user_id)
-            .map(|user| {
-                (
-                    user.color.as_ref().map(|c| c.0),
-                    user.name.as_ref().and_then(|s| s.chars().next()),
-                )
-            })
-            .unwrap_or_default();
+    /// The single-grapheme label used for a user in the read receipt gutter.
+    ///
+    /// This prefers the same name that [ApplicationSettings::get_user_span] shows in the sender
+    /// column: a configured override first, then the room's display name, then the localpart.
+    pub fn get_user_char_span(&self, user_id: &UserId, info: &RoomInfo) -> Span<'static> {
+        let (color, name) = self.get_user_overrides(user_id);
 
         let color = color.unwrap_or_else(|| user_color(user_id.as_str()));
         let style = user_style_from_color(color);
 
-        let c = c.unwrap_or_else(|| user_id.localpart().chars().next().unwrap_or(' '));
+        let name = match name {
+            Some(name) => name,
+            None => info
+                .display_names
+                .get(user_id)
+                .unwrap_or_else(|| Cow::Borrowed(user_id.localpart())),
+        };
+
+        let c = name.graphemes(true).next().unwrap_or(EMPTY_USER_CHAR);
 
         Span::styled(String::from(c), style)
     }
@@ -1294,6 +1300,35 @@ mod tests {
     use super::*;
     use matrix_sdk::ruma::user_id;
     use std::convert::TryFrom;
+
+    #[test]
+    fn test_user_char_span_prefers_display_name() {
+        use crate::tests::{mock_settings, TEST_USER1};
+
+        let mut settings = mock_settings();
+        let mut info = RoomInfo::default();
+
+        // With no display name, we fall back to the localpart.
+        assert_eq!(settings.get_user_char_span(&TEST_USER1, &info).content, "u");
+
+        // The room display name wins over the localpart.
+        info.display_names.set(TEST_USER1.clone(), Some("Ada Lovelace".into()));
+        assert_eq!(settings.get_user_char_span(&TEST_USER1, &info).content, "A");
+
+        // A multi-codepoint grapheme is not split apart.
+        info.display_names.set(TEST_USER1.clone(), Some("\u{1f469}\u{200d}\u{1f4bb} Ada".into()));
+        assert_eq!(
+            settings.get_user_char_span(&TEST_USER1, &info).content,
+            "\u{1f469}\u{200d}\u{1f4bb}"
+        );
+
+        // A configured name override still wins over the display name.
+        settings.tunables.users.insert(TEST_USER1.clone(), UserDisplayTunables {
+            name: Some("Zed".into()),
+            color: None,
+        });
+        assert_eq!(settings.get_user_char_span(&TEST_USER1, &info).content, "Z");
+    }
 
     #[test]
     fn test_profile_name_invalid() {

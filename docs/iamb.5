@@ -209,6 +209,11 @@ Defines whether or not reactions should be shown as their respective shortcode.
 Defines whether or not read confirmations are sent.
 .It Sy read_receipt_display
 Defines whether or not read confirmations are displayed.
+Each reader is shown as the first character of their name in the room, using the
+same name as the sender column: a
+.Sy settings.users
+override if one is configured, otherwise their room display name, falling back
+to the localpart of their Matrix User ID.
 .It Sy read_receipt_manual
 Defines whether rooms and threads must be marked read explicitly with
 .Sy :read .

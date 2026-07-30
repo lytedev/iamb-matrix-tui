@@ -661,6 +661,9 @@ enum SenderSpan<'a> {
 struct MessageFormatter<'a> {
     settings: &'a ApplicationSettings,
 
+    /// Room state, used to resolve display names for the read receipt gutter.
+    info: &'a RoomInfo,
+
     /// How many columns to print.
     cols: MessageColumns,
 
@@ -735,7 +738,9 @@ impl<'a> MessageFormatter<'a> {
                 line.push(time);
 
                 // Show read receipts.
-                let user_char = |user: OwnedUserId| -> Span { settings.get_user_char_span(&user) };
+                let info = self.info;
+                let user_char =
+                    |user: OwnedUserId| -> Span { settings.get_user_char_span(&user, info) };
 
                 let a = self.read.pop().map(user_char).unwrap_or_else(|| Span::raw(" "));
                 let b = self.read.pop().map(user_char).unwrap_or_else(|| Span::raw(" "));
@@ -1020,7 +1025,7 @@ impl Message {
                 .map(|user_id| user_id.to_owned())
                 .collect();
 
-            MessageFormatter { settings, cols, orig, fill, user, date, time, read }
+            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
         } else if user_gutter + TIME_GUTTER + MIN_MSG_LEN <= width {
             let cols = MessageColumns::Three;
             let fill = width - user_gutter - TIME_GUTTER;
@@ -1028,7 +1033,7 @@ impl Message {
             let time = self.timestamp.show_time();
             let read = Vec::new();
 
-            MessageFormatter { settings, cols, orig, fill, user, date, time, read }
+            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
         } else if user_gutter + MIN_MSG_LEN <= width {
             let cols = MessageColumns::Two;
             let fill = width - user_gutter;
@@ -1036,7 +1041,7 @@ impl Message {
             let time = None;
             let read = Vec::new();
 
-            MessageFormatter { settings, cols, orig, fill, user, date, time, read }
+            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
         } else {
             let cols = MessageColumns::One;
             let fill = width.saturating_sub(2);
@@ -1044,7 +1049,7 @@ impl Message {
             let time = None;
             let read = Vec::new();
 
-            MessageFormatter { settings, cols, orig, fill, user, date, time, read }
+            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
         }
     }
 
