@@ -1552,12 +1552,40 @@ impl RoomInfo {
         None
     }
 
+    /// Whether `event_id` sits at or before the user's current receipt for `thread`.
+    ///
+    /// Read receipts only ever move forward. The server hands us stale ones all the time: a
+    /// scrollback fetch reports who had read each older event, and an ephemeral receipt event can
+    /// race a `:read` we just performed locally. Applying those would drag the marker backwards
+    /// and make an already-read room look unread again.
+    ///
+    /// Events we haven't loaded have no position to compare against, so those are not stale.
+    fn receipt_is_stale(
+        &self,
+        thread: &ReceiptThread,
+        user_id: &UserId,
+        event_id: &EventId,
+    ) -> bool {
+        let Some(old_key) = self.receipt_key(thread, user_id) else {
+            return false;
+        };
+        let Some(new_key) = self.get_message_key(event_id) else {
+            return false;
+        };
+
+        new_key <= old_key
+    }
+
     pub fn set_receipt(
         &mut self,
         thread: ReceiptThread,
         user_id: OwnedUserId,
         event_id: OwnedEventId,
     ) {
+        if self.receipt_is_stale(&thread, &user_id, &event_id) {
+            return;
+        }
+
         self.clear_receipt(&thread, &user_id);
         self.event_receipts
             .entry(thread.clone())
@@ -2702,6 +2730,37 @@ pub mod tests {
         // Marking the room read with no thread covers every thread in it.
         room.mark_read(&user_id, None);
         assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
+        assert!(!room.unreads(&settings).is_unread());
+    }
+
+    #[test]
+    fn test_stale_receipts_do_not_unmark_read() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        room.mark_read(&user_id, None);
+        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // Scrollback fetches and ephemeral receipt events replay whatever the server knows,
+        // which can be a receipt we have already advanced past locally.
+        room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root.clone());
+        assert!(!room.unreads(&settings).is_unread());
+
+        room.set_receipt(
+            ReceiptThread::Thread(followed_root.clone()),
+            user_id.clone(),
+            followed_root.clone(),
+        );
+        assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+
+        // Receipts that genuinely move forward still apply.
+        let (mut room, settings, followed_root, ignored_root) = mock_room_with_threads();
+
+        room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root);
+        assert!(room.unreads(&settings).is_unread());
+
+        room.set_receipt(ReceiptThread::Main, user_id, ignored_root);
         assert!(!room.unreads(&settings).is_unread());
     }
 
