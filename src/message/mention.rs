@@ -98,7 +98,7 @@ impl MentionCandidate {
 /// that leave less of the haystack unmatched score higher. Higher scores are better matches, so
 /// typing a name in full puts that person at the top: nothing was skipped and nothing was left
 /// over.
-fn fuzzy_score(needle: &str, haystack: &str) -> Option<isize> {
+pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<isize> {
     if needle.is_empty() {
         return Some(0);
     }

@@ -2044,6 +2044,9 @@ pub enum IambId {
 
     /// The `:commands` window.
     CommandPalette,
+
+    /// The `:switch` window.
+    QuickSwitcher,
 }
 
 impl Display for IambId {
@@ -2068,6 +2071,7 @@ impl Display for IambId {
             IambId::ThreadList => f.write_str("iamb://threads"),
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
             IambId::CommandPalette => f.write_str("iamb://commands"),
+            IambId::QuickSwitcher => f.write_str("iamb://switch"),
         }
     }
 }
@@ -2227,6 +2231,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::CommandPalette)
             },
+            Some("switch") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://switch takes no path"));
+                }
+
+                Ok(IambId::QuickSwitcher)
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2309,6 +2320,12 @@ pub enum IambBufferId {
 
     /// The command palette's filter bar.
     CommandPaletteFilter,
+
+    /// The quick switcher's entry list.
+    QuickSwitcherList,
+
+    /// The quick switcher's filter bar.
+    QuickSwitcherFilter,
 }
 
 impl IambBufferId {
@@ -2329,6 +2346,8 @@ impl IambBufferId {
             IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
             IambBufferId::CommandPaletteList => IambId::CommandPalette,
             IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
+            IambBufferId::QuickSwitcherList => IambId::QuickSwitcher,
+            IambBufferId::QuickSwitcherFilter => IambId::QuickSwitcher,
         };
 
         Some(id)
@@ -2379,6 +2398,8 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::UnreadThreadList => vec![],
             IambBufferId::CommandPaletteList => vec![],
             IambBufferId::CommandPaletteFilter => vec![],
+            IambBufferId::QuickSwitcherList => vec![],
+            IambBufferId::QuickSwitcherFilter => vec![],
         }
     }
 }

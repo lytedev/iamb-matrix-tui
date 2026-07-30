@@ -364,6 +364,17 @@ fn iamb_commands(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult 
     return Ok(step);
 }
 
+fn iamb_switch(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::QuickSwitcher));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_threads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -789,16 +800,38 @@ pub struct CommandForm {
 
     /// What this form does.
     pub description: &'static str,
+
+    /// The window this form opens, if opening a window is all it does.
+    ///
+    /// This is what the [quick switcher][crate::windows::switcher] lists alongside rooms, so a
+    /// form that opens a window has to say so here or it will not be reachable from the switcher.
+    /// Windows that need to be told which room they are about, like `:members`, are left out:
+    /// there is no one window for the switcher to jump to.
+    pub window: Option<IambId>,
 }
 
 /// A form of a command that takes something after the command name.
 const fn form(args: &'static str, description: &'static str) -> CommandForm {
-    CommandForm { args: Some(args), description }
+    CommandForm { args: Some(args), description, window: None }
 }
 
 /// A form of a command that is just the command name.
 const fn bare(description: &'static str) -> CommandForm {
-    CommandForm { args: None, description }
+    CommandForm { args: None, description, window: None }
+}
+
+/// A form that is just the command name, and opens a window.
+const fn opens(description: &'static str, window: IambId) -> CommandForm {
+    CommandForm { args: None, description, window: Some(window) }
+}
+
+/// A form that takes something after the command name, and opens a window.
+const fn form_opens(
+    args: &'static str,
+    description: &'static str,
+    window: IambId,
+) -> CommandForm {
+    CommandForm { args: Some(args), description, window: Some(window) }
 }
 
 /// One of iamb's own commands: how it gets registered, and every form the palette should list.
@@ -833,13 +866,13 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "chats",
         aliases: &[],
         f: iamb_chats,
-        forms: &[bare("List joined rooms and direct messages together")],
+        forms: &[opens("List joined rooms and direct messages together", IambId::ChatList)],
     },
     IambCommandInfo {
         name: "commands",
         aliases: &["palette"],
         f: iamb_commands,
-        forms: &[bare("List iamb's commands and the keys bound to them")],
+        forms: &[opens("List iamb's commands and the keys bound to them", IambId::CommandPalette)],
     },
     IambCommandInfo {
         name: "create",
@@ -857,7 +890,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "dms",
         aliases: &[],
         f: iamb_dms,
-        forms: &[bare("List your direct messages")],
+        forms: &[opens("List your direct messages", IambId::DirectList)],
     },
     IambCommandInfo {
         name: "download",
@@ -1008,7 +1041,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "rooms",
         aliases: &[],
         f: iamb_rooms,
-        forms: &[bare("List the rooms you have joined")],
+        forms: &[opens("List the rooms you have joined", IambId::RoomList)],
     },
     IambCommandInfo {
         name: "space",
@@ -1023,13 +1056,19 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "spaces",
         aliases: &[],
         f: iamb_spaces,
-        forms: &[bare("List the spaces you have joined")],
+        forms: &[opens("List the spaces you have joined", IambId::SpaceList)],
+    },
+    IambCommandInfo {
+        name: "switch",
+        aliases: &["switcher"],
+        f: iamb_switch,
+        forms: &[opens("Jump to a room, DM, space, or window", IambId::QuickSwitcher)],
     },
     IambCommandInfo {
         name: "threads",
         aliases: &[],
         f: iamb_threads,
-        forms: &[bare("List the threads you follow across all rooms")],
+        forms: &[opens("List the threads you follow across all rooms", IambId::ThreadList)],
     },
     IambCommandInfo {
         name: "unreact",
@@ -1045,16 +1084,23 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_unreads,
         forms: &[
-            bare("List unread rooms"),
+            opens("List unread rooms", IambId::UnreadList),
             form("clear", "Mark all rooms as read"),
-            form("threads", "List unread rooms and unread followed threads together"),
+            form_opens(
+                "threads",
+                "List unread rooms and unread followed threads together",
+                IambId::UnreadThreadList,
+            ),
         ],
     },
     IambCommandInfo {
         name: "unreadsandthreads",
         aliases: &[],
         f: iamb_unreads_and_threads,
-        forms: &[bare("List unread rooms and unread followed threads together")],
+        forms: &[opens(
+            "List unread rooms and unread followed threads together",
+            IambId::UnreadThreadList,
+        )],
     },
     IambCommandInfo {
         name: "upload",
@@ -1067,7 +1113,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_verify,
         forms: &[
-            bare("List ongoing E2EE verifications"),
+            opens("List ongoing E2EE verifications", IambId::VerifyList),
             form("request <user id>", "Request a new verification with a user"),
             form("accept <key>", "Accept a verification request"),
             form("confirm <key>", "Confirm an in-progress verification"),
@@ -1079,7 +1125,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "welcome",
         aliases: &[],
         f: iamb_welcome,
-        forms: &[bare("Show the iamb welcome window")],
+        forms: &[opens("Show the iamb welcome window", IambId::Welcome)],
     },
 ];
 
@@ -1163,6 +1209,40 @@ mod tests {
 
         assert!(cmds.input_cmd(":threads foo", ctx.clone()).is_err());
         assert!(cmds.input_cmd(":unreadsandthreads foo", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_switch() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::QuickSwitcher));
+
+        let res = cmds.input_cmd(":switch", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.clone().into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":switcher", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":switch foo", ctx).is_err());
+    }
+
+    #[test]
+    fn test_every_form_that_opens_a_window_is_bare_or_literal() {
+        // The switcher shows these forms as-is and jumps straight to the window, so a form that
+        // still needed the user to fill something in would be showing them a lie.
+        for form in IAMB_COMMANDS.iter().flat_map(|cmd| cmd.forms) {
+            if form.window.is_none() {
+                continue;
+            }
+
+            let args = form.args.unwrap_or_default();
+
+            assert!(
+                !args.contains('<') && !args.contains('['),
+                "{:?} opens a window but takes an argument",
+                args
+            );
+        }
     }
 
     #[test]

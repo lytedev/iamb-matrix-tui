@@ -20,7 +20,7 @@ use modalkit::{
     prelude::*,
 };
 
-use crate::base::{IambAction, IambInfo, Keybindings, RoomAction, MATRIX_ID_WORD};
+use crate::base::{IambAction, IambId, IambInfo, Keybindings, RoomAction, MATRIX_ID_WORD};
 use crate::config::{ApplicationSettings, Keys};
 
 pub type IambStep = InputStep<IambInfo>;
@@ -91,6 +91,20 @@ pub const IAMB_BINDINGS: &[IambBinding] = &[
         command: Some("read"),
         description: "Mark the focused room, thread, or selected list entry as read",
         actions: || vec![IambAction::Room(RoomAction::MarkRead).into()],
+    },
+    IambBinding {
+        // Vim leaves <C-K> alone outside of insert and command mode, where it starts a digraph;
+        // this only takes the normal and visual mode key, so digraphs still work while typing.
+        keys: &["<C-K>"],
+        modes: WINDOW_MODES,
+        goto: Some(VimMode::Normal),
+        command: Some("switch"),
+        description: "Jump to a room, DM, space, or window",
+        actions: || {
+            let switcher = OpenTarget::Application(IambId::QuickSwitcher);
+
+            vec![WindowAction::Switch(switcher).into()]
+        },
     },
     IambBinding {
         keys: &["<Tab>"],
@@ -191,6 +205,7 @@ mod tests {
     #[test]
     fn test_keys_for_command() {
         assert_eq!(keys_for_command("read"), Some("<C-W>r"));
+        assert_eq!(keys_for_command("switch"), Some("<C-K>"));
         assert_eq!(keys_for_command("rooms"), None);
     }
 }

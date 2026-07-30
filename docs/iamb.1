@@ -105,6 +105,47 @@ Mark every room and thread as read.
 View a list of joined rooms.
 .It Sy ":spaces"
 View a list of joined spaces.
+.It Sy ":switch" , Sy ":switcher"
+Open the quick switcher: one fuzzy-matched list of everywhere there is to jump
+to.
+Type to narrow it down, move through the list with the usual movement keys, and
+press
+.Sy <Enter>
+to go to the selected entry.
+Bound to
+.Sy <C-K> .
+.Pp
+It lists every room, direct message, and space you have joined, matched on name,
+canonical alias, and room ID; and the windows that
+.Nm
+commands open, such as
+.Sy ":rooms"
+and
+.Sy ":unreads" ,
+matched on the command and on what it does.
+Each entry says which it is: rooms are prefixed
+.Sy # ,
+direct messages
+.Sy @ ,
+spaces
+.Sy + ,
+and windows
+.Sy \&: ,
+and every entry is labelled in its own column.
+Entries with unread activity are marked and shown in bold.
+.Pp
+How well an entry matches what you typed decides the order, so typing a room's
+name in full puts that room first.
+Entries that match equally well are ordered rooms before windows, unread before
+quiet, and most recent first, which is also the order of the whole list before
+you have typed anything.
+.Pp
+Selecting a room opens it exactly as selecting it in
+.Sy ":rooms"
+would.
+.Sy <C-K>
+is bound in normal and visual mode only, so it does not shadow the Vim digraph
+key while you are typing a message.
 .It Sy ":threads"
 View a list of threads you follow across all rooms.
 A thread counts as followed if you started it, replied in it, or have a

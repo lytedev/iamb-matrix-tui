@@ -81,13 +81,19 @@ use crate::base::{
     UnreadInfo,
 };
 
-use self::{palette::CommandPaletteState, room::RoomState, welcome::WelcomeState};
+use self::{
+    palette::CommandPaletteState,
+    room::RoomState,
+    switcher::QuickSwitcherState,
+    welcome::WelcomeState,
+};
 use crate::message::MessageTimeStamp;
 use feruca::Collator;
 
 pub mod filtered;
 pub mod palette;
 pub mod room;
+pub mod switcher;
 pub mod welcome;
 
 type MatrixRoomInfo = Arc<(MatrixRoom, Option<Tags>)>;
@@ -401,6 +407,7 @@ macro_rules! delegate {
             IambWindow::ThreadList($id) => $e,
             IambWindow::UnreadThreadList($id) => $e,
             IambWindow::CommandPalette($id) => $e,
+            IambWindow::QuickSwitcher($id) => $e,
         }
     };
 }
@@ -418,6 +425,7 @@ pub enum IambWindow {
     ThreadList(ThreadListState),
     UnreadThreadList(UnreadThreadListState),
     CommandPalette(CommandPaletteState),
+    QuickSwitcher(QuickSwitcherState),
 }
 
 impl IambWindow {
@@ -625,6 +633,7 @@ impl WindowOps<IambInfo> for IambWindow {
         match self {
             IambWindow::Room(state) => state.draw(area, buf, focused, store),
             IambWindow::CommandPalette(state) => state.draw(area, buf, focused, store),
+            IambWindow::QuickSwitcher(state) => state.draw(area, buf, focused, store),
             IambWindow::DirectList(state) => {
                 let mut items = store
                     .application
@@ -861,6 +870,7 @@ impl WindowOps<IambInfo> for IambWindow {
         match self {
             IambWindow::Room(w) => w.dup(store).into(),
             IambWindow::CommandPalette(w) => IambWindow::CommandPalette(w.dup(store)),
+            IambWindow::QuickSwitcher(w) => IambWindow::QuickSwitcher(w.dup(store)),
             IambWindow::DirectList(w) => w.dup(store).into(),
             IambWindow::MemberList(w, room_id, last_fetch) => {
                 IambWindow::MemberList(w.dup(store), room_id.clone(), *last_fetch)
@@ -917,6 +927,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ThreadList(_) => IambId::ThreadList,
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
             IambWindow::CommandPalette(_) => IambId::CommandPalette,
+            IambWindow::QuickSwitcher(_) => IambId::QuickSwitcher,
         }
     }
 
@@ -932,6 +943,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ThreadList(_) => bold_spans("Threads"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
+            IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -963,6 +975,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ThreadList(_) => bold_spans("Threads"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
+            IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
@@ -1038,6 +1051,11 @@ impl Window<IambInfo> for IambWindow {
                 let win = CommandPaletteState::new(store);
 
                 Ok(IambWindow::CommandPalette(win))
+            },
+            IambId::QuickSwitcher => {
+                let win = QuickSwitcherState::new(store);
+
+                Ok(IambWindow::QuickSwitcher(win))
             },
             IambId::UnreadThreadList => {
                 let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
