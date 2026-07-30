@@ -251,7 +251,8 @@ fn text_to_html(input: &str) -> Option<String> {
     markdown_to_html(input, &options).into()
 }
 
-fn text_to_message_content(input: String) -> TextMessageEventContent {
+/// Turn user-typed text into message content, rendering its Markdown if there is any.
+pub fn text_to_message_content(input: String) -> TextMessageEventContent {
     let body = parse_mentions(input.as_str()).body;
 
     if let Some(html) = text_to_html(input.as_str()) {

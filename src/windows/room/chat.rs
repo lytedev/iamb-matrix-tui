@@ -5,9 +5,10 @@ use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+use chrono::Local;
 use edit::edit_with_builder as external_edit;
 use edit::Builder;
-use modalkit::editing::store::RegisterError;
+use modalkit::editing::store::{RegisterError, RegisterStore};
 use std::process::Command;
 use tokio;
 use url::Url;
@@ -91,6 +92,7 @@ use crate::config::EncryptionIndicatorLocation;
 use crate::message::mention::MENTION_SIGIL;
 use crate::message::{
     text_to_message,
+    text_to_message_content,
     Message,
     MessageEvent,
     MessageKey,
@@ -103,6 +105,43 @@ use super::scrollback::{Scrollback, ScrollbackState};
 
 /// Where the closest match sits in a completion list, which orders itself best first.
 const BEST_MATCH_INDEX: usize = 0;
+
+/// Clipboard images arrive without a name, so we make one that sorts and reads sensibly.
+const CLIPBOARD_IMAGE_FILENAME_PREFIX: &str = "clipboard-";
+const CLIPBOARD_IMAGE_FILENAME_TIMESTAMP: &str = "%Y%m%d-%H%M%S";
+const CLIPBOARD_IMAGE_FILENAME_SUFFIX: &str = ".png";
+
+/// Raw image data taken from the system clipboard.
+struct ClipboardImage {
+    width: usize,
+    height: usize,
+    bytes: Cow<'static, [u8]>,
+}
+
+/// A name for an image that the clipboard handed us without one.
+fn clipboard_image_filename() -> String {
+    let stamp = Local::now().format(CLIPBOARD_IMAGE_FILENAME_TIMESTAMP);
+
+    format!("{CLIPBOARD_IMAGE_FILENAME_PREFIX}{stamp}{CLIPBOARD_IMAGE_FILENAME_SUFFIX}")
+}
+
+/// Read an image out of the system clipboard.
+///
+/// The register store is what already talks to the system clipboard for yank and paste, and it
+/// reports image contents as a [RegisterError::ClipboardImage]. Anything else in the clipboard,
+/// text included, means there is no image for us to send.
+fn clipboard_image(registers: &RegisterStore) -> IambResult<ClipboardImage> {
+    match registers.get(&Register::SelectionClipboard) {
+        Err(RegisterError::ClipboardImage(data)) => {
+            Ok(ClipboardImage {
+                width: data.width,
+                height: data.height,
+                bytes: data.bytes,
+            })
+        },
+        _ => Err(IambError::ClipboardHasNoImage.into()),
+    }
+}
 
 /// Point a completion popup at its best match, so that the user can see which one it is.
 ///
@@ -713,33 +752,12 @@ impl ChatState {
                 (resp.event_id, msg)
             },
             SendAction::UploadImage(width, height, bytes) => {
-                // Convert to png because arboard does not give us the mime type.
-                let bytes =
-                    image::ImageBuffer::from_raw(width as _, height as _, bytes.into_owned())
-                        .ok_or(IambError::Clipboard)
-                        .and_then(|imagebuf| {
-                            let dynimage = image::DynamicImage::ImageRgba8(imagebuf);
-                            let bytes = Vec::<u8>::new();
-                            let mut buff = std::io::Cursor::new(bytes);
-                            dynimage.write_to(&mut buff, image::ImageFormat::Png)?;
-                            Ok(buff.into_inner())
-                        })?;
-                let mime = mime::IMAGE_PNG;
+                self.send_clipboard_image(&room, ClipboardImage { width, height, bytes }).await?
+            },
+            SendAction::UploadClipboard => {
+                let image = clipboard_image(&store.registers)?;
 
-                let name = "Clipboard.png";
-                let config = AttachmentConfig::new();
-
-                let resp = room
-                    .send_attachment(name, &mime, bytes, config)
-                    .await
-                    .map_err(IambError::from)?;
-
-                // Mock up the local echo message for the scrollback.
-                let msg = TextMessageEventContent::plain(format!("[Attached File: {name}]"));
-                let msg = MessageType::Text(msg);
-                let msg = RoomMessageEventContent::new(msg);
-
-                (resp.event_id, msg)
+                self.send_clipboard_image(&room, image).await?
             },
         };
 
@@ -756,6 +774,66 @@ impl ChatState {
         self.scrollback.goto_latest();
 
         Ok(None)
+    }
+
+    /// Upload an image from the system clipboard, captioned with the message bar's contents.
+    ///
+    /// The caption travels in the same event as the image ([MSC2530]): the real filename goes in
+    /// `filename`, and the caption becomes the `body` that clients show beneath the picture. An
+    /// empty message bar sends the image on its own.
+    ///
+    /// [MSC2530]: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
+    async fn send_clipboard_image(
+        &mut self,
+        room: &MatrixRoom,
+        image: ClipboardImage,
+    ) -> IambResult<(OwnedEventId, RoomMessageEventContent)> {
+        let ClipboardImage { width, height, bytes } = image;
+
+        // Convert to png because the clipboard does not give us the mime type.
+        let bytes = image::ImageBuffer::from_raw(width as _, height as _, bytes.into_owned())
+            .ok_or(IambError::Clipboard)
+            .and_then(|imagebuf| {
+                let dynimage = image::DynamicImage::ImageRgba8(imagebuf);
+                let bytes = Vec::<u8>::new();
+                let mut buff = std::io::Cursor::new(bytes);
+                dynimage.write_to(&mut buff, image::ImageFormat::Png)?;
+                Ok(buff.into_inner())
+            })?;
+        let mime = mime::IMAGE_PNG;
+
+        let name = clipboard_image_filename();
+        let caption = self.take_caption();
+        let config = AttachmentConfig::new().caption(caption.clone());
+
+        let resp = room
+            .send_attachment(&name, &mime, bytes, config)
+            .await
+            .map_err(IambError::from)?;
+
+        // Mock up the local echo message for the scrollback.
+        let echo = match &caption {
+            Some(caption) => format!("[Attached File: {name}] {}", caption.body),
+            None => format!("[Attached File: {name}]"),
+        };
+        let msg = MessageType::Text(TextMessageEventContent::plain(echo));
+        let msg = RoomMessageEventContent::new(msg);
+
+        Ok((resp.event_id, msg))
+    }
+
+    /// Consume the message bar's contents to use as an attachment caption.
+    fn take_caption(&mut self) -> Option<TextMessageEventContent> {
+        let text = self.tbox.get();
+
+        if text.is_blank() {
+            return None;
+        }
+
+        let caption = text_to_message_content(text.trim_end().to_string());
+        self.reset();
+
+        Some(caption)
     }
 
     pub fn focus_toggle(&mut self) {
@@ -1237,6 +1315,21 @@ mod tests {
             cursor: Cursor::new(0, 2),
             start: Cursor::new(0, 0),
         }
+    }
+
+    #[test]
+    fn test_clipboard_image_filename() {
+        let name = clipboard_image_filename();
+
+        assert!(name.starts_with(CLIPBOARD_IMAGE_FILENAME_PREFIX), "{}", name);
+        assert!(name.ends_with(CLIPBOARD_IMAGE_FILENAME_SUFFIX), "{}", name);
+
+        // A timestamp, so that two pastes in the same room don't look like the same file.
+        let stamp = name
+            .trim_start_matches(CLIPBOARD_IMAGE_FILENAME_PREFIX)
+            .trim_end_matches(CLIPBOARD_IMAGE_FILENAME_SUFFIX);
+        assert!(stamp.chars().all(|c| c.is_ascii_digit() || c == '-'), "{}", stamp);
+        assert_eq!(stamp.len(), "YYYYmmdd-HHMMSS".len(), "{}", stamp);
     }
 
     #[test]

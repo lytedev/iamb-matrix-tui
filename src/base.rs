@@ -488,6 +488,9 @@ pub enum SendAction {
 
     /// Upload the image data.
     UploadImage(usize, usize, Cow<'static, [u8]>),
+
+    /// Upload the image currently held in the system clipboard.
+    UploadClipboard,
 }
 
 /// An action performed against the user's homeserver.
@@ -818,6 +821,10 @@ pub enum IambError {
     /// A failure to access the system's clipboard.
     #[error("Could not use system clipboard data")]
     Clipboard,
+
+    /// The system clipboard holds something other than an image.
+    #[error("No image in the system clipboard")]
+    ClipboardHasNoImage,
 
     /// An failure during disk/network/ipc/etc. I/O.
     #[error("Input/Output error: {0}")]

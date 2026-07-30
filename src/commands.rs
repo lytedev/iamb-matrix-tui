@@ -727,11 +727,13 @@ fn iamb_space(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 fn iamb_upload(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
-    if args.len() != 1 {
-        return Result::Err(CommandError::InvalidArgument);
-    }
+    // Without a path, we upload whatever image the system clipboard is holding.
+    let sact = match args.len() {
+        0 => SendAction::UploadClipboard,
+        1 => SendAction::Upload(args.remove(0)),
+        _ => return Result::Err(CommandError::InvalidArgument),
+    };
 
-    let sact = SendAction::Upload(args.remove(0));
     let iact = IambAction::from(sact);
     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
 
@@ -1106,7 +1108,13 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "upload",
         aliases: &[],
         f: iamb_upload,
-        forms: &[form("<path>", "Upload a file to the focused room")],
+        forms: &[
+            form("<path>", "Upload a file to the focused room"),
+            form(
+                "",
+                "Upload the system clipboard's image, captioned with the message bar's text",
+            ),
+        ],
     },
     IambCommandInfo {
         name: "verify",
@@ -1170,6 +1178,23 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         assert!(cmds.input_cmd(":read bogus", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_upload() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let res = cmds.input_cmd(":upload /tmp/pic.png", ctx.clone()).unwrap();
+        let act = IambAction::from(SendAction::Upload("/tmp/pic.png".into()));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        // No path means the image sitting in the system clipboard.
+        let res = cmds.input_cmd(":upload", ctx.clone()).unwrap();
+        let act = IambAction::from(SendAction::UploadClipboard);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":upload /tmp/one.png /tmp/two.png", ctx).is_err());
     }
 
     #[test]

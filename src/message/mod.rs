@@ -70,7 +70,7 @@ mod html;
 mod printer;
 mod state;
 
-pub use self::compose::text_to_message;
+pub use self::compose::{text_to_message, text_to_message_content};
 use self::state::{body_cow_state, html_state};
 pub use html::TreeGenState;
 

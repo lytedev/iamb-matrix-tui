@@ -211,6 +211,11 @@ Cancel the currently drafted message including replies.
 Go to the message the current message replied to.
 .It Sy ":upload [path]"
 Upload an attachment and send it to the currently selected room.
+With no path, the image currently in the system clipboard is uploaded instead,
+as a PNG named after the time it was sent.
+Anything typed in the message bar is sent with the image as its caption, in the
+same message, rather than as a separate message.
+If the clipboard holds no image, nothing is sent and an error is shown.
 .El
 
 .Sh "ROOM COMMANDS"
