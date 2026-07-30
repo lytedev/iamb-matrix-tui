@@ -295,6 +295,14 @@ impl RoomState {
 
                 Ok(vec![])
             },
+            RoomAction::SelectMessage(event_id) => {
+                match self {
+                    RoomState::Chat(chat) => chat.select_message(event_id, store),
+                    RoomState::Space(_) => return Err(IambError::NoSelectedRoom.into()),
+                }
+
+                Ok(vec![])
+            },
             RoomAction::Leave(skip_confirm) => {
                 if let Some(room) = store.application.worker.client.get_room(self.id()) {
                     if skip_confirm {

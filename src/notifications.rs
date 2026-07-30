@@ -23,7 +23,7 @@ use matrix_sdk::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    base::{AsyncProgramStore, IambError, IambId, IambResult, ProgramStore},
+    base::{AsyncProgramStore, IambError, IambId, IambResult, NotificationJump, ProgramStore},
     config::{ApplicationSettings, NotifyVia},
 };
 
@@ -46,11 +46,21 @@ const FOCUS_TUI_COMMAND: &str = "focus-tui";
 pub struct NotificationTarget {
     pub room_id: OwnedRoomId,
     pub thread_root: Option<OwnedEventId>,
+    pub event_id: OwnedEventId,
 }
 
 impl From<&NotificationTarget> for IambId {
     fn from(target: &NotificationTarget) -> Self {
         IambId::Room(target.room_id.clone(), target.thread_root.clone())
+    }
+}
+
+impl From<&NotificationTarget> for NotificationJump {
+    fn from(target: &NotificationTarget) -> Self {
+        NotificationJump {
+            window: IambId::from(target),
+            event_id: target.event_id.clone(),
+        }
     }
 }
 
@@ -128,11 +138,10 @@ pub async fn register_notifications(
                     return;
                 }
 
-                let room_id = room.room_id().to_owned();
                 match notification.event {
                     RawAnySyncOrStrippedTimelineEvent::Sync(e) => {
                         match parse_full_notification(e, room, show_message).await {
-                            Ok((summary, body, server_ts, thread_root)) => {
+                            Ok((summary, body, server_ts, target)) => {
                                 if server_ts < startup_ts {
                                     return;
                                 }
@@ -145,7 +154,7 @@ pub async fn register_notifications(
                                     &notify_via,
                                     &summary,
                                     body.as_deref(),
-                                    NotificationTarget { room_id, thread_root },
+                                    target,
                                     &store,
                                     sound_hint.as_deref(),
                                     focus_tui.as_deref(),
@@ -235,12 +244,12 @@ async fn send_notification_desktop(
             {
                 let (dismiss, dismissed) = tokio::sync::oneshot::channel();
                 let focus_tui = focus_tui.map(ToOwned::to_owned);
-                let window = IambId::from(&target);
+                let jump = NotificationJump::from(&target);
                 let store = _store.clone();
 
                 tokio::spawn(async move {
                     if wait_for_click(&handle, dismissed).await {
-                        jump_to_notification(window, focus_tui, &store).await;
+                        jump_to_notification(jump, focus_tui, &store).await;
                     }
 
                     handle.close_async().await;
@@ -291,7 +300,7 @@ async fn wait_for_click(
 /// Bring iamb back to the front and queue the jump to the message that was notified about.
 #[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
 async fn jump_to_notification(
-    window: IambId,
+    jump: NotificationJump,
     focus_tui: Option<String>,
     store: &AsyncProgramStore,
 ) {
@@ -309,7 +318,7 @@ async fn jump_to_notification(
         }
     }
 
-    store.lock().await.application.notification_jump = Some(window);
+    store.lock().await.application.notification_jump = Some(jump);
 }
 
 async fn global_or_room_mode(
@@ -370,7 +379,7 @@ pub async fn parse_full_notification(
     event: Raw<AnySyncTimelineEvent>,
     room: MatrixRoom,
     show_body: bool,
-) -> IambResult<(String, Option<String>, MilliSecondsSinceUnixEpoch, Option<OwnedEventId>)> {
+) -> IambResult<(String, Option<String>, MilliSecondsSinceUnixEpoch, NotificationTarget)> {
     let event = event.deserialize().map_err(IambError::from)?;
 
     let server_ts = event.origin_server_ts();
@@ -400,7 +409,13 @@ pub async fn parse_full_notification(
         None
     };
 
-    return Ok((summary, body, server_ts, event_thread_root(&event)));
+    let target = NotificationTarget {
+        room_id: room.room_id().to_owned(),
+        thread_root: event_thread_root(&event),
+        event_id: event.event_id().to_owned(),
+    };
+
+    return Ok((summary, body, server_ts, target));
 }
 
 /// The thread a notified-about event lives in, so that clicking it opens the thread and not just
@@ -515,14 +530,39 @@ mod tests {
     fn test_notification_target_window() {
         let room_id = room_id!("!room:example.com").to_owned();
         let thread_root = event_id!("$root:example.com").to_owned();
+        let event_id = event_id!("$message:example.com").to_owned();
 
-        let target = NotificationTarget { room_id: room_id.clone(), thread_root: None };
+        let target = NotificationTarget {
+            room_id: room_id.clone(),
+            thread_root: None,
+            event_id: event_id.clone(),
+        };
         assert_eq!(IambId::from(&target), IambId::Room(room_id.clone(), None));
 
         let target = NotificationTarget {
             room_id: room_id.clone(),
             thread_root: Some(thread_root.clone()),
+            event_id: event_id.clone(),
         };
         assert_eq!(IambId::from(&target), IambId::Room(room_id, Some(thread_root)));
+    }
+
+    /// A click has to carry the notified message, not just the room, so that it can be selected.
+    #[test]
+    fn test_notification_jump_keeps_the_event() {
+        let room_id = room_id!("!room:example.com").to_owned();
+        let thread_root = event_id!("$root:example.com").to_owned();
+        let event_id = event_id!("$message:example.com").to_owned();
+
+        let target = NotificationTarget {
+            room_id: room_id.clone(),
+            thread_root: Some(thread_root.clone()),
+            event_id: event_id.clone(),
+        };
+
+        assert_eq!(NotificationJump::from(&target), NotificationJump {
+            window: IambId::Room(room_id, Some(thread_root)),
+            event_id,
+        });
     }
 }

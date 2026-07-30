@@ -92,6 +92,7 @@ use crate::{
         ChatStore,
         HomeserverAction,
         IambAction,
+        RoomAction,
         IambCompleter,
         IambError,
         IambId,
@@ -370,10 +371,15 @@ impl Application {
             self.redraw(self.dirty, self.store.clone().lock().await.deref_mut())?;
             self.dirty = false;
 
-            if let Some(window) = self.store.lock().await.application.notification_jump.take() {
-                let act = WindowAction::Switch(OpenTarget::Application(window));
+            if let Some(jump) = self.store.lock().await.application.notification_jump.take() {
+                let switch = WindowAction::Switch(OpenTarget::Application(jump.window));
+                let select = IambAction::Room(RoomAction::SelectMessage(jump.event_id));
+                let ctx = ProgramContext::default();
 
-                return Ok(Step::Actions(vec![(act.into(), ProgramContext::default())]));
+                return Ok(Step::Actions(vec![
+                    (switch.into(), ctx.clone()),
+                    (select.into(), ctx),
+                ]));
             }
 
             if !poll(Duration::from_secs(1))? {

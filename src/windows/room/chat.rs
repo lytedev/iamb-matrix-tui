@@ -844,6 +844,21 @@ impl ChatState {
         Some(text_to_message_content(text.trim_end().to_string()))
     }
 
+    /// Move the scrollback cursor onto a message, backfilling first if it is not loaded yet.
+    ///
+    /// This is what clicking a notification uses, so the notified message ends up selected just as
+    /// if the user had moved onto it themselves.
+    pub fn select_message(&mut self, event_id: OwnedEventId, store: &mut ProgramStore) {
+        let info = store.application.rooms.get_or_default(self.room_id.clone());
+
+        if self.scrollback.goto_event(&event_id, info) {
+            return;
+        }
+
+        self.scrollback.select_when_loaded(event_id.clone());
+        store.application.need_load.need_message(self.room_id.clone(), event_id);
+    }
+
     pub fn focus_toggle(&mut self) {
         self.focus.toggle();
     }

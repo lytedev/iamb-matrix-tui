@@ -2,7 +2,7 @@
 use ratatui_image::Image;
 use regex::Regex;
 
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId};
 
 use modalkit_ratatui::{ScrollActions, TerminalCursor, WindowOps};
 use ratatui::{
@@ -135,6 +135,25 @@ pub struct ScrollbackState {
     /// This is used to ensure that ^E/^Y work nicely when the cursor is currently
     /// on a multiline message.
     show_full_on_redraw: bool,
+
+    /// A message that should be selected as soon as it has been loaded.
+    pending_selection: Option<PendingSelection>,
+}
+
+/// A message that was asked for before it was loaded, to be selected once it arrives.
+///
+/// Clicking a notification can name a message that this scrollback has not backfilled yet, so the
+/// selection has to wait for the load to finish rather than block the main loop on it.
+#[derive(Clone)]
+struct PendingSelection {
+    /// The message to select once it is loaded.
+    event_id: OwnedEventId,
+
+    /// Where the cursor was when the selection was requested.
+    ///
+    /// If the cursor has moved since then, the user has started reading something else, and a late
+    /// arrival should no longer yank them away from it.
+    cursor: MessageCursor,
 }
 
 impl ScrollbackState {
@@ -153,6 +172,7 @@ impl ScrollbackState {
             viewctx,
             jumped,
             show_full_on_redraw,
+            pending_selection: None,
         }
     }
 
@@ -168,6 +188,52 @@ impl ScrollbackState {
         let mut cursor = MessageCursor::new(target, 0);
         std::mem::swap(&mut cursor, &mut self.cursor);
         self.jumped.push(cursor);
+    }
+
+    /// Move the cursor onto `event_id`, if that message is loaded in this scrollback.
+    ///
+    /// Returns whether the message was there to select. A message can be known to the room but
+    /// absent here, because a thread's scrollback only holds that thread's replies.
+    pub fn goto_event(&mut self, event_id: &EventId, info: &RoomInfo) -> bool {
+        let Some(key) = info.get_message_key(event_id) else {
+            return false;
+        };
+
+        let Some(thread) = self.get_thread(info) else {
+            return false;
+        };
+
+        if !thread.contains_key(key) {
+            return false;
+        }
+
+        let key = key.clone();
+        self.goto_message(key);
+
+        true
+    }
+
+    /// Select `event_id` once it has been loaded.
+    ///
+    /// Loading it is the caller's job; this only watches for it to show up.
+    pub fn select_when_loaded(&mut self, event_id: OwnedEventId) {
+        self.pending_selection = Some(PendingSelection { event_id, cursor: self.cursor.clone() });
+    }
+
+    /// Select the message requested by [ScrollbackState::select_when_loaded], if it has arrived.
+    fn take_pending_selection(&mut self, info: &RoomInfo) {
+        let Some(pending) = self.pending_selection.take() else {
+            return;
+        };
+
+        if pending.cursor != self.cursor {
+            // The user has moved on; stop waiting.
+            return;
+        }
+
+        if !self.goto_event(&pending.event_id, info) {
+            self.pending_selection = Some(pending);
+        }
     }
 
     /// Set the dimensions and placement within the terminal window for this list.
@@ -595,6 +661,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             viewctx: self.viewctx.clone(),
             jumped: self.jumped.clone(),
             show_full_on_redraw: false,
+            pending_selection: self.pending_selection.clone(),
         }
     }
 
@@ -1299,6 +1366,8 @@ impl StatefulWidget for Scrollback<'_> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let info = self.store.application.rooms.get_or_default(state.room_id.clone());
+        state.take_pending_selection(info);
+
         let settings = &self.store.application.settings;
         let area = if state.cursor.timestamp.is_some() {
             render_jump_to_recent(area, buf, self.focused)
@@ -1445,6 +1514,72 @@ impl StatefulWidget for Scrollback<'_> {
 mod tests {
     use super::*;
     use crate::{base::Need, tests::*};
+    use matrix_sdk::ruma::server_name;
+
+    #[tokio::test]
+    async fn test_goto_event_selects_a_loaded_message() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let info = store.application.rooms.get_or_default(room_id);
+
+        assert_eq!(scrollback.cursor, MessageCursor::latest());
+        assert!(scrollback.goto_event(&MSG2_EVID, info));
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
+    }
+
+    #[tokio::test]
+    async fn test_goto_event_ignores_an_unloaded_message() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let info = store.application.rooms.get_or_default(room_id);
+        let unloaded = EventId::new_v1(server_name!("example.com"));
+
+        assert!(!scrollback.goto_event(&unloaded, info));
+        assert_eq!(scrollback.cursor, MessageCursor::latest());
+    }
+
+    #[tokio::test]
+    async fn test_pending_selection_waits_for_the_message() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let unloaded = EventId::new_v1(server_name!("example.com"));
+
+        // Nothing to select yet, so the cursor stays where it is and the request is kept.
+        scrollback.select_when_loaded(unloaded);
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        scrollback.take_pending_selection(info);
+        assert_eq!(scrollback.cursor, MessageCursor::latest());
+        assert!(scrollback.pending_selection.is_some());
+
+        // Once the message is there, it gets selected and the request is done with.
+        scrollback.select_when_loaded(MSG2_EVID.clone());
+        let info = store.application.rooms.get_or_default(room_id);
+        scrollback.take_pending_selection(info);
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
+        assert!(scrollback.pending_selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_selection_yields_to_the_user() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let unloaded = EventId::new_v1(server_name!("example.com"));
+
+        scrollback.select_when_loaded(unloaded);
+
+        // The user selected something themselves while the message was still loading, so the late
+        // arrival must not move them.
+        scrollback.goto_message(MSG4_KEY.clone());
+
+        let info = store.application.rooms.get_or_default(room_id);
+        scrollback.take_pending_selection(info);
+        assert_eq!(scrollback.cursor, MSG4_KEY.clone().into());
+        assert!(scrollback.pending_selection.is_none());
+    }
 
     #[tokio::test]
     async fn test_search_messages() {

@@ -455,6 +455,9 @@ pub enum RoomAction {
     /// Mark this room, or the thread being viewed, as read.
     MarkRead,
 
+    /// Move the scrollback cursor onto a message, loading it first if necessary.
+    SelectMessage(OwnedEventId),
+
     /// Update a user's membership in this room.
     MemberUpdate(MemberUpdateAction, String, Option<String>, bool),
 
@@ -1987,13 +1990,23 @@ pub struct ChatStore {
     /// Read operations that `:undoread` can walk back through, oldest first.
     pub read_undos: Vec<ReadUndoEntry>,
 
-    /// Window a clicked desktop notification wants the main loop to switch to.
+    /// Where a clicked desktop notification wants the main loop to take the user.
     ///
     /// Notifications are handled off the main loop, which is blocked reading terminal input, so
     /// the click leaves the target here and the loop picks it up on its next pass. Only the most
     /// recent click is kept: when several notifications are clicked in quick succession, the user
     /// only ends up looking at one of them anyway.
-    pub notification_jump: Option<IambId>,
+    pub notification_jump: Option<NotificationJump>,
+}
+
+/// Where a clicked desktop notification takes the user.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationJump {
+    /// The window to switch to: the room, or the thread the notified message lives in.
+    pub window: IambId,
+
+    /// The notified message, to be selected once the window is showing it.
+    pub event_id: OwnedEventId,
 }
 
 /// How many read operations `:undoread` can walk back through.

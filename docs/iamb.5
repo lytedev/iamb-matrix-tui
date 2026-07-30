@@ -332,6 +332,12 @@ The
 .Sy settings.notifications
 subsection allows configuring how notifications for new messages behave.
 .Pp
+Clicking a desktop notification opens the room the message was sent in, or the thread it belongs
+to, and selects the message itself, so that it can be replied to or opened as a thread without
+scrolling back to it first.
+If the message has not been loaded yet, iamb fetches it in the background and selects it when it
+arrives, unless another message has been selected in the meantime.
+.Pp
 The available fields in this subsection are:
 .Bl -tag -width Ds
 .It Sy enabled
