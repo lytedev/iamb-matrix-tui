@@ -1331,6 +1331,30 @@ mod tests {
     }
 
     #[test]
+    fn test_user_char_span_matches_the_sender_column_color() {
+        use crate::tests::{mock_settings, TEST_USER1};
+
+        let mut settings = mock_settings();
+        let mut info = RoomInfo::default();
+
+        info.display_names.set(TEST_USER1.clone(), Some("Ada Lovelace".into()));
+
+        // The receipt letter is styled exactly like the sender column, both when the color is
+        // derived from the user ID and when it is overridden in the configuration.
+        let derived = settings.get_user_char_span(&TEST_USER1, &info).style;
+        assert_eq!(derived, settings.get_user_span(&TEST_USER1, &info).style);
+
+        settings.tunables.users.insert(TEST_USER1.clone(), UserDisplayTunables {
+            name: None,
+            color: Some(UserColor(Color::LightRed)),
+        });
+
+        let overridden = settings.get_user_char_span(&TEST_USER1, &info).style;
+        assert_eq!(overridden, settings.get_user_span(&TEST_USER1, &info).style);
+        assert_ne!(overridden, derived);
+    }
+
+    #[test]
     fn test_profile_name_invalid() {
         assert_eq!(validate_profile_name(""), false);
         assert_eq!(validate_profile_name(" "), false);
