@@ -628,184 +628,126 @@ impl TerminalCursor for IambWindow {
     }
 }
 
-impl WindowOps<IambInfo> for IambWindow {
-    fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
+/// Draw a list window's entries, or the message that says why it has none.
+fn render_list<T: ListItem<IambInfo>>(
+    state: &mut ListState<T, IambInfo>,
+    empty_message: &'static str,
+    area: Rect,
+    buf: &mut Buffer,
+    focused: bool,
+    store: &mut ProgramStore,
+) {
+    List::new(store)
+        .empty_message(empty_message)
+        .empty_alignment(Alignment::Center)
+        .focus(focused)
+        .render(area, buf, state);
+}
+
+/// Build the entries for one of the windows that mixes rooms and DMs.
+fn chat_items(store: &mut ProgramStore) -> Vec<GenericChatItem> {
+    let sync_info = &store.application.sync_info;
+    let rooms = sync_info.rooms.clone();
+    let dms = sync_info.dms.clone();
+
+    let mut items = rooms
+        .into_iter()
+        .map(|room_info| GenericChatItem::new(room_info, store, false))
+        .collect::<Vec<_>>();
+
+    items.extend(dms.into_iter().map(|room_info| GenericChatItem::new(room_info, store, true)));
+
+    items
+}
+
+impl IambWindow {
+    /// Put the entries into this window's list.
+    ///
+    /// Windows are opened empty, so something has to fill them in. This is that something, and it
+    /// is called from two places: [Window::open], so that a window has its entries the moment it
+    /// exists, and [WindowOps::draw], so that they keep up with the rest of the client.
+    ///
+    /// Filling in at open is what makes a macro like `:unreadsandthreads<Enter>G<Enter>` work. All
+    /// of a macro's keys are consumed in one batch before anything is redrawn, so `G` and `<Enter>`
+    /// would otherwise be moving around and selecting from a list that is still empty. There is
+    /// nothing to wait for here: every one of these lists is built from state already in the
+    /// store, so the only reason they were empty was that nobody had asked for them yet.
+    ///
+    /// The exception is [IambWindow::MemberList], whose entries come from the worker rather than
+    /// the store. It keeps its own debounce, which decides on its own terms whether this actually
+    /// asks for anything.
+    pub fn refresh(&mut self, store: &mut ProgramStore) {
+        /// Sort the entries the way the user has configured this kind of list to be sorted, and
+        /// put them in the list.
+        macro_rules! sorted {
+            ($state: expr, $items: expr, $field: ident) => {{
+                let mut items = $items;
+                let fields = &store.application.settings.tunables.sort.$field;
+                let collator = &mut store.application.collator;
+
+                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
+                $state.set(items);
+            }};
+        }
+
         match self {
-            IambWindow::Room(state) => state.draw(area, buf, focused, store),
-            IambWindow::CommandPalette(state) => state.draw(area, buf, focused, store),
-            IambWindow::QuickSwitcher(state) => state.draw(area, buf, focused, store),
+            // These have no list of their own to fill in.
+            IambWindow::Room(_) | IambWindow::Welcome(_) => {},
+
+            // These decide for themselves what belongs in their list, based on what has been
+            // typed into their filter bar.
+            IambWindow::CommandPalette(state) => state.rebuild(store),
+            IambWindow::QuickSwitcher(state) => state.rebuild(store),
+
             IambWindow::DirectList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .dms
-                    .clone()
+                let items = store.application.sync_info.dms.clone();
+                let items = items
                     .into_iter()
                     .map(|room_info| DirectItem::new(room_info, store))
                     .collect::<Vec<_>>();
-                let fields = &store.application.settings.tunables.sort.dms;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("No direct messages yet!")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
-            },
-            IambWindow::MemberList(state, room_id, last_fetch) => {
-                let need_fetch = match last_fetch {
-                    Some(i) => i.elapsed() >= MEMBER_FETCH_DEBOUNCE,
-                    None => true,
-                };
-
-                if need_fetch {
-                    if let Ok(mems) = store.application.worker.members(room_id.clone()) {
-                        let mut items = mems
-                            .into_iter()
-                            .map(|m| MemberItem::new(m, room_id.clone()))
-                            .collect::<Vec<_>>();
-                        let fields = &store.application.settings.tunables.sort.members;
-                        items.sort_by(|a, b| user_fields_cmp(a, b, fields));
-                        state.set(items);
-                        *last_fetch = Some(Instant::now());
-                    }
-                }
-
-                List::new(store)
-                    .empty_message("No users here yet!")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, dms);
             },
             IambWindow::RoomList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .rooms
-                    .clone()
+                let items = store.application.sync_info.rooms.clone();
+                let items = items
                     .into_iter()
                     .map(|room_info| RoomItem::new(room_info, store))
                     .collect::<Vec<_>>();
-                let fields = &store.application.settings.tunables.sort.rooms;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
-                state.set(items);
+                sorted!(state, items, rooms);
+            },
+            IambWindow::SpaceList(state) => {
+                let items = store.application.sync_info.spaces.clone();
+                let items =
+                    items.into_iter().map(|room| SpaceItem::new(room, store)).collect::<Vec<_>>();
 
-                List::new(store)
-                    .empty_message("You haven't joined any rooms yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, spaces);
             },
             IambWindow::ChatList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .rooms
-                    .clone()
-                    .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, false))
-                    .collect::<Vec<_>>();
+                let items = chat_items(store);
 
-                let dms = store
-                    .application
-                    .sync_info
-                    .dms
-                    .clone()
-                    .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, true));
-
-                items.extend(dms);
-
-                let fields = &store.application.settings.tunables.sort.chats;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
-
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("You do not have rooms or dms yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, chats);
             },
             IambWindow::UnreadList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .rooms
-                    .clone()
+                let items = chat_items(store)
                     .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, false))
                     .filter(RoomLikeItem::is_unread)
                     .collect::<Vec<_>>();
 
-                let dms = store
-                    .application
-                    .sync_info
-                    .dms
-                    .clone()
-                    .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, true))
-                    .filter(RoomLikeItem::is_unread);
-
-                items.extend(dms);
-
-                let fields = &store.application.settings.tunables.sort.chats;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
-
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("You do not have any unreads yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, chats);
             },
             IambWindow::ThreadList(state) => {
-                let mut items = followed_thread_items(store);
+                let items = followed_thread_items(store);
 
-                let fields = &store.application.settings.tunables.sort.chats;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
-
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("You are not following any threads yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, chats);
             },
             IambWindow::UnreadThreadList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .rooms
-                    .clone()
+                let mut items = chat_items(store)
                     .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, false))
                     .filter(RoomLikeItem::is_unread)
                     .map(UnreadThreadItem::Chat)
                     .collect::<Vec<_>>();
-
-                let dms = store
-                    .application
-                    .sync_info
-                    .dms
-                    .clone()
-                    .into_iter()
-                    .map(|room_info| GenericChatItem::new(room_info, store, true))
-                    .filter(RoomLikeItem::is_unread)
-                    .map(UnreadThreadItem::Chat)
-                    .collect::<Vec<_>>();
-
-                items.extend(dms);
 
                 let threads = followed_thread_items(store)
                     .into_iter()
@@ -814,55 +756,94 @@ impl WindowOps<IambInfo> for IambWindow {
 
                 items.extend(threads);
 
-                let fields = &store.application.settings.tunables.sort.chats;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
-
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("You do not have any unread rooms or threads yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
-            },
-            IambWindow::SpaceList(state) => {
-                let mut items = store
-                    .application
-                    .sync_info
-                    .spaces
-                    .clone()
-                    .into_iter()
-                    .map(|room| SpaceItem::new(room, store))
-                    .collect::<Vec<_>>();
-                let fields = &store.application.settings.tunables.sort.spaces;
-                let collator = &mut store.application.collator;
-                items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
-
-                state.set(items);
-
-                List::new(store)
-                    .empty_message("You haven't joined any spaces yet")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
+                sorted!(state, items, chats);
             },
             IambWindow::VerifyList(state) => {
-                let verifications = &store.application.verifications;
-                let mut items = verifications.iter().map(VerifyItem::from).collect::<Vec<_>>();
+                let mut items =
+                    store.application.verifications.iter().map(VerifyItem::from).collect::<Vec<_>>();
 
                 // Sort the active verifications towards the top.
                 items.sort();
 
                 state.set(items);
-
-                List::new(store)
-                    .empty_message("No in-progress verifications")
-                    .empty_alignment(Alignment::Center)
-                    .focus(focused)
-                    .render(area, buf, state);
             },
-            IambWindow::Welcome(state) => state.draw(area, buf, focused, store),
+            IambWindow::MemberList(state, room_id, last_fetch) => {
+                let need_fetch = match last_fetch {
+                    Some(i) => i.elapsed() >= MEMBER_FETCH_DEBOUNCE,
+                    None => true,
+                };
+
+                if !need_fetch {
+                    return;
+                }
+
+                if let Ok(mems) = store.application.worker.members(room_id.clone()) {
+                    let mut items = mems
+                        .into_iter()
+                        .map(|m| MemberItem::new(m, room_id.clone()))
+                        .collect::<Vec<_>>();
+                    let fields = &store.application.settings.tunables.sort.members;
+
+                    items.sort_by(|a, b| user_fields_cmp(a, b, fields));
+                    state.set(items);
+                    *last_fetch = Some(Instant::now());
+                }
+            },
+        }
+    }
+}
+
+impl WindowOps<IambInfo> for IambWindow {
+    fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
+        // These windows draw themselves, and refresh themselves as they do.
+        match self {
+            IambWindow::Room(state) => return state.draw(area, buf, focused, store),
+            IambWindow::Welcome(state) => return state.draw(area, buf, focused, store),
+            IambWindow::CommandPalette(state) => return state.draw(area, buf, focused, store),
+            IambWindow::QuickSwitcher(state) => return state.draw(area, buf, focused, store),
+            _ => {},
+        }
+
+        self.refresh(store);
+
+        match self {
+            IambWindow::DirectList(state) => {
+                render_list(state, "No direct messages yet!", area, buf, focused, store)
+            },
+            IambWindow::MemberList(state, _, _) => {
+                render_list(state, "No users here yet!", area, buf, focused, store)
+            },
+            IambWindow::RoomList(state) => {
+                render_list(state, "You haven't joined any rooms yet", area, buf, focused, store)
+            },
+            IambWindow::SpaceList(state) => {
+                render_list(state, "You haven't joined any spaces yet", area, buf, focused, store)
+            },
+            IambWindow::ChatList(state) => {
+                render_list(state, "You do not have rooms or dms yet", area, buf, focused, store)
+            },
+            IambWindow::UnreadList(state) => {
+                render_list(state, "You do not have any unreads yet", area, buf, focused, store)
+            },
+            IambWindow::ThreadList(state) => {
+                let empty = "You are not following any threads yet";
+
+                render_list(state, empty, area, buf, focused, store)
+            },
+            IambWindow::UnreadThreadList(state) => {
+                let empty = "You do not have any unread rooms or threads yet";
+
+                render_list(state, empty, area, buf, focused, store)
+            },
+            IambWindow::VerifyList(state) => {
+                render_list(state, "No in-progress verifications", area, buf, focused, store)
+            },
+
+            // Already drawn above.
+            IambWindow::Room(_) |
+            IambWindow::Welcome(_) |
+            IambWindow::CommandPalette(_) |
+            IambWindow::QuickSwitcher(_) => {},
         }
     }
 
@@ -909,6 +890,81 @@ impl WindowOps<IambInfo> for IambWindow {
 
     fn get_selected_word(&self) -> Option<String> {
         delegate!(self, w => w.get_selected_word())
+    }
+}
+
+/// Build a window with an empty list, which [IambWindow::refresh] then fills in.
+fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
+    match id {
+        IambId::Room(room_id, thread) => {
+            let (room, name, tags) = store.application.worker.get_room(room_id)?;
+            let room = RoomState::new(room, thread, name, tags, store);
+
+            store.application.need_load.need_members(room.id().to_owned());
+            return Ok(room.into());
+        },
+        IambId::DirectList => {
+            let list = DirectListState::new(IambBufferId::DirectList, vec![]);
+
+            return Ok(list.into());
+        },
+        IambId::MemberList(room_id) => {
+            let id = IambBufferId::MemberList(room_id.clone());
+            let list = MemberListState::new(id, vec![]);
+            let win = IambWindow::MemberList(list, room_id, None);
+
+            return Ok(win);
+        },
+        IambId::RoomList => {
+            let list = RoomListState::new(IambBufferId::RoomList, vec![]);
+
+            return Ok(list.into());
+        },
+        IambId::SpaceList => {
+            let list = SpaceListState::new(IambBufferId::SpaceList, vec![]);
+
+            return Ok(list.into());
+        },
+        IambId::VerifyList => {
+            let list = VerifyListState::new(IambBufferId::VerifyList, vec![]);
+
+            return Ok(list.into());
+        },
+        IambId::Welcome => {
+            let win = WelcomeState::new(store);
+
+            return Ok(win.into());
+        },
+        IambId::ChatList => {
+            let list = ChatListState::new(IambBufferId::ChatList, vec![]);
+
+            Ok(list.into())
+        },
+        IambId::UnreadList => {
+            let list = UnreadListState::new(IambBufferId::UnreadList, vec![]);
+
+            Ok(IambWindow::UnreadList(list))
+        },
+        IambId::ThreadList => {
+            let list = ThreadListState::new(IambBufferId::ThreadList, vec![]);
+
+            Ok(IambWindow::ThreadList(list))
+        },
+        IambId::CommandPalette => {
+            let win = CommandPaletteState::new(store);
+
+            Ok(IambWindow::CommandPalette(win))
+        },
+        IambId::QuickSwitcher => {
+            let win = QuickSwitcherState::new(store);
+
+            Ok(IambWindow::QuickSwitcher(win))
+        },
+        IambId::UnreadThreadList => {
+            let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
+
+            Ok(IambWindow::UnreadThreadList(list))
+        },
     }
 }
 
@@ -992,78 +1048,15 @@ impl Window<IambInfo> for IambWindow {
     }
 
     fn open(id: IambId, store: &mut ProgramStore) -> IambResult<Self> {
-        match id {
-            IambId::Room(room_id, thread) => {
-                let (room, name, tags) = store.application.worker.get_room(room_id)?;
-                let room = RoomState::new(room, thread, name, tags, store);
+        let mut win = open_empty(id, store)?;
 
-                store.application.need_load.need_members(room.id().to_owned());
-                return Ok(room.into());
-            },
-            IambId::DirectList => {
-                let list = DirectListState::new(IambBufferId::DirectList, vec![]);
+        // A window is no use to a macro that opens it and immediately acts on it if its list is
+        // still empty when the next key arrives, and nothing here has to be waited on.
+        win.refresh(store);
 
-                return Ok(list.into());
-            },
-            IambId::MemberList(room_id) => {
-                let id = IambBufferId::MemberList(room_id.clone());
-                let list = MemberListState::new(id, vec![]);
-                let win = IambWindow::MemberList(list, room_id, None);
-
-                return Ok(win);
-            },
-            IambId::RoomList => {
-                let list = RoomListState::new(IambBufferId::RoomList, vec![]);
-
-                return Ok(list.into());
-            },
-            IambId::SpaceList => {
-                let list = SpaceListState::new(IambBufferId::SpaceList, vec![]);
-
-                return Ok(list.into());
-            },
-            IambId::VerifyList => {
-                let list = VerifyListState::new(IambBufferId::VerifyList, vec![]);
-
-                return Ok(list.into());
-            },
-            IambId::Welcome => {
-                let win = WelcomeState::new(store);
-
-                return Ok(win.into());
-            },
-            IambId::ChatList => {
-                let list = ChatListState::new(IambBufferId::ChatList, vec![]);
-
-                Ok(list.into())
-            },
-            IambId::UnreadList => {
-                let list = UnreadListState::new(IambBufferId::UnreadList, vec![]);
-
-                Ok(IambWindow::UnreadList(list))
-            },
-            IambId::ThreadList => {
-                let list = ThreadListState::new(IambBufferId::ThreadList, vec![]);
-
-                Ok(IambWindow::ThreadList(list))
-            },
-            IambId::CommandPalette => {
-                let win = CommandPaletteState::new(store);
-
-                Ok(IambWindow::CommandPalette(win))
-            },
-            IambId::QuickSwitcher => {
-                let win = QuickSwitcherState::new(store);
-
-                Ok(IambWindow::QuickSwitcher(win))
-            },
-            IambId::UnreadThreadList => {
-                let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
-
-                Ok(IambWindow::UnreadThreadList(list))
-            },
-        }
+        Ok(win)
     }
+
 
     fn find(name: String, store: &mut ProgramStore) -> IambResult<Self> {
         let ChatStore { names, worker, .. } = &mut store.application;
@@ -2094,7 +2087,40 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for MemberItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mock_store;
     use matrix_sdk::ruma::{room_alias_id, server_name};
+
+    /// Opening a window has to leave its list populated, not empty until the first redraw.
+    ///
+    /// A macro like `:unreadsandthreads<Enter>G<Enter>` has all of its keys consumed in one batch
+    /// before anything is drawn, so `G` and `<Enter>` would otherwise be acting on an empty list
+    /// and failing with "No item currently selected".
+    ///
+    /// The switcher is what this can be checked with: its entries include the windows that iamb's
+    /// commands open, which are there regardless of whether a sync has happened. The room lists
+    /// need a real Matrix client to have anything in them, so they cannot be checked here.
+    #[tokio::test]
+    async fn test_opening_a_window_fills_in_its_list() {
+        let mut store = mock_store().await;
+
+        let IambWindow::QuickSwitcher(switcher) =
+            IambWindow::open(IambId::QuickSwitcher, &mut store).unwrap()
+        else {
+            panic!("opening iamb://switch should give back a switcher");
+        };
+
+        assert!(switcher.len() > 0, "the switcher should have entries before it is ever drawn");
+    }
+
+    #[tokio::test]
+    async fn test_opening_a_window_that_has_nothing_to_fill_in() {
+        let mut store = mock_store().await;
+
+        // Nothing has synced, so these are empty rather than broken, and opening them still works.
+        for id in [IambId::RoomList, IambId::DirectList, IambId::UnreadThreadList] {
+            assert!(IambWindow::open(id, &mut store).is_ok());
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     struct TestRoomItem {

@@ -90,12 +90,19 @@ impl<T: FilteredItem> FilteredListState<T> {
         FilteredListState { filter, list }
     }
 
+    /// How many rows the list currently holds.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
     /// Rebuild the list for what has been typed.
     ///
-    /// This happens on every edit and every draw, rather than only when the typed text changes, so
-    /// that rows which depend on more than the filter -- which rooms are unread, say -- keep up
-    /// with the rest of the client. It is the same thing the other list windows do when they draw.
-    fn rebuild(&mut self, store: &mut ProgramStore) {
+    /// This happens when the window is opened, on every edit, and on every draw, rather than only
+    /// when the typed text changes. Opening is what lets a macro that opens the window and acts on
+    /// it in one go find anything there; redrawing is what keeps rows that depend on more than the
+    /// filter -- which rooms are unread, say -- up to date with the rest of the client.
+    pub fn rebuild(&mut self, store: &mut ProgramStore) {
         let needle = self.filter.get().to_string().trim().to_string();
 
         self.list.set(T::matching(&needle, store));
