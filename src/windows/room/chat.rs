@@ -803,13 +803,19 @@ impl ChatState {
         let mime = mime::IMAGE_PNG;
 
         let name = clipboard_image_filename();
-        let caption = self.take_caption();
+        let caption = self.caption();
         let config = AttachmentConfig::new().caption(caption.clone());
 
         let resp = room
             .send_attachment(&name, &mime, bytes, config)
             .await
             .map_err(IambError::from)?;
+
+        // Only now that the caption has actually gone out do we clear it, so that a failed
+        // upload leaves the user's text where they typed it.
+        if caption.is_some() {
+            self.reset();
+        }
 
         // Mock up the local echo message for the scrollback.
         let echo = match &caption {
@@ -822,18 +828,15 @@ impl ChatState {
         Ok((resp.event_id, msg))
     }
 
-    /// Consume the message bar's contents to use as an attachment caption.
-    fn take_caption(&mut self) -> Option<TextMessageEventContent> {
+    /// The message bar's contents, as an attachment caption.
+    fn caption(&mut self) -> Option<TextMessageEventContent> {
         let text = self.tbox.get();
 
         if text.is_blank() {
             return None;
         }
 
-        let caption = text_to_message_content(text.trim_end().to_string());
-        self.reset();
-
-        Some(caption)
+        Some(text_to_message_content(text.trim_end().to_string()))
     }
 
     pub fn focus_toggle(&mut self) {
