@@ -1986,6 +1986,14 @@ pub struct ChatStore {
 
     /// Read operations that `:undoread` can walk back through, oldest first.
     pub read_undos: Vec<ReadUndoEntry>,
+
+    /// Window a clicked desktop notification wants the main loop to switch to.
+    ///
+    /// Notifications are handled off the main loop, which is blocked reading terminal input, so
+    /// the click leaves the target here and the loop picks it up on its next pass. Only the most
+    /// recent click is kept: when several notifications are clicked in quick succession, the user
+    /// only ends up looking at one of them anyway.
+    pub notification_jump: Option<IambId>,
 }
 
 /// How many read operations `:undoread` can walk back through.
@@ -2036,6 +2044,7 @@ impl ChatStore {
             focused: true,
             open_notifications: Default::default(),
             read_undos: Default::default(),
+            notification_jump: None,
         }
     }
 

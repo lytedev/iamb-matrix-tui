@@ -352,6 +352,18 @@ The notification rules are stored server side, loaded once at startup, and are c
 In other words, you can simply change the rules with another client.
 .It Sy sound_hint
 Controls the notification sound name that is passed as a hint to the notification daemon.
+.It Sy focus_tui
+Name to register with the external
+.Ic focus-tui
+helper, which raises the window and terminal tab that iamb is running in.
+Unset by default, in which case iamb never runs an external command; clicking a notification still
+jumps to the message, but only within an already-visible iamb.
+When set, iamb runs
+.Ic focus-tui-register Ar name
+once at startup to record where it is running, and
+.Ic focus-tui Ar name
+when a notification is clicked.
+A missing or failing helper is logged and otherwise ignored.
 .El
 .Ss Example 1: Enable notifications with default options
 .Bd -literal -offset indent
@@ -371,6 +383,12 @@ show_message = false
 enabled = true
 sound_hint = "message-new-instant" # Linux
 sound_hint = "IM"                  # Windows
+.Ed
+.Ss Example 4: Make notifications raise iamb when clicked
+.Bd -literal -offset indent
+[settings.notifications]
+enabled = true
+focus_tui = "iamb"
 .Ed
 .Sh "SORTING LISTS"
 The

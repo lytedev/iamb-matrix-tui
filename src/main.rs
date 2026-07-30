@@ -238,6 +238,15 @@ fn setup_screen(
     return Ok(ScreenState::new(win, cmd));
 }
 
+/// What woke the main loop up.
+enum Step {
+    /// The user pressed a key, which the keybindings get to interpret.
+    Key(TerminalKey),
+
+    /// Something outside the terminal asked for actions to run, such as a clicked notification.
+    Actions(Vec<(ProgramAction, ProgramContext)>),
+}
+
 /// The main application state and event loop.
 struct Application {
     /// Terminal backend.
@@ -356,10 +365,16 @@ impl Application {
         Ok(())
     }
 
-    async fn step(&mut self) -> Result<TerminalKey, std::io::Error> {
+    async fn step(&mut self) -> Result<Step, std::io::Error> {
         loop {
             self.redraw(self.dirty, self.store.clone().lock().await.deref_mut())?;
             self.dirty = false;
+
+            if let Some(window) = self.store.lock().await.application.notification_jump.take() {
+                let act = WindowAction::Switch(OpenTarget::Application(window));
+
+                return Ok(Step::Actions(vec![(act.into(), ProgramContext::default())]));
+            }
 
             if !poll(Duration::from_secs(1))? {
                 // Redraw in case there's new messages to show.
@@ -372,7 +387,7 @@ impl Application {
                         continue;
                     }
 
-                    return Ok(ke.into());
+                    return Ok(Step::Key(ke.into()));
                 },
                 Event::Mouse(me) => {
                     let dir = match me.kind {
@@ -786,9 +801,10 @@ impl Application {
         let store = self.store.clone();
 
         while self.screen.tabs() != 0 {
-            let key = self.step().await?;
-
-            self.bindings.input_key(key);
+            match self.step().await? {
+                Step::Key(key) => self.bindings.input_key(key),
+                Step::Actions(acts) => self.action_prepend(acts),
+            }
 
             let mut locked = store.lock().await;
             let mut keyskip = false;
@@ -1140,6 +1156,11 @@ async fn run(settings: ApplicationSettings) -> IambResult<()> {
                ))
                 .unwrap_or_default()
         });
+
+    // This has to run while iamb still owns a plain terminal, and before the UI can take any time
+    // to start: the helper reads the window it was launched in.
+    crate::notifications::register_focus_tui(&settings);
+
     setup_tty(&settings, enable_enhanced_keys)?;
 
     let orig_hook = std::panic::take_hook();

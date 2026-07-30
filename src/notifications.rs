@@ -1,3 +1,4 @@
+use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use matrix_sdk::{
@@ -5,9 +6,14 @@ use matrix_sdk::{
     notification_settings::{IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode},
     room::Room as MatrixRoom,
     ruma::{
-        events::{room::message::MessageType, AnyMessageLikeEventContent, AnySyncTimelineEvent},
+        events::{
+            room::message::{MessageType, Relation},
+            AnyMessageLikeEventContent,
+            AnySyncTimelineEvent,
+        },
         serde::Raw,
         MilliSecondsSinceUnixEpoch,
+        OwnedEventId,
         OwnedRoomId,
         RoomId,
     },
@@ -17,7 +23,7 @@ use matrix_sdk::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    base::{AsyncProgramStore, IambError, IambResult, ProgramStore},
+    base::{AsyncProgramStore, IambError, IambId, IambResult, ProgramStore},
     config::{ApplicationSettings, NotifyVia},
 };
 
@@ -26,19 +32,66 @@ const IAMB_XDG_NAME: &str = match option_env!("IAMB_XDG_NAME") {
     Some(iamb) => iamb,
 };
 
+/// Notification action invoked by clicking the notification body rather than a button.
+const DEFAULT_ACTION: &str = "default";
+
+/// External helper that records which window and terminal tab iamb is running in.
+const FOCUS_TUI_REGISTER_COMMAND: &str = "focus-tui-register";
+
+/// External helper that raises the window and tab recorded by [FOCUS_TUI_REGISTER_COMMAND].
+const FOCUS_TUI_COMMAND: &str = "focus-tui";
+
+/// Where a notification should take the user when they click it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationTarget {
+    pub room_id: OwnedRoomId,
+    pub thread_root: Option<OwnedEventId>,
+}
+
+impl From<&NotificationTarget> for IambId {
+    fn from(target: &NotificationTarget) -> Self {
+        IambId::Room(target.room_id.clone(), target.thread_root.clone())
+    }
+}
+
 /// Handle for an open notification that should be closed when the user views it.
+///
+/// Dropping this cancels the task that is waiting for the user to click the notification, which
+/// closes the notification itself.
 pub struct NotificationHandle(
     #[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
-    Option<notify_rust::NotificationHandle>,
+    #[allow(dead_code)]
+    tokio::sync::oneshot::Sender<()>,
 );
 
-impl Drop for NotificationHandle {
-    fn drop(&mut self) {
-        #[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
-        if let Some(handle) = self.0.take() {
-            handle.close();
-        }
+/// Record where iamb is running, so that clicking a notification can bring this window back.
+///
+/// This has to happen at startup rather than when a notification is clicked: several terminal
+/// windows typically share one process, so iamb's own identity does not name a window, and by the
+/// time a notification arrives iamb is by definition not the focused window.
+///
+/// Entirely optional. Users opt in by setting `notifications.focus_tui`, and even then a missing
+/// or failing helper is logged and ignored rather than being allowed to hold up startup.
+pub fn register_focus_tui(settings: &ApplicationSettings) {
+    let Some(name) = settings.tunables.notifications.focus_tui.as_deref() else {
+        return;
+    };
+
+    match run_focus_tui_helper(FOCUS_TUI_REGISTER_COMMAND, name) {
+        Ok(status) if status.success() => (),
+        Ok(status) => tracing::warn!("{FOCUS_TUI_REGISTER_COMMAND} exited with {status}"),
+        Err(err) => tracing::warn!("Failed to run {FOCUS_TUI_REGISTER_COMMAND}: {err}"),
     }
+}
+
+/// Run one of the `focus-tui` helpers, with its output detached from iamb's terminal.
+fn run_focus_tui_helper(command: &str, name: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new(command)
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
 }
 
 pub async fn register_notifications(
@@ -52,6 +105,7 @@ pub async fn register_notifications(
     let notify_via = settings.tunables.notifications.via;
     let show_message = settings.tunables.notifications.show_message;
     let sound_hint = settings.tunables.notifications.sound_hint.clone();
+    let focus_tui = settings.tunables.notifications.focus_tui.clone();
     let server_settings = client.notification_settings().await;
     let Some(startup_ts) = MilliSecondsSinceUnixEpoch::from_system_time(SystemTime::now()) else {
         return;
@@ -63,6 +117,7 @@ pub async fn register_notifications(
             let store = store.clone();
             let server_settings = server_settings.clone();
             let sound_hint = sound_hint.clone();
+            let focus_tui = focus_tui.clone();
             async move {
                 let mode = global_or_room_mode(&server_settings, &room).await;
                 if mode == RoomNotificationMode::Mute {
@@ -77,7 +132,7 @@ pub async fn register_notifications(
                 match notification.event {
                     RawAnySyncOrStrippedTimelineEvent::Sync(e) => {
                         match parse_full_notification(e, room, show_message).await {
-                            Ok((summary, body, server_ts)) => {
+                            Ok((summary, body, server_ts, thread_root)) => {
                                 if server_ts < startup_ts {
                                     return;
                                 }
@@ -90,9 +145,10 @@ pub async fn register_notifications(
                                     &notify_via,
                                     &summary,
                                     body.as_deref(),
-                                    room_id,
+                                    NotificationTarget { room_id, thread_root },
                                     &store,
                                     sound_hint.as_deref(),
+                                    focus_tui.as_deref(),
                                 )
                                 .await;
                             },
@@ -115,17 +171,18 @@ async fn send_notification(
     via: &NotifyVia,
     summary: &str,
     body: Option<&str>,
-    room_id: OwnedRoomId,
+    target: NotificationTarget,
     store: &AsyncProgramStore,
     sound_hint: Option<&str>,
+    focus_tui: Option<&str>,
 ) {
     #[cfg(feature = "desktop")]
     if via.desktop {
-        send_notification_desktop(summary, body, room_id, store, sound_hint).await;
+        send_notification_desktop(summary, body, target, store, sound_hint, focus_tui).await;
     }
     #[cfg(not(feature = "desktop"))]
     {
-        let _ = (summary, body, IAMB_XDG_NAME);
+        let _ = (summary, body, target, focus_tui, IAMB_XDG_NAME);
     }
 
     if via.bell {
@@ -143,16 +200,17 @@ async fn send_notification_bell(store: &AsyncProgramStore) {
 async fn send_notification_desktop(
     summary: &str,
     body: Option<&str>,
-    room_id: OwnedRoomId,
+    target: NotificationTarget,
     _store: &AsyncProgramStore,
     sound_hint: Option<&str>,
+    focus_tui: Option<&str>,
 ) {
     let mut desktop_notification = notify_rust::Notification::new();
     desktop_notification
         .summary(summary)
         .appname(IAMB_XDG_NAME)
         .icon(IAMB_XDG_NAME)
-        .action("default", "default");
+        .action(DEFAULT_ACTION, DEFAULT_ACTION);
 
     if let Some(sound_hint) = sound_hint {
         desktop_notification.sound_name(sound_hint);
@@ -174,16 +232,84 @@ async fn send_notification_desktop(
         Err(err) => tracing::error!("Failed to send notification: {err}"),
         Ok(handle) => {
             #[cfg(all(unix, not(target_os = "macos")))]
-            _store
-                .lock()
-                .await
-                .application
-                .open_notifications
-                .entry(room_id)
-                .or_default()
-                .push(NotificationHandle(Some(handle)));
+            {
+                let (dismiss, dismissed) = tokio::sync::oneshot::channel();
+                let focus_tui = focus_tui.map(ToOwned::to_owned);
+                let window = IambId::from(&target);
+                let store = _store.clone();
+
+                tokio::spawn(async move {
+                    if wait_for_click(&handle, dismissed).await {
+                        jump_to_notification(window, focus_tui, &store).await;
+                    }
+
+                    handle.close_async().await;
+                });
+
+                _store
+                    .lock()
+                    .await
+                    .application
+                    .open_notifications
+                    .entry(target.room_id)
+                    .or_default()
+                    .push(NotificationHandle(dismiss));
+            }
         },
     }
+}
+
+/// Wait until the user clicks `handle`, or until it is dismissed because they read the room.
+///
+/// Returns whether the notification was clicked.
+#[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
+async fn wait_for_click(
+    handle: &notify_rust::NotificationHandle,
+    dismissed: tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // `wait_for_action_async` reports the action through a synchronous callback, so the answer has
+    // to come back out through a flag rather than the future's output.
+    let clicked = AtomicBool::new(false);
+
+    tokio::select! {
+        _ = handle.wait_for_action_async(|response| {
+            let is_default = matches!(
+                response,
+                notify_rust::ActionResponse::Custom(action) if *action == DEFAULT_ACTION
+            );
+
+            clicked.store(is_default, Ordering::Relaxed);
+        }) => (),
+        _ = dismissed => (),
+    }
+
+    clicked.load(Ordering::Relaxed)
+}
+
+/// Bring iamb back to the front and queue the jump to the message that was notified about.
+#[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
+async fn jump_to_notification(
+    window: IambId,
+    focus_tui: Option<String>,
+    store: &AsyncProgramStore,
+) {
+    if let Some(name) = focus_tui {
+        let raised = tokio::task::spawn_blocking(move || {
+            run_focus_tui_helper(FOCUS_TUI_COMMAND, &name)
+        })
+        .await;
+
+        match raised {
+            Ok(Ok(status)) if status.success() => (),
+            Ok(Ok(status)) => tracing::warn!("{FOCUS_TUI_COMMAND} exited with {status}"),
+            Ok(Err(err)) => tracing::warn!("Failed to run {FOCUS_TUI_COMMAND}: {err}"),
+            Err(err) => tracing::warn!("Failed to wait for {FOCUS_TUI_COMMAND}: {err}"),
+        }
+    }
+
+    store.lock().await.application.notification_jump = Some(window);
 }
 
 async fn global_or_room_mode(
@@ -244,7 +370,7 @@ pub async fn parse_full_notification(
     event: Raw<AnySyncTimelineEvent>,
     room: MatrixRoom,
     show_body: bool,
-) -> IambResult<(String, Option<String>, MilliSecondsSinceUnixEpoch)> {
+) -> IambResult<(String, Option<String>, MilliSecondsSinceUnixEpoch, Option<OwnedEventId>)> {
     let event = event.deserialize().map_err(IambError::from)?;
 
     let server_ts = event.origin_server_ts();
@@ -274,7 +400,24 @@ pub async fn parse_full_notification(
         None
     };
 
-    return Ok((summary, body, server_ts));
+    return Ok((summary, body, server_ts, event_thread_root(&event)));
+}
+
+/// The thread a notified-about event lives in, so that clicking it opens the thread and not just
+/// the room's main timeline.
+pub fn event_thread_root(event: &AnySyncTimelineEvent) -> Option<OwnedEventId> {
+    let AnySyncTimelineEvent::MessageLike(event) = event else {
+        return None;
+    };
+
+    let AnyMessageLikeEventContent::RoomMessage(message) = event.original_content()? else {
+        return None;
+    };
+
+    match message.relates_to? {
+        Relation::Thread(thread) => Some(thread.event_id),
+        _ => None,
+    }
 }
 
 pub fn event_notification_body(event: &AnySyncTimelineEvent, sender_name: &str) -> Option<String> {
@@ -325,5 +468,61 @@ fn truncate(s: String) -> String {
         truncated + "..."
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use matrix_sdk::ruma::{event_id, room_id};
+
+    fn message_event(relates_to: &str) -> AnySyncTimelineEvent {
+        let json = format!(
+            r#"{{
+                "type": "m.room.message",
+                "event_id": "$message:example.com",
+                "sender": "@user:example.com",
+                "origin_server_ts": 1,
+                "content": {{ "msgtype": "m.text", "body": "hello"{relates_to} }}
+            }}"#
+        );
+
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn test_event_thread_root_unthreaded() {
+        assert_eq!(event_thread_root(&message_event("")), None);
+    }
+
+    #[test]
+    fn test_event_thread_root_threaded() {
+        let relates_to = r#", "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "$root:example.com",
+            "is_falling_back": true,
+            "m.in_reply_to": { "event_id": "$root:example.com" }
+        }"#;
+
+        assert_eq!(
+            event_thread_root(&message_event(relates_to)),
+            Some(event_id!("$root:example.com").to_owned())
+        );
+    }
+
+    #[test]
+    fn test_notification_target_window() {
+        let room_id = room_id!("!room:example.com").to_owned();
+        let thread_root = event_id!("$root:example.com").to_owned();
+
+        let target = NotificationTarget { room_id: room_id.clone(), thread_root: None };
+        assert_eq!(IambId::from(&target), IambId::Room(room_id.clone(), None));
+
+        let target = NotificationTarget {
+            room_id: room_id.clone(),
+            thread_root: Some(thread_root.clone()),
+        };
+        assert_eq!(IambId::from(&target), IambId::Room(room_id, Some(thread_root)));
     }
 }

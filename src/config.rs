@@ -572,6 +572,14 @@ pub struct Notifications {
     pub show_message: bool,
     #[serde(default)]
     pub sound_hint: Option<String>,
+
+    /// Name to register with the external `focus-tui` helper, enabling clickable notifications.
+    ///
+    /// Opting in means iamb runs `focus-tui-register <name>` at startup, and runs
+    /// `focus-tui <name>` when a notification is clicked. Leaving this unset means iamb never
+    /// shells out, and clicking a notification only jumps within an already-visible iamb.
+    #[serde(default)]
+    pub focus_tui: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1527,6 +1535,16 @@ mod tests {
         );
         assert!(serde_json::from_str::<NotifyVia>(r#""other""#).is_err());
         assert!(serde_json::from_str::<NotifyVia>(r#""""#).is_err());
+    }
+
+    #[test]
+    fn test_parse_notifications_focus_tui() {
+        let res: Notifications = serde_json::from_str("{\"enabled\": true}").unwrap();
+        assert_eq!(res.focus_tui, None);
+
+        let res: Notifications =
+            serde_json::from_str("{\"enabled\": true, \"focus_tui\": \"iamb\"}").unwrap();
+        assert_eq!(res.focus_tui, Some("iamb".into()));
     }
 
     #[test]
