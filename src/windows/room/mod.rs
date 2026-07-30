@@ -165,9 +165,9 @@ impl RoomState {
         }
     }
 
-    pub fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+    pub fn show_completions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
         match self {
-            RoomState::Chat(chat) => chat.show_mentions(ctx, store),
+            RoomState::Chat(chat) => chat.show_completions(ctx, store),
             RoomState::Space(_) => {},
         }
     }

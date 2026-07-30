@@ -11,7 +11,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use emojis::Emoji;
 use matrix_sdk::ruma::events::receipt::ReceiptThread;
 use matrix_sdk::ruma::events::sticker::StickerEvent;
 use ratatui::{
@@ -92,6 +91,7 @@ use modalkit::{
 };
 
 use crate::config::ImagePreviewProtocolValues;
+use crate::message::emoji::{complete_emoji_names, complete_emojis, EMOJI_SIGIL};
 use crate::message::mention::{complete_mentions, MentionCandidate, MENTION_SIGIL};
 use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
@@ -1804,19 +1804,6 @@ impl RoomInfo {
     }
 }
 
-/// Generate a [CompletionMap] for Emoji shortcodes.
-fn emoji_map() -> CompletionMap<String, &'static Emoji> {
-    let mut emojis = CompletionMap::default();
-
-    for emoji in emojis::iter() {
-        for shortcode in emoji.shortcodes() {
-            emojis.insert(shortcode.to_string(), emoji);
-        }
-    }
-
-    return emojis;
-}
-
 #[cfg(unix)]
 fn picker_from_termios(protocol_type: Option<ProtocolType>) -> Option<Picker> {
     let mut picker = match Picker::from_query_stdio() {
@@ -1976,9 +1963,6 @@ pub struct ChatStore {
     /// Set of rooms that need more messages loaded in their scrollback.
     pub need_load: RoomNeeds,
 
-    /// [CompletionMap] of Emoji shortcodes.
-    pub emojis: CompletionMap<String, &'static Emoji>,
-
     /// Information gathered by the background thread.
     pub sync_info: SyncInfo,
 
@@ -2039,7 +2023,6 @@ impl ChatStore {
             settings,
             picker,
             cmds: crate::commands::setup_commands(),
-            emojis: emoji_map(),
 
             collator: Default::default(),
             names: Default::default(),
@@ -2645,11 +2628,8 @@ fn complete_msgbar(
         },
 
         // Complete Emoji shortcodes.
-        Some(':') => {
-            let list = store.emojis.complete(&id[1..]);
-            let iter = list.into_iter().take(200).map(|s| format!(":{s}:"));
-
-            return iter.collect();
+        Some(EMOJI_SIGIL) => {
+            return complete_emojis(id.as_ref());
         },
 
         // Complete a mention of somebody in this room.
@@ -2698,12 +2678,16 @@ fn complete_matrix_names(text: &EditRope, cursor: &mut Cursor, store: &ChatStore
 }
 
 /// Tab completion for Emoji shortcode names.
-fn complete_emoji(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let sc = text.get_prefix_word_mut(cursor, &WordStyle::Little);
+///
+/// The word style is the one used for Matrix identifiers because it treats `:` as part of a word,
+/// which lets the argument be written either as `smile` or as `:smile`. The sigil is optional here
+/// since the command already says an Emoji is what is wanted.
+fn complete_emoji(text: &EditRope, cursor: &mut Cursor) -> Vec<String> {
+    let sc = text.get_prefix_word_mut(cursor, &MATRIX_ID_WORD);
     let sc = sc.unwrap_or_else(EditRope::empty);
     let sc = Cow::from(&sc);
 
-    store.emojis.complete(sc.as_ref())
+    complete_emoji_names(sc.as_ref())
 }
 
 /// Tab completion for command names.
@@ -2734,7 +2718,7 @@ fn complete_cmdarg(
         "cancel" | "dms" | "edit" | "redact" | "reply" => vec![],
         "members" | "rooms" | "spaces" | "welcome" => vec![],
         "download" | "keys" | "open" | "upload" => complete_path(text, cursor),
-        "react" | "unreact" => complete_emoji(text, cursor, store),
+        "react" | "unreact" => complete_emoji(text, cursor),
 
         "invite" => complete_users(text, cursor, store),
         "join" | "split" | "vsplit" | "tabedit" => complete_matrix_names(text, cursor, store),
@@ -3297,8 +3281,22 @@ pub mod tests {
         let text = EditRope::from("going for a walk :walk ");
         let mut cursor = Cursor::new(0, 22);
         let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        assert_eq!(res, vec![":walking:", ":walking_man:", ":walking_woman:"]);
+        // Fuzzy matching finds looser matches too -- "walk" is a subsequence of "woman health
+        // worker" -- but they rank below the shortcodes that actually start with what was typed.
+        assert_eq!(res[..3], [":walking:", ":walking_man:", ":walking_woman:"]);
         assert_eq!(cursor, Cursor::new(0, 17));
+
+        // A ":" in the middle of a word belongs to that word, so a time is not a shortcode.
+        let text = EditRope::from("see you at 10:30 ");
+        let mut cursor = Cursor::new(0, 16);
+        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
+        assert_eq!(res, Vec::<String>::new());
+
+        // Nor is the ":" in a URL.
+        let text = EditRope::from("read https://iamb.chat ");
+        let mut cursor = Cursor::new(0, 22);
+        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
+        assert_eq!(res, Vec::<String>::new());
 
         // An "@" in the middle of a word belongs to that word, so an email address is not a
         // mention and does not go looking for room members.
@@ -3366,6 +3364,20 @@ pub mod tests {
         let mut cursor = Cursor::new(0, 15);
         let res = complete_cmdbar(&text, &mut cursor, &store);
         assert_eq!(res, users);
+
+        // A reaction can be named with or without the shortcode sigil, and either way it is the
+        // bare name that gets inserted, since that is what the command wants.
+        let text = EditRope::from("react polrbear");
+        let mut cursor = Cursor::new(0, 14);
+        let res = complete_cmdbar(&text, &mut cursor, &store);
+        assert_eq!(res.first().map(String::as_str), Some("polar_bear"));
+        assert_eq!(cursor, Cursor::new(0, 6));
+
+        let text = EditRope::from("react :polrbear");
+        let mut cursor = Cursor::new(0, 15);
+        let res = complete_cmdbar(&text, &mut cursor, &store);
+        assert_eq!(res.first().map(String::as_str), Some("polar_bear"));
+        assert_eq!(cursor, Cursor::new(0, 6));
     }
 
     #[test]

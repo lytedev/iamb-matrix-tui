@@ -451,15 +451,15 @@ impl Application {
         }
     }
 
-    /// Show the mention completion popup if the typing that just happened was in a message bar and
-    /// started, or continued, a mention.
+    /// Show the completion popup if the typing that just happened was in a message bar and started,
+    /// or continued, a mention or an Emoji shortcode.
     ///
-    /// Completion is normally something the user asks for with a key, but a mention is worth
-    /// offering unprompted, so this runs after every insertion. The window decides whether there is
-    /// anything to show; see [IambWindow::show_mentions].
-    fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+    /// Completion is normally something the user asks for with a key, but these are worth offering
+    /// unprompted, so this runs after every insertion. The window decides whether there is
+    /// anything to show; see [IambWindow::show_completions].
+    fn show_completions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
         if let Ok(window) = self.screen.current_window_mut() {
-            window.show_mentions(ctx, store);
+            window.show_completions(ctx, store);
         }
     }
 
@@ -492,14 +492,14 @@ impl Application {
                     Err(err) => return Err(err.into()),
                 };
 
-                // Typing in a message bar can open the mention popup, and editing what has
+                // Typing in a message bar can open the completion popup, and editing what has
                 // already been typed keeps it up to date. Editing outside of insert mode is
                 // somebody moving text around rather than composing, so it is left alone.
                 let composing = ctx.get_insert_style().is_some() &&
                     matches!(act, EditorAction::InsertText(_) | EditorAction::Edit(_, _));
 
                 if composing {
-                    self.show_mentions(&ctx, store);
+                    self.show_completions(&ctx, store);
                 }
 
                 info

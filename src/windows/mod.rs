@@ -430,10 +430,10 @@ pub enum IambWindow {
 }
 
 impl IambWindow {
-    /// Open or refresh the mention completion popup, if this window is composing a message.
-    pub fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+    /// Open or refresh the completion popup, if this window is composing a message.
+    pub fn show_completions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
         if let IambWindow::Room(w) = self {
-            w.show_mentions(ctx, store)
+            w.show_completions(ctx, store)
         }
     }
 

@@ -489,6 +489,58 @@ and
 .Sy /html
 send what you typed as you typed it.
 
+.Sh "EMOJI SHORTCODES"
+While composing a message, typing
+.Sy \&:
+brings up a list of Emoji straight away, and typing more characters narrows it
+down.
+The matching works exactly as it does for mentions: it is fuzzy, so the
+characters you type only have to appear in order, and the closest match is at
+the top of the list and highlighted.
+.Sy <Tab>
+and
+.Sy <C-N>
+take an entry, and
+.Sy <C-P>
+walks the list backwards.
+.Pp
+Both the shortcodes of an Emoji and its written-out name are matched, so
+.Sy :polar bear
+finds
+.Sy :polar_bear:
+just as
+.Sy :plrbear
+does.
+.Pp
+As with mentions, the list only appears when the
+.Sy \&:
+starts a word.
+A
+.Sy \&:
+in the middle of a word belongs to that word, so times such as
+.Sy 10:30
+and URLs such as
+.Lk https://iamb.chat
+do not bring one up.
+Type a space or press
+.Sy <Esc>
+to dismiss the list without picking anything.
+.Pp
+Taking an entry inserts the shortcode, such as
+.Sy :polar_bear: ,
+rather than the Emoji character itself, so that the list you are searching
+stays readable and so that the text remains editable afterwards.
+Messages interpreted as markup, which is the default, render shortcodes as
+their Emoji when they are sent.
+.Pp
+The argument to
+.Sy :react
+and
+.Sy :unreact
+completes the same way, with or without a leading
+.Sy \&: ,
+and inserts the bare shortcode that those commands expect.
+
 .Sh "ENVIRONMENT"
 The behaviour of
 .Nm

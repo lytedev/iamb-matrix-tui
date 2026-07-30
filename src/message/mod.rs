@@ -65,6 +65,7 @@ use crate::{
 };
 
 pub mod compose;
+pub mod emoji;
 pub mod mention;
 mod html;
 mod printer;

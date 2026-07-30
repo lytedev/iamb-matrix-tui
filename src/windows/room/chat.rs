@@ -89,6 +89,7 @@ use crate::base::{
 };
 
 use crate::config::EncryptionIndicatorLocation;
+use crate::message::emoji::EMOJI_SIGIL;
 use crate::message::mention::MENTION_SIGIL;
 use crate::message::{
     text_to_message,
@@ -105,6 +106,9 @@ use super::scrollback::{Scrollback, ScrollbackState};
 
 /// Where the closest match sits in a completion list, which orders itself best first.
 const BEST_MATCH_INDEX: usize = 0;
+
+/// The sigils whose completions are offered unprompted while composing a message.
+const AUTO_COMPLETED_SIGILS: &[char] = &[MENTION_SIGIL, EMOJI_SIGIL];
 
 /// Clipboard images arrive without a name, so we make one that sorts and reads sensibly.
 const CLIPBOARD_IMAGE_FILENAME_PREFIX: &str = "clipboard-";
@@ -206,13 +210,14 @@ impl ChatState {
         self.scrollback.thread()
     }
 
-    /// Whether the message bar has a mention part-way typed at the cursor.
+    /// Whether the message bar has something worth completing part-way typed at the cursor.
     ///
     /// This asks the same question of the same text, with the same word boundaries, that
-    /// [crate::base::IambCompleter] does, so the two cannot disagree about whether an `@` starts a
-    /// mention. In particular an `@` in the middle of a word -- an email address, say -- is part of
-    /// that word rather than the start of a mention, and so does not count.
-    fn typing_mention(&mut self) -> bool {
+    /// [crate::base::IambCompleter] does, so the two cannot disagree about whether a sigil starts a
+    /// completion. In particular a sigil in the middle of a word is part of that word rather than
+    /// the start of anything: an `@` in an email address does not begin a mention, and the `:` in
+    /// `10:30` or in a URL does not begin an Emoji shortcode.
+    fn typing_completion(&mut self) -> bool {
         if self.focus != RoomFocus::MessageBar {
             return false;
         }
@@ -224,19 +229,19 @@ impl ChatState {
             return false;
         };
 
-        Cow::from(&word).starts_with(MENTION_SIGIL)
+        Cow::from(&word).starts_with(AUTO_COMPLETED_SIGILS)
     }
 
-    /// Open or refresh the member completion popup if a mention is being typed.
+    /// Open or refresh the message bar's completion popup if something is being typed at it.
     ///
-    /// Running this after every insertion is what makes the popup appear as soon as `@` is typed,
-    /// without the user having to ask for a completion: modalkit throws the completion list away on
-    /// every edit, so it has to be rebuilt each time to keep up with what has been typed.
+    /// Running this after every insertion is what makes the popup appear as soon as a sigil is
+    /// typed, without the user having to ask for a completion: modalkit throws the completion list
+    /// away on every edit, so it has to be rebuilt each time to keep up with what has been typed.
     ///
     /// The action goes straight at the message bar rather than through the screen's focused editor,
     /// so it cannot disturb the command bar if that happens to be where the typing went.
-    pub fn show_mentions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
-        if !self.typing_mention() {
+    pub fn show_completions(&mut self, ctx: &ProgramContext, store: &mut ProgramStore) {
+        if !self.typing_completion() {
             return;
         }
 
