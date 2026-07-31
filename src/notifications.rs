@@ -35,6 +35,11 @@ const IAMB_XDG_NAME: &str = match option_env!("IAMB_XDG_NAME") {
 /// Notification action invoked by clicking the notification body rather than a button.
 const DEFAULT_ACTION: &str = "default";
 
+/// Text shown for [`DEFAULT_ACTION`]. The specification permits a daemon to hide the reserved
+/// `default` action, but not all of them do. Some daemons draw a button beside the body and show
+/// this text on it, so it must read as a label and not as the action key.
+const DEFAULT_ACTION_LABEL: &str = "Open";
+
 /// External helper that records which window and terminal tab iamb is running in.
 const FOCUS_TUI_REGISTER_COMMAND: &str = "focus-tui-register";
 
@@ -219,7 +224,7 @@ async fn send_notification_desktop(
         .summary(summary)
         .appname(IAMB_XDG_NAME)
         .icon(IAMB_XDG_NAME)
-        .action(DEFAULT_ACTION, DEFAULT_ACTION);
+        .action(DEFAULT_ACTION, DEFAULT_ACTION_LABEL);
 
     if let Some(sound_hint) = sound_hint {
         desktop_notification.sound_name(sound_hint);
