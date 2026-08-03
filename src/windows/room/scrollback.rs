@@ -858,12 +858,16 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                 };
 
                 if let Some(range) = range {
-                    let mut yanked = EditRope::from("");
+                    let msgs = self.messages(range, info).map(|(_, msg)| msg);
+                    let text = crate::message::yank::show_messages(
+                        msgs,
+                        info,
+                        &store.application.settings,
+                    );
 
-                    for (_, msg) in self.messages(range, info) {
-                        yanked += EditRope::from(msg.event.body());
-                        yanked += EditRope::from('\n');
-                    }
+                    // A linewise register needs the closing newline, or a put runs the last
+                    // message into whatever follows it.
+                    let yanked = EditRope::from(text + "\n");
 
                     let cell = RegisterCell::new(TargetShape::LineWise, yanked);
                     let register = ctx.get_register().unwrap_or(Register::Unnamed);
@@ -1669,6 +1673,53 @@ mod tests {
         // And one more becomes "latest" cursor:
         scrollback.edit(&EditAction::Motion, &next(1), &ctx, &mut store).unwrap();
         assert_eq!(scrollback.cursor, MessageCursor::latest());
+    }
+
+    /// Read back what a yank put into the unnamed register.
+    fn yanked(store: &mut ProgramStore) -> String {
+        store.registers.get(&Register::Unnamed).unwrap().value.to_string()
+    }
+
+    #[tokio::test]
+    async fn test_yank_takes_the_selected_message() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        // MSG2 is the "helium" message.
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        scrollback.edit(&EditAction::Motion, &prev(3), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
+
+        scrollback
+            .edit(&EditAction::Yank, &EditTarget::CurrentPosition, &ctx, &mut store)
+            .unwrap();
+
+        let text = yanked(&mut store);
+        assert!(text.ends_with("@user2:example.com: helium\n"));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_yank_keeps_every_line_of_a_multiline_message() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        // MSG3 is the multiline message.
+        scrollback.edit(&EditAction::Motion, &prev(3), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG3_KEY.clone().into());
+
+        scrollback
+            .edit(&EditAction::Yank, &EditTarget::CurrentPosition, &ctx, &mut store)
+            .unwrap();
+
+        let text = yanked(&mut store);
+        assert!(text.ends_with("@user2:example.com:\nthis\nis\na\nmultiline\nmessage\n"));
     }
 
     #[tokio::test]
