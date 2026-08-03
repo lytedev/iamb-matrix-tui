@@ -483,6 +483,19 @@ impl ScrollbackState {
         }
     }
 
+    /// The rendered text of the visual selection, or of the message under the cursor.
+    ///
+    /// This is the text that a yank puts into a register, so that `:pipe` and `y` cannot drift
+    /// apart. It is `None` when the scrollback holds no message to take.
+    pub fn selected_text(&self, info: &RoomInfo, settings: &ApplicationSettings) -> Option<String> {
+        let thread = self.get_thread(info)?;
+        let key = self.cursor.to_key(thread)?.clone();
+        let range = self.selection_range(key);
+        let msgs = self.messages(range, info).map(|(_, msg)| msg);
+
+        Some(crate::message::yank::show_messages(msgs, info, settings))
+    }
+
     /// Whether `key` is one of the messages covered by the visual selection.
     fn selection_contains(&self, key: &MessageKey, cursor_key: &MessageKey) -> bool {
         let Some(anchor) = self.selection_anchor.as_ref().and_then(|a| a.timestamp.as_ref()) else {

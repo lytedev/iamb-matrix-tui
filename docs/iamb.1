@@ -225,6 +225,20 @@ React to the selected message with an Emoji.
 .It Sy ":unreact [shortcode]"
 Remove your reaction from the selected message.
 When no arguments are given, remove all of your reactions from the message.
+.It Sy ":pipe <command>"
+Send the selected messages to a shell command on its standard input.
+With a visual selection this sends every selected message, and otherwise it sends
+the one message under the cursor.
+The messages are sent as plain text, in the same form that
+.Sy y
+puts in a register.
+The command is run by the shell named by
+.Ev $SHELL ,
+so a pipeline or a redirection in it works, as in
+.Dl :pipe cat > /tmp/thread.txt
+.Pp
+The command runs in the background.
+What it prints is shown on the status line, as is any failure to run it.
 .It Sy ":redact [reason]"
 Redact the selected message with the optional reason.
 .It Sy ":reply"

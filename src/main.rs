@@ -89,6 +89,7 @@ mod tests;
 use crate::{
     base::{
         AsyncProgramStore,
+        BackgroundReport,
         ChatStore,
         HomeserverAction,
         IambAction,
@@ -368,6 +369,21 @@ impl Application {
 
     async fn step(&mut self) -> Result<Step, std::io::Error> {
         loop {
+            // Show whatever background tasks have left behind, such as how a command started by
+            // `:pipe` ended. This runs before the redraw, so that the message reaches the screen
+            // on this pass rather than on the next one.
+            for report in self.store.lock().await.application.take_reports() {
+                match report {
+                    BackgroundReport::Info(msg) => self.screen.push_info(msg),
+                    BackgroundReport::Error(msg) => {
+                        let err: UIError<IambInfo> = UIError::Failure(msg);
+                        self.screen.push_error(err);
+                    },
+                }
+
+                self.dirty = true;
+            }
+
             self.redraw(self.dirty, self.store.clone().lock().await.deref_mut())?;
             self.dirty = false;
 
