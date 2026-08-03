@@ -32,6 +32,7 @@ use modalkit::{
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
 use matrix_sdk::ruma::OwnedRoomId;
+use unicode_width::UnicodeWidthStr;
 
 use crate::base::{
     IambBufferId,
@@ -354,6 +355,17 @@ fn rank(needle: &str, items: Vec<SwitchItem>) -> Vec<SwitchItem> {
     scored.into_iter().map(|(_, item)| item).collect()
 }
 
+/// Pad `s` out to `width` terminal columns.
+///
+/// Rust's own width formatting counts characters, and a terminal draws columns. One emoji is one
+/// character in two columns, so a name such as "lytebot 💕" formatted that way pushes every
+/// column after it one to the right, and the list no longer lines up.
+fn pad(s: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(s));
+
+    format!("{s}{}", " ".repeat(padding))
+}
+
 impl ListItem<IambInfo> for SwitchItem {
     fn show(
         &self,
@@ -373,8 +385,8 @@ impl ListItem<IambInfo> for SwitchItem {
             READ_MARKER
         };
         let name = format!("{}{}", self.kind.sigil(), self.name);
-        let name = format!("{name:NAME_COLUMN_WIDTH$} ");
-        let kind = format!("{:KIND_COLUMN_WIDTH$} ", self.kind.label());
+        let name = format!("{} ", pad(&name, NAME_COLUMN_WIDTH));
+        let kind = format!("{} ", pad(self.kind.label(), KIND_COLUMN_WIDTH));
         let detail = self.also_known_as.as_deref().unwrap_or(&self.description);
 
         let name_style = if self.unread {
@@ -429,7 +441,21 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SwitchItem {
 mod tests {
     use super::*;
     use crate::base::UnreadInfo;
+    use crate::tests::mock_store;
     use matrix_sdk::ruma::{event_id, room_id, RoomId};
+
+    /// The column that the kind label starts in, which is what has to line up between rows.
+    async fn kind_column(item: &SwitchItem) -> usize {
+        let mut store = mock_store().await;
+        let viewport = ViewportContext::<ListCursor>::new();
+        let text = item.show(false, &viewport, &mut store);
+        let spans = &text.lines[0].spans;
+
+        spans[..2]
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
 
     fn room(name: &str, id: &RoomId, unread: bool, recency: u64) -> SwitchItem {
         SwitchItem {
@@ -602,6 +628,26 @@ mod tests {
         )];
 
         assert!(rank("zzzzzz", items).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_emoji_in_a_name_does_not_shift_the_later_columns() {
+        // An emoji is one character but two columns, and the padding has to count columns.
+        let plain = room("lytebot", room_id!("!a:example.com"), false, NO_RECENCY);
+        let emoji = room("lytebot 💕", room_id!("!b:example.com"), false, NO_RECENCY);
+
+        assert_eq!(kind_column(&plain).await, kind_column(&emoji).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_multi_character_emoji_does_not_shift_the_later_columns() {
+        // A ZWJ sequence is several characters, and a variation selector adds another.
+        let plain = room("family", room_id!("!a:example.com"), false, NO_RECENCY);
+        let zwj = room("family 👨‍👩‍👧", room_id!("!b:example.com"), false, NO_RECENCY);
+        let selector = room("warning ⚠️", room_id!("!c:example.com"), false, NO_RECENCY);
+
+        assert_eq!(kind_column(&plain).await, kind_column(&zwj).await);
+        assert_eq!(kind_column(&plain).await, kind_column(&selector).await);
     }
 
     #[test]
