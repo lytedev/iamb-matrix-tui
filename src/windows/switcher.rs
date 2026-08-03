@@ -1,13 +1,15 @@
 //! # Quick Switcher
 //!
 //! The `:switch` window, bound to `<C-K>`, is one fuzzy-matched list of everywhere the user might
-//! want to jump to: every room, DM, and space they have joined, together with the windows that
-//! iamb's own commands open. Typing narrows it, and taking an entry goes straight there.
+//! want to jump to: every room, DM, and space they have joined, every thread they follow, together
+//! with the windows that iamb's own commands open. Typing narrows it, and taking an entry goes
+//! straight there.
 //!
-//! Both halves come from something that is already the source of truth, so neither can drift.
+//! Every part comes from something that is already the source of truth, so none of them can drift.
 //! Rooms come out of [SyncInfo][crate::base::SyncInfo] the same way the `:rooms` and `:dms`
-//! windows build their lists, and the sections come out of the `window` each
-//! [CommandForm][crate::commands::CommandForm] in [IAMB_COMMANDS] declares it opens.
+//! windows build their lists, threads come out of the same
+//! [followed_thread_items] that fills in `:threads`, and the sections come out of the `window`
+//! each [CommandForm][crate::commands::CommandForm] in [IAMB_COMMANDS] declares it opens.
 //!
 //! Taking an entry emits the same [WindowAction::Switch] that selecting a room in `:rooms` does,
 //! so a room reached from here is opened by exactly the machinery that opens it anywhere else.
@@ -29,11 +31,22 @@ use modalkit::{
 
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
-use crate::base::{IambBufferId, IambId, IambInfo, ProgramAction, ProgramContext, ProgramStore};
+use matrix_sdk::ruma::OwnedRoomId;
+
+use crate::base::{
+    IambBufferId,
+    IambId,
+    IambInfo,
+    ProgramAction,
+    ProgramContext,
+    ProgramStore,
+    ThreadSummary,
+};
 use crate::commands::IAMB_COMMANDS;
 use crate::message::mention::fuzzy_score;
 use crate::message::MessageTimeStamp;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
+use crate::windows::{followed_thread_items, RoomLikeItem};
 
 /// The `:switch` window.
 pub type QuickSwitcherState = FilteredListState<SwitchItem>;
@@ -88,6 +101,9 @@ pub enum SwitchKind {
     /// A space the user has joined.
     Space,
 
+    /// A thread the user follows.
+    Thread,
+
     /// A window that one of iamb's own commands opens.
     Section,
 }
@@ -99,6 +115,7 @@ impl SwitchKind {
             SwitchKind::Room => "#",
             SwitchKind::Direct => "@",
             SwitchKind::Space => "+",
+            SwitchKind::Thread => ">",
             SwitchKind::Section => ":",
         }
     }
@@ -109,6 +126,7 @@ impl SwitchKind {
             SwitchKind::Room => "room",
             SwitchKind::Direct => "dm",
             SwitchKind::Space => "space",
+            SwitchKind::Thread => "thread",
             SwitchKind::Section => "section",
         }
     }
@@ -186,6 +204,45 @@ impl SwitchItem {
         items
     }
 
+    /// The entries for every thread the user follows.
+    ///
+    /// The threads come from the same [followed_thread_items] that fills in `:threads` and
+    /// `:unreadsandthreads`, so the switcher cannot list a different set of threads than they do.
+    fn threads(store: &mut ProgramStore) -> Vec<SwitchItem> {
+        followed_thread_items(store)
+            .into_iter()
+            .map(|item| {
+                let room_id = item.room_id().to_owned();
+
+                SwitchItem::thread(item.room_name, room_id, ThreadSummary {
+                    root: item.thread_root,
+                    preview: item.preview,
+                    unread: item.unread,
+                })
+            })
+            .collect()
+    }
+
+    /// The entry for one followed thread.
+    ///
+    /// A thread has no name of its own, so the preview of the message that started it is the name,
+    /// the same text that `:threads` lists a thread under. The room the thread is in becomes the
+    /// second name, because the user who wants "that thread in #general" remembers the room long
+    /// after they forget how the thread opened.
+    fn thread(room_name: String, room_id: OwnedRoomId, summary: ThreadSummary) -> SwitchItem {
+        let ThreadSummary { root, preview, unread } = summary;
+
+        SwitchItem {
+            name: preview,
+            also_known_as: Some(room_name),
+            description: root.to_string(),
+            kind: SwitchKind::Thread,
+            window: IambId::Room(room_id, Some(root)),
+            unread: unread.is_unread(),
+            recency: recency(unread.latest()),
+        }
+    }
+
     /// The entries for the windows that iamb's own commands open.
     ///
     /// The switcher leaves itself out: it is not somewhere to jump to from inside it.
@@ -261,6 +318,7 @@ impl FilteredItem for SwitchItem {
     fn matching(needle: &str, store: &mut ProgramStore) -> Vec<SwitchItem> {
         let mut items = SwitchItem::rooms(store);
 
+        items.extend(SwitchItem::threads(store));
         items.extend(SwitchItem::sections());
 
         rank(needle, items)
@@ -309,7 +367,11 @@ impl ListItem<IambInfo> for SwitchItem {
             Style::default()
         };
 
-        let marker = if self.unread { UNREAD_MARKER } else { READ_MARKER };
+        let marker = if self.unread {
+            UNREAD_MARKER
+        } else {
+            READ_MARKER
+        };
         let name = format!("{}{}", self.kind.sigil(), self.name);
         let name = format!("{name:NAME_COLUMN_WIDTH$} ");
         let kind = format!("{:KIND_COLUMN_WIDTH$} ", self.kind.label());
@@ -366,7 +428,8 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SwitchItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{room_id, RoomId};
+    use crate::base::UnreadInfo;
+    use matrix_sdk::ruma::{event_id, room_id, RoomId};
 
     fn room(name: &str, id: &RoomId, unread: bool, recency: u64) -> SwitchItem {
         SwitchItem {
@@ -387,6 +450,14 @@ mod tests {
         }
     }
 
+    fn thread(preview: &str, room_name: &str, id: &RoomId, unread: bool) -> SwitchItem {
+        SwitchItem::thread(room_name.to_string(), id.to_owned(), ThreadSummary {
+            root: event_id!("$thread:example.com").to_owned(),
+            preview: preview.to_string(),
+            unread: UnreadInfo { unread, latest: None },
+        })
+    }
+
     fn names(items: &[SwitchItem]) -> Vec<&str> {
         items.iter().map(|item| item.name.as_str()).collect()
     }
@@ -396,7 +467,9 @@ mod tests {
         let sections = SwitchItem::sections();
         let listed = names(&sections);
 
-        for name in [":rooms", ":dms", ":spaces", ":threads", ":unreads", ":verify", ":welcome"] {
+        for name in [
+            ":rooms", ":dms", ":spaces", ":threads", ":unreads", ":verify", ":welcome",
+        ] {
             assert!(listed.contains(&name), "{:?} should be reachable from the switcher", name);
         }
 
@@ -490,7 +563,12 @@ mod tests {
 
     #[test]
     fn test_rooms_are_found_by_room_id() {
-        let items = vec![room("Some Room", room_id!("!abcdef:example.com"), false, NO_RECENCY)];
+        let items = vec![room(
+            "Some Room",
+            room_id!("!abcdef:example.com"),
+            false,
+            NO_RECENCY,
+        )];
 
         assert_eq!(names(&rank("abcdef", items)).len(), 1);
     }
@@ -516,9 +594,50 @@ mod tests {
 
     #[test]
     fn test_entries_that_do_not_match_are_dropped() {
-        let items = vec![room("general", room_id!("!a:example.com"), false, NO_RECENCY)];
+        let items = vec![room(
+            "general",
+            room_id!("!a:example.com"),
+            false,
+            NO_RECENCY,
+        )];
 
         assert!(rank("zzzzzz", items).is_empty());
+    }
+
+    #[test]
+    fn test_thread_entries_switch_to_the_thread_in_its_room() {
+        // The same window that taking the thread in `:unreadsandthreads` opens.
+        let item = thread("what about lunch", "general", room_id!("!a:example.com"), false);
+
+        assert_eq!(item.kind, SwitchKind::Thread);
+        assert_eq!(
+            item.window,
+            IambId::Room(
+                room_id!("!a:example.com").to_owned(),
+                Some(event_id!("$thread:example.com").to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn test_threads_are_found_by_their_preview_and_by_their_room() {
+        let items = vec![
+            thread("what about lunch", "general", room_id!("!a:example.com"), false),
+            room("unrelated", room_id!("!b:example.com"), false, NO_RECENCY),
+        ];
+
+        assert_eq!(names(&rank("lunch", items.clone())), vec!["what about lunch"]);
+        assert_eq!(names(&rank("general", items)), vec!["what about lunch"]);
+    }
+
+    #[test]
+    fn test_unread_threads_come_first_when_nothing_is_typed() {
+        let items = vec![
+            room("quiet", room_id!("!a:example.com"), false, NO_RECENCY),
+            thread("noisy thread", "general", room_id!("!b:example.com"), true),
+        ];
+
+        assert_eq!(names(&rank("", items))[0], "noisy thread");
     }
 
     #[test]

@@ -656,7 +656,10 @@ fn chat_items(store: &mut ProgramStore) -> Vec<GenericChatItem> {
         .map(|room_info| GenericChatItem::new(room_info, store, false))
         .collect::<Vec<_>>();
 
-    items.extend(dms.into_iter().map(|room_info| GenericChatItem::new(room_info, store, true)));
+    items.extend(
+        dms.into_iter()
+            .map(|room_info| GenericChatItem::new(room_info, store, true)),
+    );
 
     items
 }
@@ -720,8 +723,10 @@ impl IambWindow {
             },
             IambWindow::SpaceList(state) => {
                 let items = store.application.sync_info.spaces.clone();
-                let items =
-                    items.into_iter().map(|room| SpaceItem::new(room, store)).collect::<Vec<_>>();
+                let items = items
+                    .into_iter()
+                    .map(|room| SpaceItem::new(room, store))
+                    .collect::<Vec<_>>();
 
                 sorted!(state, items, spaces);
             },
@@ -760,8 +765,12 @@ impl IambWindow {
                 sorted!(state, items, chats);
             },
             IambWindow::VerifyList(state) => {
-                let mut items =
-                    store.application.verifications.iter().map(VerifyItem::from).collect::<Vec<_>>();
+                let mut items = store
+                    .application
+                    .verifications
+                    .iter()
+                    .map(VerifyItem::from)
+                    .collect::<Vec<_>>();
 
                 // Sort the active verifications towards the top.
                 items.sort();
@@ -1057,7 +1066,6 @@ impl Window<IambInfo> for IambWindow {
 
         Ok(win)
     }
-
 
     fn find(name: String, store: &mut ProgramStore) -> IambResult<Self> {
         let ChatStore { names, worker, .. } = &mut store.application;
@@ -2118,7 +2126,11 @@ mod tests {
         let mut store = mock_store().await;
 
         // Nothing has synced, so these are empty rather than broken, and opening them still works.
-        for id in [IambId::RoomList, IambId::DirectList, IambId::UnreadThreadList] {
+        for id in [
+            IambId::RoomList,
+            IambId::DirectList,
+            IambId::UnreadThreadList,
+        ] {
             assert!(IambWindow::open(id, &mut store).is_ok());
         }
     }
