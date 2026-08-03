@@ -102,6 +102,18 @@ features = ["macros", "net", "rt-multi-thread", "sync", "time"]
 lazy_static = "1.4.0"
 pretty_assertions = "1.4.0"
 
+# Carries a fix for an infinite loop in modalkit 0.0.25. The `changenum` command
+# runs on <C-A> and <C-X>. Its loop advances the cursor only at the end of the
+# body, and two `continue` statements go past that advance. If the buffer holds
+# no number, the loop repeats the same failed search forever. The user interface
+# then stops and one thread uses all of its processor time.
+#
+# The fix is vendored, because upstream has no release that contains it. Remove
+# this section and the `vendor/modalkit` directory when a fixed modalkit is
+# published. See vendor/modalkit/CHANGES-lytedev.md.
+[patch.crates-io]
+modalkit = { path = "vendor/modalkit" }
+
 [profile.release-lto]
 inherits = "release"
 incremental = false

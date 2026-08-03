@@ -1,0 +1,47 @@
+[package]
+name = "modalkit"
+version = "0.0.25"
+homepage = "https://github.com/ulyssa/modalkit/tree/main/crates/modalkit"
+readme = "README.md"
+description = "A library for building applications that use modal editing"
+exclude = [".github", "CONTRIBUTING.md"]
+keywords = ["modal", "vim", "emacs"]
+categories = ["command-line-interface", "text-editors"]
+
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+clipboard = ["dep:arboard"]
+
+[dependencies]
+anymap2 = "0.13.0"
+bitflags = { workspace = true }
+crossterm = { workspace = true }
+derive_more = "0.99.16"
+editor-types = { workspace = true }
+intervaltree = { workspace = true }
+keybindings = { workspace = true }
+nom = { workspace = true }
+radix_trie = "0.2.1"
+regex = { workspace = true }
+ropey = "1.5.0"
+thiserror = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+
+[dependencies.arboard]
+version = "^3.3.2"
+optional = true
+features = ["wayland-data-control"]
+
+[dev-dependencies]
+rand = { workspace = true }
+temp-dir = { workspace = true }
+
+[lints]
+workspace = true
