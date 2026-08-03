@@ -1281,13 +1281,31 @@ impl RoomInfo {
     }
 
     /// Get an event for an identifier.
+    ///
+    /// A message sent in a thread is kept only in that thread's collection, so a search of the
+    /// main scrollback alone does not find it. Edits and redactions are applied to the copy in
+    /// the thread, and a lookup that misses it gives the caller stale or missing content.
     pub fn get_event(&self, event_id: &EventId) -> Option<&Message> {
-        self.messages.get(self.get_message_key(event_id)?)
+        match self.keys.get(event_id)? {
+            EventLocation::Message(Some(thread), key) => self.threads.get(thread)?.get(key),
+            loc => self.messages.get(loc.to_message_key()?),
+        }
     }
 
     /// Get an event for an identifier as mutable.
+    ///
+    /// This searches the threads as well, for the reason given on [RoomInfo::get_event].
     pub fn get_event_mut(&mut self, event_id: &EventId) -> Option<&mut Message> {
-        self.messages.get_mut(self.keys.get(event_id)?.to_message_key()?)
+        match self.keys.get(event_id)? {
+            EventLocation::Message(Some(thread), key) => {
+                let (thread, key) = (thread.clone(), key.clone());
+                self.threads.get_mut(&thread)?.get_mut(&key)
+            },
+            loc => {
+                let key = loc.to_message_key()?.clone();
+                self.messages.get_mut(&key)
+            },
+        }
     }
 
     pub fn redact(&mut self, ev: OriginalSyncRoomRedactionEvent) {
@@ -2901,6 +2919,101 @@ pub mod tests {
         room.set_receipt(ReceiptThread::Main, user_id, last_reply);
 
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
+    }
+
+    /// A room with one thread: a root in the main scrollback, and one reply inside the thread.
+    ///
+    /// The events are server events, because a local echo accepts no redaction.
+    fn mock_room_with_a_thread() -> (RoomInfo, OwnedEventId, OwnedEventId) {
+        let mut room = RoomInfo::default();
+
+        let root_id = EventId::new_v1(server_name!("example.com"));
+        let reply_id = EventId::new_v1(server_name!("example.com"));
+
+        let root_key: MessageKey =
+            (MessageTimeStamp::OriginServer(UInt::new(1).unwrap()), root_id.clone());
+        let reply_key: MessageKey =
+            (MessageTimeStamp::OriginServer(UInt::new(2).unwrap()), reply_id.clone());
+
+        room.keys.insert(root_id.clone(), EventLocation::Message(None, root_key.clone()));
+        room.get_thread_mut(None).insert(
+            root_key.clone(),
+            mock_room1_message(
+                RoomMessageEventContent::text_plain("the original post"),
+                TEST_USER1.clone(),
+                root_key,
+            ),
+        );
+
+        let reply_loc = EventLocation::Message(Some(root_id.clone()), reply_key.clone());
+        room.keys.insert(reply_id.clone(), reply_loc);
+        room.get_thread_mut(Some(root_id.clone())).insert(
+            reply_key.clone(),
+            mock_room1_message(
+                RoomMessageEventContent::text_plain("a reply in the thread"),
+                TEST_USER2.clone(),
+                reply_key,
+            ),
+        );
+
+        (room, root_id, reply_id)
+    }
+
+    fn mock_redaction(redacts: &EventId) -> OriginalSyncRoomRedactionEvent {
+        serde_json::from_value(Value::Object(Map::from_iter([
+            ("type".to_owned(), Value::String("m.room.redaction".into())),
+            ("content".to_owned(), serde_json::json!({ "redacts": redacts })),
+            ("redacts".to_owned(), serde_json::to_value(redacts).unwrap()),
+            (
+                "event_id".to_owned(),
+                serde_json::to_value(EventId::new_v1(server_name!("example.com"))).unwrap(),
+            ),
+            ("sender".to_owned(), serde_json::to_value(&*TEST_USER1).unwrap()),
+            ("origin_server_ts".to_owned(), serde_json::to_value(3u64).unwrap()),
+        ])))
+        .unwrap()
+    }
+
+    /// The text that a preview of this event shows the user.
+    fn shown_body(room: &RoomInfo, event_id: &EventId) -> String {
+        room.get_event(event_id).expect("the event is in the room").event.body().to_string()
+    }
+
+    fn edit(room: &mut RoomInfo, event_id: &OwnedEventId, body: &str) {
+        room.insert_edit(Replacement::new(
+            event_id.clone(),
+            RoomMessageEventContent::text_plain(body).into(),
+        ));
+    }
+
+    #[test]
+    fn test_an_edit_to_a_thread_root_shows_in_the_preview() {
+        let (mut room, root_id, _) = mock_room_with_a_thread();
+
+        edit(&mut room, &root_id, "the corrected post");
+
+        assert_eq!(shown_body(&room, &root_id), "the corrected post");
+    }
+
+    #[test]
+    fn test_an_edit_inside_a_thread_shows_in_the_preview() {
+        let (mut room, _, reply_id) = mock_room_with_a_thread();
+
+        edit(&mut room, &reply_id, "a corrected reply");
+
+        // A lookup that reads only the main scrollback misses this event altogether, and the
+        // preview then tells the user that the message is not loaded.
+        assert_eq!(shown_body(&room, &reply_id), "a corrected reply");
+    }
+
+    #[test]
+    fn test_a_redaction_inside_a_thread_shows_in_the_preview() {
+        let (mut room, _, reply_id) = mock_room_with_a_thread();
+
+        room.redact(mock_redaction(&reply_id));
+
+        let msg = room.get_event(&reply_id).expect("the event is in the room");
+        assert!(matches!(msg.event, MessageEvent::Redacted(_, _)));
     }
 
     #[test]
