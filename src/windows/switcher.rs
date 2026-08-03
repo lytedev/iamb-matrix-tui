@@ -32,6 +32,7 @@ use modalkit::{
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
 use matrix_sdk::ruma::OwnedRoomId;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::base::{
@@ -59,11 +60,27 @@ pub type QuickSwitcherState = FilteredListState<SwitchItem>;
 /// findable.
 const DESCRIPTION_MATCH_SCORE: isize = isize::MIN + 1;
 
-/// The width the name column is padded out to, so that the rest lines up.
+/// The widest the name column is drawn, so that the rest lines up.
 const NAME_COLUMN_WIDTH: usize = 36;
 
-/// The width the kind column is padded out to.
+/// The narrowest the name column is drawn, when the terminal has no room for more.
+const MIN_NAME_COLUMN_WIDTH: usize = 12;
+
+/// The width the kind column is drawn at.
 const KIND_COLUMN_WIDTH: usize = 8;
+
+/// The narrowest the detail column is worth drawing at.
+const MIN_DETAIL_COLUMN_WIDTH: usize = 8;
+
+/// The width the unread marker is drawn at.
+const MARKER_WIDTH: usize = 2;
+
+/// What every column except the name takes up, including the space after each of them.
+const OTHER_COLUMNS_WIDTH: usize =
+    MARKER_WIDTH + KIND_COLUMN_WIDTH + 1 + MIN_DETAIL_COLUMN_WIDTH + 1;
+
+/// Shown in place of what a column had no room for.
+const ELLIPSIS: &str = "…";
 
 /// Shown in front of an entry with activity the user hasn't read yet.
 const UNREAD_MARKER: &str = "● ";
@@ -355,22 +372,74 @@ fn rank(needle: &str, items: Vec<SwitchItem>) -> Vec<SwitchItem> {
     scored.into_iter().map(|(_, item)| item).collect()
 }
 
-/// Pad `s` out to `width` terminal columns.
+/// Make `s` occupy exactly `width` terminal columns: pad it out, or cut it down.
 ///
 /// Rust's own width formatting counts characters, and a terminal draws columns. One emoji is one
 /// character in two columns, so a name such as "lytebot 💕" formatted that way pushes every
-/// column after it one to the right, and the list no longer lines up.
+/// column after it one to the right, and the list no longer lines up. Rust's own formatting also
+/// never cuts anything down, so a name longer than the column pushes the later columns right by
+/// however much it overran.
+///
+/// The cut lands on a grapheme boundary, because half of an emoji is not a character the terminal
+/// can draw. A grapheme two columns wide that straddles the boundary is dropped whole, and the
+/// column it would have half-filled becomes a space.
+fn fit(s: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= width {
+        return pad(s, width);
+    }
+
+    let budget = width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+    let mut kept = String::new();
+    let mut used = 0;
+
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+        if used + grapheme_width > budget {
+            break;
+        }
+
+        kept.push_str(grapheme);
+        used += grapheme_width;
+    }
+
+    kept.push_str(ELLIPSIS);
+
+    pad(&kept, width)
+}
+
+/// Pad `s` out to `width` terminal columns, counting columns rather than characters.
 fn pad(s: &str, width: usize) -> String {
     let padding = width.saturating_sub(UnicodeWidthStr::width(s));
 
     format!("{s}{}", " ".repeat(padding))
 }
 
+/// How wide the name column can be drawn in a viewport this wide.
+///
+/// The name column is as wide as it can be up to [NAME_COLUMN_WIDTH], because a name the user
+/// recognises is worth more than a room ID they do not. It stops at [MIN_NAME_COLUMN_WIDTH] so
+/// that a narrow terminal still shows enough of every column to tell the rows apart, rather than
+/// one column of names and nothing else.
+///
+/// A viewport of no width is one that has not been drawn yet, and the full column suits it.
+fn name_column_width(viewport: &ViewportContext<ListCursor>) -> usize {
+    let available = viewport.dimensions.0;
+
+    if available == 0 {
+        return NAME_COLUMN_WIDTH;
+    }
+
+    available
+        .saturating_sub(OTHER_COLUMNS_WIDTH)
+        .clamp(MIN_NAME_COLUMN_WIDTH, NAME_COLUMN_WIDTH)
+}
+
 impl ListItem<IambInfo> for SwitchItem {
     fn show(
         &self,
         selected: bool,
-        _: &ViewportContext<ListCursor>,
+        viewport: &ViewportContext<ListCursor>,
         _: &mut ProgramStore,
     ) -> Text<'_> {
         let style = if selected {
@@ -385,8 +454,8 @@ impl ListItem<IambInfo> for SwitchItem {
             READ_MARKER
         };
         let name = format!("{}{}", self.kind.sigil(), self.name);
-        let name = format!("{} ", pad(&name, NAME_COLUMN_WIDTH));
-        let kind = format!("{} ", pad(self.kind.label(), KIND_COLUMN_WIDTH));
+        let name = format!("{} ", fit(&name, name_column_width(viewport)));
+        let kind = format!("{} ", fit(self.kind.label(), KIND_COLUMN_WIDTH));
         let detail = self.also_known_as.as_deref().unwrap_or(&self.description);
 
         let name_style = if self.unread {
@@ -444,10 +513,21 @@ mod tests {
     use crate::tests::mock_store;
     use matrix_sdk::ruma::{event_id, room_id, RoomId};
 
+    /// A viewport `columns` wide, which is what the switcher is drawn into.
+    fn viewport(columns: usize) -> ViewportContext<ListCursor> {
+        let mut viewport = ViewportContext::<ListCursor>::new();
+
+        viewport.dimensions = (columns, 40);
+        viewport
+    }
+
     /// The column that the kind label starts in, which is what has to line up between rows.
     async fn kind_column(item: &SwitchItem) -> usize {
+        kind_column_in(item, viewport(120)).await
+    }
+
+    async fn kind_column_in(item: &SwitchItem, viewport: ViewportContext<ListCursor>) -> usize {
         let mut store = mock_store().await;
-        let viewport = ViewportContext::<ListCursor>::new();
         let text = item.show(false, &viewport, &mut store);
         let spans = &text.lines[0].spans;
 
@@ -648,6 +728,62 @@ mod tests {
 
         assert_eq!(kind_column(&plain).await, kind_column(&zwj).await);
         assert_eq!(kind_column(&plain).await, kind_column(&selector).await);
+    }
+
+    #[tokio::test]
+    async fn test_an_over_long_name_is_cut_down_to_the_column() {
+        let long = room(
+            "Discord bridge bot, Matthew Petry, lytedev",
+            room_id!("!a:example.com"),
+            false,
+            NO_RECENCY,
+        );
+        let short = room("general", room_id!("!b:example.com"), false, NO_RECENCY);
+
+        assert_eq!(kind_column(&long).await, kind_column(&short).await);
+        assert_eq!(kind_column(&long).await, MARKER_WIDTH + NAME_COLUMN_WIDTH + 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_cut_name_ends_in_an_ellipsis() {
+        let name = "Discord bridge bot, Matthew Petry, lytedev";
+
+        assert!(fit(name, NAME_COLUMN_WIDTH).trim_end().ends_with(ELLIPSIS));
+        assert_eq!(
+            UnicodeWidthStr::width(fit(name, NAME_COLUMN_WIDTH).as_str()),
+            NAME_COLUMN_WIDTH
+        );
+    }
+
+    #[test]
+    fn test_a_cut_never_splits_a_grapheme() {
+        // The cut lands in the middle of the emoji, so the whole emoji goes.
+        assert_eq!(fit("aaa💕", 4), "aaa…");
+
+        // Only one column is left over, and half an emoji cannot fill it, so a space does.
+        let fitted = fit("💕💕", 2);
+
+        assert_eq!(fitted, "… ");
+        assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_narrow_terminal_still_shows_every_column() {
+        let long = room(
+            "Discord bridge bot, Matthew Petry, lytedev",
+            room_id!("!a:example.com"),
+            false,
+            NO_RECENCY,
+        );
+
+        // The name column gives up its width first, but never all of it.
+        let narrow = kind_column_in(&long, viewport(40)).await;
+        let widest = MARKER_WIDTH + NAME_COLUMN_WIDTH + 1;
+        let narrowest = MARKER_WIDTH + MIN_NAME_COLUMN_WIDTH + 1;
+
+        assert!(narrow < widest);
+        assert!(narrow >= narrowest);
+        assert!(narrow + KIND_COLUMN_WIDTH < 40, "the kind column has to fit in the terminal");
     }
 
     #[test]
