@@ -13,7 +13,7 @@ use crate::config::ApplicationSettings;
 use crate::message::{Message, MessageTimeStamp};
 
 /// The time format in the header of a yanked message.
-const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 /// The time shown for a message that the server has not accepted yet.
 const TIME_UNSENT: &str = "unsent";
@@ -47,7 +47,13 @@ fn show_time(timestamp: &MessageTimeStamp) -> String {
 /// on its own line, so that fenced code blocks survive the copy without a prefix.
 pub fn show_message(msg: &Message, info: &RoomInfo, settings: &ApplicationSettings) -> String {
     let time = show_time(&msg.timestamp);
-    let sender = settings.get_user_name(&msg.sender, info);
+    // Prefer the display name over the Matrix user id, whatever the scrollback is set to show.
+    // The reader of yanked text wants a human name. Two users with the same display name are
+    // already told apart by the display name store, which adds the user id back for both of them.
+    let sender = info
+        .display_names
+        .get(&msg.sender)
+        .unwrap_or_else(|| settings.get_user_name(&msg.sender, info));
     let thread = if msg.thread_root().is_some() { THREAD_MARK } else { "" };
     let body = msg.event.body();
     let body = body.trim_end_matches('\n');
@@ -139,6 +145,31 @@ mod tests {
         let text = show_message(&msg, &info, &settings);
         let expected = format!("[{}] @user1:example.com: [Redacted: \"spam\"]", expected_time(1));
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn test_the_display_name_is_used_when_the_room_knows_one() {
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER2.clone(), Some("Ada Lovelace".into()));
+
+        let settings = mock_settings();
+        let msg = mock_message2();
+
+        let expected = format!("[{}] Ada Lovelace: helium", expected_time(1));
+        assert_eq!(show_message(&msg, &info, &settings), expected);
+    }
+
+    #[test]
+    fn test_two_users_with_one_display_name_keep_their_user_ids() {
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER1.clone(), Some("Ada".into()));
+        info.display_names.set(TEST_USER2.clone(), Some("Ada".into()));
+
+        let settings = mock_settings();
+        let msg = mock_message2();
+
+        let expected = format!("[{}] Ada (@user2:example.com): helium", expected_time(1));
+        assert_eq!(show_message(&msg, &info, &settings), expected);
     }
 
     #[test]
