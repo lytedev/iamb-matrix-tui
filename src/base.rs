@@ -2014,6 +2014,12 @@ pub struct ChatStore {
     /// building the inbox list, where the rooms map is already borrowed.
     pub snooze: SnoozeStore,
 
+    /// Rooms whose snooze account data has changed and not yet been written to the server.
+    ///
+    /// A queue rather than a direct write, because a snooze is set while this store is locked and
+    /// the write needs the client. The worker drains this.
+    pub snooze_dirty: HashSet<OwnedRoomId>,
+
     /// Set of rooms that need more messages loaded in their scrollback.
     pub need_load: RoomNeeds,
 
@@ -2121,6 +2127,7 @@ impl ChatStore {
             worker,
             settings,
             snooze: SnoozeStore::default(),
+            snooze_dirty: Default::default(),
             picker,
             cmds: crate::commands::setup_commands(),
 

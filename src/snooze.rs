@@ -13,10 +13,11 @@
 //! `latest`, so a woken entry is the most recent thing in the list and rises to the top without any
 //! wake code at all.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Duration, Local as LocalTz, NaiveTime, TimeZone};
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId};
+use serde::{Deserialize, Serialize};
 
 /// Milliseconds since the Unix epoch, in UTC.
 ///
@@ -110,6 +111,87 @@ impl SnoozeStore {
     /// Pruning is by expiry and not by age, because a deliberately long snooze must survive.
     pub fn prune_expired(&mut self, now: WakeTime) {
         self.wake_times.retain(|_, wake_at| *wake_at > now);
+    }
+}
+
+/// The account data event type that carries a room's wake times.
+///
+/// A private type in our own namespace. Other Matrix clients ignore a room account data type they
+/// do not know, so no other client changes behaviour because of this event.
+pub const SNOOZE_EVENT_TYPE: &str = "dev.lyte.iamb.snooze";
+
+/// One room's wake times, as they are stored on the server.
+///
+/// Per room rather than one global event, because a tab id is unique only inside its own room and
+/// because two machines snoozing different rooms must not overwrite each other. The write race is
+/// then confined to the same room at the same moment, where last write wins is genuinely
+/// ambiguous anyway.
+#[derive(Default, Deserialize, Serialize)]
+pub struct SnoozeContent {
+    /// When the room itself comes back, if it is snoozed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<WakeTime>,
+
+    /// When each snoozed thread in this room comes back, keyed by its root event id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub threads: BTreeMap<String, WakeTime>,
+}
+
+impl SnoozeContent {
+    /// Whether this event carries nothing worth storing.
+    ///
+    /// An empty event is written rather than deleted, because the Matrix API has no way to remove
+    /// room account data.
+    pub fn is_empty(&self) -> bool {
+        self.room.is_none() && self.threads.is_empty()
+    }
+}
+
+impl SnoozeStore {
+    /// Replace what is known about one room with what the server says.
+    ///
+    /// Expired entries are dropped on the way in, so a stale event cannot resurrect a snooze that
+    /// has already run out.
+    pub fn load_room(&mut self, room_id: &OwnedRoomId, content: SnoozeContent, now: WakeTime) {
+        self.wake_times.retain(|key, _| &key.room_id != room_id);
+
+        if let Some(wake_at) = content.room.filter(|w| *w > now) {
+            self.set(SnoozeKey::room(room_id.clone()), wake_at);
+        }
+
+        for (root, wake_at) in content.threads {
+            if wake_at <= now {
+                continue;
+            }
+
+            let Ok(root) = EventId::parse(&root) else {
+                continue;
+            };
+
+            self.set(SnoozeKey::thread(room_id.clone(), root), wake_at);
+        }
+    }
+
+    /// What should be stored for one room.
+    ///
+    /// Expired entries are pruned on the way out, so the event cannot grow without bound.
+    pub fn room_content(&self, room_id: &OwnedRoomId, now: WakeTime) -> SnoozeContent {
+        let mut content = SnoozeContent::default();
+
+        for (key, wake_at) in self.entries() {
+            if &key.room_id != room_id || *wake_at <= now {
+                continue;
+            }
+
+            match &key.thread {
+                None => content.room = Some(*wake_at),
+                Some(root) => {
+                    content.threads.insert(root.to_string(), *wake_at);
+                },
+            }
+        }
+
+        content
     }
 }
 
@@ -345,6 +427,62 @@ mod tests {
         let unread = UnreadInfo { unread: true, latest: Some(old) };
 
         assert_eq!(unread.with_wake_time(None).latest(), Some(&old));
+    }
+
+    #[test]
+    fn test_a_room_survives_a_round_trip_through_account_data() {
+        let room = room_id!("!a:example.com").to_owned();
+        let thread = event_id!("$t:example.com").to_owned();
+        let mut s = store();
+
+        s.set(SnoozeKey::room(room.clone()), NOW + HOUR);
+        s.set(SnoozeKey::thread(room.clone(), thread.clone()), NOW + 2 * HOUR);
+
+        let content = s.room_content(&room, NOW);
+        let mut loaded = store();
+        loaded.load_room(&room, content, NOW);
+
+        assert_eq!(loaded.wake_at(&room, None), Some(NOW + HOUR));
+        assert_eq!(loaded.wake_at(&room, Some(&thread)), Some(NOW + 2 * HOUR));
+    }
+
+    #[test]
+    fn test_an_expired_entry_is_not_written_out() {
+        let room = room_id!("!a:example.com").to_owned();
+        let mut s = store();
+
+        s.set(SnoozeKey::room(room.clone()), NOW - HOUR);
+
+        assert!(s.room_content(&room, NOW).is_empty());
+    }
+
+    #[test]
+    fn test_an_expired_entry_is_not_read_back_in() {
+        let room = room_id!("!a:example.com").to_owned();
+        let mut content = SnoozeContent::default();
+        content.room = Some(NOW - HOUR);
+
+        let mut s = store();
+        s.load_room(&room, content, NOW);
+
+        assert!(s.wake_at(&room, None).is_none());
+    }
+
+    #[test]
+    fn test_loading_a_room_replaces_what_was_known_about_it() {
+        let room = room_id!("!a:example.com").to_owned();
+        let other = room_id!("!b:example.com").to_owned();
+        let mut s = store();
+
+        s.set(SnoozeKey::room(room.clone()), NOW + HOUR);
+        s.set(SnoozeKey::room(other.clone()), NOW + HOUR);
+
+        // An empty event means the room has no snooze any more.
+        s.load_room(&room, SnoozeContent::default(), NOW);
+
+        assert!(s.wake_at(&room, None).is_none());
+        // Another room is untouched, which is the point of storing this per room.
+        assert!(s.wake_at(&other, None).is_some());
     }
 
     #[test]

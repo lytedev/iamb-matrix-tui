@@ -424,12 +424,19 @@ where
         RoomAction::Snooze(when) => {
             let wake_at = store.application.parse_snooze(when)?;
 
+            let room_id = key.room_id.clone();
+
             store.application.snooze.set(key, wake_at);
+            store.application.snooze_dirty.insert(room_id);
         },
         RoomAction::Unsnooze => {
+            let room_id = key.room_id.clone();
+
             if !store.application.snooze.clear(&key) {
                 return Err(IambError::NotSnoozed.into());
             }
+
+            store.application.snooze_dirty.insert(room_id);
         },
         _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
     }

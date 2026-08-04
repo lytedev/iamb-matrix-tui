@@ -301,7 +301,8 @@ impl RoomState {
                 let thread = self.thread().cloned();
                 let wake_at = store.application.parse_snooze(&when)?;
 
-                store.application.snooze.set(SnoozeKey { room_id, thread }, wake_at);
+                store.application.snooze.set(SnoozeKey { room_id: room_id.clone(), thread }, wake_at);
+                store.application.snooze_dirty.insert(room_id);
 
                 Ok(vec![])
             },
@@ -309,9 +310,13 @@ impl RoomState {
                 let room_id = self.id().to_owned();
                 let thread = self.thread().cloned();
 
-                if !store.application.snooze.clear(&SnoozeKey { room_id, thread }) {
+                let key = SnoozeKey { room_id: room_id.clone(), thread };
+
+                if !store.application.snooze.clear(&key) {
                     return Err(IambError::NotSnoozed.into());
                 }
+
+                store.application.snooze_dirty.insert(room_id);
 
                 Ok(vec![])
             },
