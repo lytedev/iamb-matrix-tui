@@ -59,6 +59,7 @@ use modalkit_ratatui::{
     WindowOps,
 };
 
+use crate::snooze::{SnoozeKey, WakeTime};
 use crate::base::{
     ChatStore,
     IambBufferId,
@@ -292,6 +293,12 @@ trait RoomLikeItem {
     fn room_id(&self) -> &RoomId;
     fn has_tag(&self, tag: TagName) -> bool;
     fn is_unread(&self) -> bool;
+    /// Whether a snooze is hiding this entry from the inbox right now.
+    ///
+    /// Kept apart from [RoomLikeItem::is_unread], which stays truthful: a deferred entry is still
+    /// unread, still bold, and still counted by the unread sort. Only the inbox windows filter on
+    /// this, so a snooze hides an entry from the place the user triages and nowhere else.
+    fn is_deferred(&self) -> bool;
     fn recent_ts(&self) -> Option<&MessageTimeStamp>;
     fn alias(&self) -> Option<&RoomAliasId>;
     fn name(&self) -> &str;
@@ -389,6 +396,43 @@ where
 
     // Any notification we showed for this room is now stale.
     store.application.open_notifications.remove(&room_id);
+
+    Ok(())
+}
+
+/// Defer or restore the entry selected in a list window.
+///
+/// The list-window counterpart to [RoomState::room_command]'s handling of [RoomAction::Snooze],
+/// which can only act on the focused room. The entry's read target names the room and the thread,
+/// which is exactly the key a snooze uses.
+fn snooze_selection<T>(
+    list: &ListState<T, IambInfo>,
+    act: &RoomAction,
+    store: &mut ProgramStore,
+) -> IambResult<()>
+where
+    T: ListItem<IambInfo> + Readable,
+{
+    let Some(item) = list.get() else {
+        return Err(IambError::NoSelectedRoom.into());
+    };
+
+    let ReadTarget { room_id, thread } = item.read_target();
+    let key = SnoozeKey { room_id, thread };
+
+    match act {
+        RoomAction::Snooze(when) => {
+            let wake_at = store.application.parse_snooze(when)?;
+
+            store.application.snooze.set(key, wake_at);
+        },
+        RoomAction::Unsnooze => {
+            if !store.application.snooze.clear(&key) {
+                return Err(IambError::NotSnoozed.into());
+            }
+        },
+        _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
+    }
 
     Ok(())
 }
@@ -503,6 +547,23 @@ impl IambWindow {
                 },
                 IambWindow::ThreadList(l) => mark_selection_read(l, store)?,
                 IambWindow::UnreadThreadList(l) => mark_selection_read(l, store)?,
+                _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
+            }
+
+            return Ok(vec![]);
+        }
+
+        // Snoozing the selected entry is well-defined in the same windows, and for the same
+        // reason: the entry names a room and possibly a thread, which is all a snooze needs.
+        if let RoomAction::Snooze(_) | RoomAction::Unsnooze = &act {
+            match self {
+                IambWindow::DirectList(l) => snooze_selection(l, &act, store)?,
+                IambWindow::RoomList(l) => snooze_selection(l, &act, store)?,
+                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
+                    snooze_selection(l, &act, store)?
+                },
+                IambWindow::ThreadList(l) => snooze_selection(l, &act, store)?,
+                IambWindow::UnreadThreadList(l) => snooze_selection(l, &act, store)?,
                 _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
             }
 
@@ -738,7 +799,7 @@ impl IambWindow {
             IambWindow::UnreadList(state) => {
                 let items = chat_items(store)
                     .into_iter()
-                    .filter(RoomLikeItem::is_unread)
+                    .filter(|i| i.is_unread() && !i.is_deferred())
                     .collect::<Vec<_>>();
 
                 sorted!(state, items, chats);
@@ -751,13 +812,13 @@ impl IambWindow {
             IambWindow::UnreadThreadList(state) => {
                 let mut items = chat_items(store)
                     .into_iter()
-                    .filter(RoomLikeItem::is_unread)
+                    .filter(|i| i.is_unread() && !i.is_deferred())
                     .map(UnreadThreadItem::Chat)
                     .collect::<Vec<_>>();
 
                 let threads = followed_thread_items(store)
                     .into_iter()
-                    .filter(RoomLikeItem::is_unread)
+                    .filter(|i| i.is_unread() && !i.is_deferred())
                     .map(UnreadThreadItem::Thread);
 
                 items.extend(threads);
@@ -1108,7 +1169,10 @@ fn followed_thread_items(store: &mut ProgramStore) -> Vec<ThreadItem> {
         .cloned()
         .collect::<Vec<_>>();
 
-    let ChatStore { rooms, settings, .. } = &mut store.application;
+    // The snooze cache is a third field borrow beside rooms and settings, which is why it lives on
+    // ChatStore rather than on RoomInfo.
+    let now = store.application.now_ms();
+    let ChatStore { rooms, settings, snooze, .. } = &mut store.application;
 
     room_infos
         .into_iter()
@@ -1121,7 +1185,17 @@ fn followed_thread_items(store: &mut ProgramStore) -> Vec<ThreadItem> {
             info.followed_threads(settings)
                 .into_iter()
                 .map(|summary| {
-                    ThreadItem::new(room_info.clone(), room_name.clone(), alias.clone(), summary)
+                    let wake_at =
+                        snooze.wake_at(&room.room_id().to_owned(), Some(&summary.root));
+
+                    ThreadItem::new(
+                        room_info.clone(),
+                        room_name.clone(),
+                        alias.clone(),
+                        summary,
+                        wake_at,
+                        now,
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -1137,6 +1211,8 @@ pub struct ThreadItem {
     thread_root: OwnedEventId,
     preview: String,
     unread: UnreadInfo,
+    /// True while a snooze on this thread, or on its room, is still running.
+    deferred: bool,
 }
 
 impl ThreadItem {
@@ -1145,6 +1221,8 @@ impl ThreadItem {
         room_name: String,
         alias: Option<OwnedRoomAliasId>,
         summary: ThreadSummary,
+        wake_at: Option<WakeTime>,
+        now: WakeTime,
     ) -> Self {
         let ThreadSummary { root, preview, unread } = summary;
 
@@ -1154,7 +1232,8 @@ impl ThreadItem {
             alias,
             thread_root: root,
             preview,
-            unread,
+            unread: unread.with_wake_time(wake_at),
+            deferred: wake_at.is_some_and(|w| w > now),
         }
     }
 
@@ -1191,6 +1270,10 @@ impl RoomLikeItem for ThreadItem {
 
     fn is_unread(&self) -> bool {
         self.unread.is_unread()
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.deferred
     }
 
     fn is_invite(&self) -> bool {
@@ -1291,6 +1374,10 @@ impl RoomLikeItem for UnreadThreadItem {
         delegate_unread_thread!(self, item => item.is_unread())
     }
 
+    fn is_deferred(&self) -> bool {
+        delegate_unread_thread!(self, item => item.is_deferred())
+    }
+
     fn is_invite(&self) -> bool {
         delegate_unread_thread!(self, item => item.is_invite())
     }
@@ -1341,6 +1428,8 @@ pub struct GenericChatItem {
     alias: Option<OwnedRoomAliasId>,
     unread: UnreadInfo,
     is_dm: bool,
+    /// True while a snooze on this room, or on the room the entry belongs to, is still running.
+    deferred: bool,
 }
 
 impl GenericChatItem {
@@ -1348,17 +1437,22 @@ impl GenericChatItem {
         let room = &room_info.deref().0;
         let room_id = room.room_id();
 
+        // Read the snooze state before borrowing the room, so the two borrows do not overlap.
+        let now = store.application.now_ms();
+        let wake_at = store.application.snooze.wake_at(&room_id.to_owned(), None);
+        let deferred = wake_at.is_some_and(|w| w > now);
+
         let info = store.application.rooms.get_or_default(room_id.to_owned());
         let name = info.name.clone().unwrap_or_default();
         let alias = room.canonical_alias();
-        let unread = info.unreads(&store.application.settings);
+        let unread = info.unreads(&store.application.settings).with_wake_time(wake_at);
         info.tags.clone_from(&room_info.deref().1);
 
         if let Some(alias) = &alias {
             store.application.names.insert(alias.to_string(), room_id.to_owned());
         }
 
-        GenericChatItem { room_info, name, alias, is_dm, unread }
+        GenericChatItem { room_info, name, alias, is_dm, unread, deferred }
     }
 
     #[inline]
@@ -1399,6 +1493,10 @@ impl RoomLikeItem for GenericChatItem {
 
     fn is_unread(&self) -> bool {
         self.unread.is_unread()
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.deferred
     }
 
     fn is_invite(&self) -> bool {
@@ -1526,6 +1624,10 @@ impl RoomLikeItem for RoomItem {
         self.unread.is_unread()
     }
 
+    fn is_deferred(&self) -> bool {
+        false
+    }
+
     fn is_invite(&self) -> bool {
         self.room().state() == MatrixRoomState::Invited
     }
@@ -1641,6 +1743,10 @@ impl RoomLikeItem for DirectItem {
         self.unread.is_unread()
     }
 
+    fn is_deferred(&self) -> bool {
+        false
+    }
+
     fn is_invite(&self) -> bool {
         self.room().state() == MatrixRoomState::Invited
     }
@@ -1752,6 +1858,10 @@ impl RoomLikeItem for SpaceItem {
 
     fn is_unread(&self) -> bool {
         // XXX: this needs to check whether the space contains rooms with unread messages
+        false
+    }
+
+    fn is_deferred(&self) -> bool {
         false
     }
 
@@ -2148,6 +2258,10 @@ mod tests {
     impl RoomLikeItem for &TestRoomItem {
         fn room_id(&self) -> &RoomId {
             self.room_id.as_ref()
+        }
+
+        fn is_deferred(&self) -> bool {
+            false
         }
 
         fn has_tag(&self, tag: TagName) -> bool {

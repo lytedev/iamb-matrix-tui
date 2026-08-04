@@ -95,6 +95,9 @@ use crate::message::emoji::{complete_emoji_names, complete_emojis, EMOJI_SIGIL};
 use crate::message::mention::{complete_mentions, MentionCandidate, MENTION_SIGIL};
 use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
+use matrix_sdk::ruma::UInt;
+
+use crate::snooze::{parse_when, SnoozeKey, SnoozeStore, WakeTime};
 use crate::preview::{source_from_event, spawn_insert_preview};
 use crate::{
     message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages},
@@ -455,6 +458,15 @@ pub enum RoomAction {
     /// Mark this room, or the thread being viewed, as read.
     MarkRead,
 
+    /// Defer this room, or the thread being viewed, out of the inbox until a time.
+    ///
+    /// The [String] is the duration as the user wrote it. Parsing happens where the action runs,
+    /// so that the error can name what was typed.
+    Snooze(String),
+
+    /// Cancel a snooze on this room, or on the thread being viewed.
+    Unsnooze,
+
     /// Move the scrollback cursor onto a message, loading it first if necessary.
     SelectMessage(OwnedEventId),
 
@@ -793,6 +805,12 @@ pub enum IambError {
     #[error("No read left to undo")]
     NothingToUndoRead,
 
+    #[error("This room or thread is not snoozed")]
+    NotSnoozed,
+
+    #[error("{0}")]
+    BadSnoozeDuration(String),
+
     /// A failure due to not having a space selected.
     #[error("Current window is not a space")]
     NoSelectedSpace,
@@ -912,6 +930,33 @@ impl UnreadInfo {
 
     pub fn latest(&self) -> Option<&MessageTimeStamp> {
         self.latest.as_ref()
+    }
+
+    /// Give this entry a wake time in place of its newest message time.
+    ///
+    /// This is what makes a woken entry rise to the top of the inbox without any wake code. The
+    /// sort reads `latest`, so an entry whose wake time has just passed carries a timestamp of
+    /// roughly now and outranks older unread traffic.
+    ///
+    /// The later of the two is taken, so that a message which arrived after the wake time still
+    /// decides the order.
+    pub fn with_wake_time(mut self, wake_at: Option<WakeTime>) -> Self {
+        let Some(wake_at) = wake_at else {
+            return self;
+        };
+
+        let Ok(wake_at) = UInt::try_from(wake_at) else {
+            return self;
+        };
+
+        let wake = MessageTimeStamp::OriginServer(wake_at);
+
+        self.latest = match self.latest {
+            Some(latest) if latest > wake => Some(latest),
+            _ => Some(wake),
+        };
+
+        self
     }
 }
 
@@ -1963,6 +2008,12 @@ pub struct ChatStore {
     /// Settings for the current profile loaded from config file.
     pub settings: ApplicationSettings,
 
+    /// When each deferred room or thread comes back to the inbox.
+    ///
+    /// Held here rather than on [RoomInfo] because a thread's wake time must be reachable while
+    /// building the inbox list, where the rooms map is already borrowed.
+    pub snooze: SnoozeStore,
+
     /// Set of rooms that need more messages loaded in their scrollback.
     pub need_load: RoomNeeds,
 
@@ -2035,6 +2086,33 @@ pub struct ReadUndoEntry {
 }
 
 impl ChatStore {
+    /// Now, as the wake times are measured.
+    pub fn now_ms(&self) -> WakeTime {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as WakeTime)
+            .unwrap_or(0)
+    }
+
+    /// Read a snooze duration against the current time and the configured hour for "tomorrow".
+    ///
+    /// The error names what the user typed, so that a mistyped duration is obvious.
+    pub fn parse_snooze(&self, when: &str) -> Result<WakeTime, IambError> {
+        let when = if when.trim().is_empty() {
+            self.settings.tunables.snooze_default.as_str()
+        } else {
+            when
+        };
+
+        parse_when(when, self.now_ms(), self.settings.tunables.snooze_tomorrow_hour)
+            .map_err(|e| IambError::BadSnoozeDuration(e.to_string()))
+    }
+
+    /// Whether an inbox entry is deferred right now.
+    pub fn is_deferred(&self, room_id: &OwnedRoomId, thread: Option<&OwnedEventId>) -> bool {
+        self.snooze.is_deferred(room_id, thread, self.now_ms())
+    }
+
     /// Create a new [ChatStore].
     pub fn new(worker: Requester, settings: ApplicationSettings) -> Self {
         let picker = picker_from_settings(&settings);
@@ -2042,6 +2120,7 @@ impl ChatStore {
         ChatStore {
             worker,
             settings,
+            snooze: SnoozeStore::default(),
             picker,
             cmds: crate::commands::setup_commands(),
 

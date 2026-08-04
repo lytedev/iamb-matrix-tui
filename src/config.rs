@@ -707,6 +707,10 @@ pub struct TunableValues {
     pub reaction_display: bool,
     pub reaction_shortcode_display: bool,
     pub read_receipt_send: bool,
+    /// The duration `:snooze` uses when given no argument.
+    pub snooze_default: String,
+    /// The local hour that `:snooze tomorrow` resolves to.
+    pub snooze_tomorrow_hour: u32,
     pub read_receipt_display: bool,
     pub read_receipt_manual: bool,
     pub request_timeout: u64,
@@ -753,6 +757,8 @@ pub struct Tunables {
     pub reaction_display: Option<bool>,
     pub reaction_shortcode_display: Option<bool>,
     pub read_receipt_send: Option<bool>,
+    pub snooze_default: Option<String>,
+    pub snooze_tomorrow_hour: Option<u32>,
     pub read_receipt_display: Option<bool>,
     pub read_receipt_manual: Option<bool>,
     pub request_timeout: Option<u64>,
@@ -791,6 +797,8 @@ impl Tunables {
                 .reaction_shortcode_display
                 .or(other.reaction_shortcode_display),
             read_receipt_send: self.read_receipt_send.or(other.read_receipt_send),
+            snooze_default: self.snooze_default.or(other.snooze_default),
+            snooze_tomorrow_hour: self.snooze_tomorrow_hour.or(other.snooze_tomorrow_hour),
             read_receipt_display: self.read_receipt_display.or(other.read_receipt_display),
             read_receipt_manual: self.read_receipt_manual.or(other.read_receipt_manual),
             request_timeout: self.request_timeout.or(other.request_timeout),
@@ -826,6 +834,11 @@ impl Tunables {
             reaction_display: self.reaction_display.unwrap_or(true),
             reaction_shortcode_display: self.reaction_shortcode_display.unwrap_or(false),
             read_receipt_send: self.read_receipt_send.unwrap_or(true),
+            // An hour is long enough to clear a distraction and short enough that a forgotten
+            // snooze surfaces the same day.
+            snooze_default: self.snooze_default.unwrap_or_else(|| "1h".into()),
+            // The start of a working day, so that "tomorrow" means "when I next sit down".
+            snooze_tomorrow_hour: self.snooze_tomorrow_hour.unwrap_or(9).min(23),
             read_receipt_display: self.read_receipt_display.unwrap_or(true),
             read_receipt_manual: self.read_receipt_manual.unwrap_or(false),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQ_TIMEOUT),

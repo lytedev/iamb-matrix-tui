@@ -207,6 +207,10 @@ pub fn describe(wake_at: WakeTime) -> String {
 mod tests {
     use super::*;
     use chrono::Timelike;
+    use matrix_sdk::ruma::UInt;
+
+    use crate::base::UnreadInfo;
+    use crate::message::MessageTimeStamp;
     use matrix_sdk::ruma::{event_id, room_id};
 
     const MINUTE: WakeTime = 60_000;
@@ -309,6 +313,38 @@ mod tests {
 
         assert!(s.wake_at(&room, None).is_some());
         assert!(s.wake_at(&other, None).is_none());
+    }
+
+    #[test]
+    fn test_a_wake_time_replaces_an_older_message_time() {
+        let old = MessageTimeStamp::OriginServer(UInt::new(1_000).unwrap());
+        let unread = UnreadInfo { unread: true, latest: Some(old) };
+
+        let woken = unread.with_wake_time(Some(NOW));
+
+        // The entry now claims to be as recent as its wake time, which is what lifts it to the top
+        // of the inbox when it comes back.
+        assert_eq!(woken.latest(), Some(&MessageTimeStamp::OriginServer(
+            UInt::new(NOW).unwrap()
+        )));
+    }
+
+    #[test]
+    fn test_a_newer_message_beats_the_wake_time() {
+        let newer = MessageTimeStamp::OriginServer(UInt::new(NOW + HOUR).unwrap());
+        let unread = UnreadInfo { unread: true, latest: Some(newer) };
+
+        let woken = unread.with_wake_time(Some(NOW));
+
+        assert_eq!(woken.latest(), Some(&newer));
+    }
+
+    #[test]
+    fn test_no_wake_time_leaves_the_entry_alone() {
+        let old = MessageTimeStamp::OriginServer(UInt::new(1_000).unwrap());
+        let unread = UnreadInfo { unread: true, latest: Some(old) };
+
+        assert_eq!(unread.with_wake_time(None).latest(), Some(&old));
     }
 
     #[test]
