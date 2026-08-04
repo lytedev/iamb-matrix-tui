@@ -373,6 +373,17 @@ fn iamb_unsnooze(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult 
     return Ok(step);
 }
 
+fn iamb_snoozed(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = IambAction::ShowSnoozed;
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_undoread(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -1019,6 +1030,12 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
             bare("Defer the focused room, thread, or selected list entry for the default time"),
             form("<duration>", "Defer it for 30m, 2h, 3d, 1w, or until tomorrow"),
         ],
+    },
+    IambCommandInfo {
+        name: "snoozed",
+        aliases: &[],
+        f: iamb_snoozed,
+        forms: &[bare("List what is deferred and when each entry comes back")],
     },
     IambCommandInfo {
         name: "unsnooze",

@@ -573,6 +573,9 @@ pub enum IambAction {
 
     /// Put the receipts moved by the most recent read operation back where they were.
     UndoRead,
+
+    /// Show what is deferred and when each entry comes back.
+    ShowSnoozed,
 }
 
 impl IambAction {
@@ -618,6 +621,7 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Track,
             IambAction::ClearUnreads => SequenceStatus::Break,
             IambAction::UndoRead => SequenceStatus::Break,
+            IambAction::ShowSnoozed => SequenceStatus::Break,
             IambAction::Homeserver(..) => SequenceStatus::Break,
             IambAction::Keys(..) => SequenceStatus::Break,
             IambAction::Message(..) => SequenceStatus::Break,
@@ -636,6 +640,7 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Atom,
             IambAction::ClearUnreads => SequenceStatus::Atom,
             IambAction::UndoRead => SequenceStatus::Atom,
+            IambAction::ShowSnoozed => SequenceStatus::Atom,
             IambAction::Homeserver(..) => SequenceStatus::Atom,
             IambAction::Keys(..) => SequenceStatus::Atom,
             IambAction::Message(..) => SequenceStatus::Atom,
@@ -654,6 +659,7 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Ignore,
             IambAction::ClearUnreads => SequenceStatus::Ignore,
             IambAction::UndoRead => SequenceStatus::Ignore,
+            IambAction::ShowSnoozed => SequenceStatus::Ignore,
             IambAction::Homeserver(..) => SequenceStatus::Ignore,
             IambAction::Keys(..) => SequenceStatus::Ignore,
             IambAction::Message(..) => SequenceStatus::Ignore,
@@ -672,6 +678,7 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => false,
             IambAction::ClearUnreads => false,
             IambAction::UndoRead => false,
+            IambAction::ShowSnoozed => false,
             IambAction::Homeserver(..) => false,
             IambAction::Message(..) => false,
             IambAction::Space(..) => false,

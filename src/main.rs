@@ -649,6 +649,44 @@ impl Application {
 
                 None
             },
+            IambAction::ShowSnoozed => {
+                // A listing rather than a window. Deferral the user cannot audit becomes deferral
+                // the user does not trust, and this answers that without the weight of a new
+                // window type. A window can replace it later.
+                let now = store.application.now_ms();
+                let mut lines = store
+                    .application
+                    .snooze
+                    .entries()
+                    .filter(|(_, wake_at)| **wake_at > now)
+                    .map(|(key, wake_at)| {
+                        let room = store
+                            .application
+                            .rooms
+                            .get(&key.room_id)
+                            .and_then(|i| i.name.clone())
+                            .unwrap_or_else(|| key.room_id.to_string());
+
+                        let what = match &key.thread {
+                            None => room,
+                            // The root event id is not a name, but it is what the user has, and it
+                            // is enough to tell two threads in one room apart.
+                            Some(root) => format!("{room} (thread {root})"),
+                        };
+
+                        format!("{what} until {}", crate::snooze::describe(*wake_at))
+                    })
+                    .collect::<Vec<_>>();
+
+                if lines.is_empty() {
+                    Some(InfoMessage::from("Nothing is snoozed"))
+                } else {
+                    lines.sort();
+
+                    Some(InfoMessage::from(lines.join("\n")))
+                }
+            },
+
             IambAction::UndoRead => {
                 let Some(entry) = store.application.undo_read() else {
                     return Err(IambError::NothingToUndoRead.into());

@@ -146,6 +146,35 @@ would.
 .Sy <C-K>
 is bound in normal and visual mode only, so it does not shadow the Vim digraph
 key while you are typing a message.
+.It Sy ":snooze [duration]"
+Defer the focused room, the thread being viewed, or the selected list entry, so
+that it leaves
+.Sy ":unreads" ,
+.Sy ":threads"
+and
+.Sy ":unreadsandthreads"
+until the time passes.
+Nothing is marked read and no read receipt moves.
+The duration is a number with
+.Sy m , h , d
+or
+.Sy w ,
+or the word
+.Sy tomorrow .
+With no argument the configured default is used.
+When the time passes the entry returns at the top of the unread list, because it
+sorts as the most recent thing there.
+Desktop notifications for it are silenced while it is deferred, including direct
+mentions.
+Snoozing a room also defers the threads in that room, and an explicit snooze on
+a thread always wins, whether it is sooner or later.
+Wake times are stored in room account data, so they survive a restart and reach
+your other clients.
+.It Sy ":snoozed"
+List what is deferred and when each entry comes back.
+.It Sy ":unsnooze"
+Cancel the snooze on the focused room, the thread being viewed, or the selected
+list entry.
 .It Sy ":threads"
 View a list of threads you follow across all rooms.
 A thread counts as followed if you started it, replied in it, or have a
