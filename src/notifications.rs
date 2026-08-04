@@ -151,6 +151,10 @@ pub async fn register_notifications(
                                     return;
                                 }
 
+                                if is_deferred(&store, &target).await {
+                                    return;
+                                }
+
                                 if is_missing_mention(&body, mode, &client) {
                                     return;
                                 }
@@ -372,6 +376,22 @@ fn is_open(locked: &mut ProgramStore, room_id: &RoomId) -> bool {
 
 fn is_focused(locked: &ProgramStore) -> bool {
     locked.application.focused
+}
+
+/// Whether a snooze is still hiding what this notification is about.
+///
+/// An entry that keeps interrupting is not deferred, so a snooze silences the notification as well
+/// as the inbox row. A direct mention inside a snoozed thread is silenced too. That is deliberate
+/// for a deferral primitive, and the user can cancel the snooze.
+///
+/// The check runs on the notification's own target, so a snooze on one thread does not silence the
+/// rest of its room.
+async fn is_deferred(store: &AsyncProgramStore, target: &NotificationTarget) -> bool {
+    let locked = store.lock().await;
+
+    locked
+        .application
+        .is_deferred(&target.room_id, target.thread_root.as_ref())
 }
 
 async fn is_visible_room(store: &AsyncProgramStore, room_id: &RoomId) -> bool {
