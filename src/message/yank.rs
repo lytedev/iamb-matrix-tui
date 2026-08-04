@@ -6,11 +6,13 @@
 //!
 //! Change the format here, and every yank changes with it.
 
+use std::borrow::Cow;
+
 use chrono::Local as LocalTz;
 
 use crate::base::RoomInfo;
 use crate::config::ApplicationSettings;
-use crate::message::{Message, MessageTimeStamp};
+use crate::message::{Message, MessageEvent, MessageTimeStamp};
 
 /// The time format in the header of a yanked message.
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
@@ -22,7 +24,11 @@ const TIME_UNSENT: &str = "unsent";
 const THREAD_MARK: &str = " (thread)";
 
 /// The text between two yanked messages.
-const MESSAGE_SEPARATOR: &str = "\n";
+/// A blank line between messages.
+///
+/// One newline is not enough. A body that runs to several lines becomes indistinguishable from the
+/// next message, which is the whole problem the reader of a dump has to solve.
+const MESSAGE_SEPARATOR: &str = "\n\n";
 
 /// Format the timestamp for the header of a yanked message.
 fn show_time(timestamp: &MessageTimeStamp) -> String {
@@ -41,6 +47,48 @@ fn show_time(timestamp: &MessageTimeStamp) -> String {
     }
 }
 
+/// Put an `@` in front of each name the message mentions.
+///
+/// A mention reaches the plain body as the bare display name, so a dump cannot tell a mention from
+/// someone merely being talked about. The truth is in `m.mentions`, which names the users by id, so
+/// this marks their display names rather than guessing from the text.
+///
+/// Returns the body untouched when there is nothing to mark, so the common case allocates nothing.
+fn mark_mentions<'a>(body: &'a str, msg: &Message, info: &RoomInfo) -> Cow<'a, str> {
+    let MessageEvent::Original(ev) = &msg.event else {
+        return Cow::Borrowed(body);
+    };
+
+    let Some(mentions) = &ev.content.mentions else {
+        return Cow::Borrowed(body);
+    };
+
+    let mut out = Cow::Borrowed(body);
+
+    for user in &mentions.user_ids {
+        let Some(name) = info.display_names.get(user) else {
+            continue;
+        };
+        let name: &str = name.as_ref();
+
+        if name.is_empty() || !out.contains(name) {
+            continue;
+        }
+
+        // Skip a name that is already marked, so that a client which sends the `@` itself does not
+        // end up with two.
+        let marked = format!("@{name}");
+
+        if out.contains(&marked) {
+            continue;
+        }
+
+        out = Cow::Owned(out.replace(name, &marked));
+    }
+
+    out
+}
+
 /// Format a single message as plain text.
 ///
 /// A body that fits on one line stays on the header line. A body with more than one line starts
@@ -56,7 +104,8 @@ pub fn show_message(msg: &Message, info: &RoomInfo, settings: &ApplicationSettin
         .unwrap_or_else(|| settings.get_user_name(&msg.sender, info));
     let thread = if msg.thread_root().is_some() { THREAD_MARK } else { "" };
     let body = msg.event.body();
-    let body = body.trim_end_matches('\n');
+    let body = mark_mentions(body.trim_end_matches('\n'), msg, info);
+    let body = body.as_ref();
 
     if body.contains('\n') {
         format!("[{time}] {sender}{thread}:\n{body}")
@@ -91,6 +140,7 @@ mod tests {
     use crate::tests::*;
 
     use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    use matrix_sdk::ruma::events::Mentions;
 
     /// Format the time the same way the yanked text does, but from `chrono` directly, so that the
     /// test does not depend on the timezone of the machine that runs it.
@@ -172,15 +222,51 @@ mod tests {
         assert_eq!(show_message(&msg, &info, &settings), expected);
     }
 
+    /// A message from TEST_USER2 whose body names TEST_USER1, optionally as a real mention.
+    fn mock_message_naming_user1(mention: bool) -> Message {
+        let content = RoomMessageEventContent::text_plain("Ada Lovelace let me know what you need");
+        let mut msg = mock_room1_message(content, TEST_USER2.clone(), MSG2_KEY.clone());
+
+        if mention {
+            if let MessageEvent::Original(ev) = &mut msg.event {
+                let mut mentions = Mentions::new();
+                mentions.user_ids.insert(TEST_USER1.clone());
+                ev.content.mentions = Some(mentions);
+            }
+        }
+
+        msg
+    }
+
     #[test]
-    fn test_messages_are_separated_by_a_newline() {
+    fn test_a_mentioned_name_is_marked_with_an_at_sign() {
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER1.clone(), Some("Ada Lovelace".into()));
+
+        let text = show_message(&mock_message_naming_user1(true), &info, &mock_settings());
+
+        assert!(text.contains("@Ada Lovelace let me know"), "got: {text}");
+    }
+
+    #[test]
+    fn test_a_name_that_is_only_talked_about_is_left_alone() {
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER1.clone(), Some("Ada Lovelace".into()));
+
+        let text = show_message(&mock_message_naming_user1(false), &info, &mock_settings());
+
+        assert!(!text.contains("@Ada"), "got: {text}");
+    }
+
+    #[test]
+    fn test_messages_are_separated_by_a_blank_line() {
         let info = mock_room();
         let settings = mock_settings();
         let msgs = [mock_message2(), mock_message4()];
 
         let text = show_messages(msgs.iter(), &info, &settings);
         let expected = format!(
-            "[{}] @user2:example.com: helium\n[{}] @user1:example.com: help",
+            "[{}] @user2:example.com: helium\n\n[{}] @user1:example.com: help",
             expected_time(1),
             expected_time(2)
         );

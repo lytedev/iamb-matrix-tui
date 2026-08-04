@@ -1845,7 +1845,9 @@ mod tests {
             .unwrap();
 
         let text = yanked(&mut store);
-        let bodies: Vec<_> = text.lines().filter(|l| !l.starts_with('[')).collect();
+        // Blank lines are the separator between messages, so they are not body lines.
+        let bodies: Vec<_> =
+            text.lines().filter(|l| !l.starts_with('[') && !l.is_empty()).collect();
         assert_eq!(bodies, vec!["this", "is", "a", "multiline", "message"]);
         assert_eq!(text.matches('[').count(), 3);
         assert!(text.ends_with("@user2:example.com: character\n"));
