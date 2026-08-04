@@ -573,9 +573,6 @@ pub enum IambAction {
 
     /// Put the receipts moved by the most recent read operation back where they were.
     UndoRead,
-
-    /// Show what is deferred and when each entry comes back.
-    ShowSnoozed,
 }
 
 impl IambAction {
@@ -621,7 +618,6 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Track,
             IambAction::ClearUnreads => SequenceStatus::Break,
             IambAction::UndoRead => SequenceStatus::Break,
-            IambAction::ShowSnoozed => SequenceStatus::Break,
             IambAction::Homeserver(..) => SequenceStatus::Break,
             IambAction::Keys(..) => SequenceStatus::Break,
             IambAction::Message(..) => SequenceStatus::Break,
@@ -640,7 +636,6 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Atom,
             IambAction::ClearUnreads => SequenceStatus::Atom,
             IambAction::UndoRead => SequenceStatus::Atom,
-            IambAction::ShowSnoozed => SequenceStatus::Atom,
             IambAction::Homeserver(..) => SequenceStatus::Atom,
             IambAction::Keys(..) => SequenceStatus::Atom,
             IambAction::Message(..) => SequenceStatus::Atom,
@@ -659,7 +654,6 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => SequenceStatus::Ignore,
             IambAction::ClearUnreads => SequenceStatus::Ignore,
             IambAction::UndoRead => SequenceStatus::Ignore,
-            IambAction::ShowSnoozed => SequenceStatus::Ignore,
             IambAction::Homeserver(..) => SequenceStatus::Ignore,
             IambAction::Keys(..) => SequenceStatus::Ignore,
             IambAction::Message(..) => SequenceStatus::Ignore,
@@ -678,7 +672,6 @@ impl ApplicationAction for IambAction {
             IambAction::AcceptCompletion => false,
             IambAction::ClearUnreads => false,
             IambAction::UndoRead => false,
-            IambAction::ShowSnoozed => false,
             IambAction::Homeserver(..) => false,
             IambAction::Message(..) => false,
             IambAction::Space(..) => false,
@@ -1211,7 +1204,7 @@ impl RoomInfo {
     }
 
     /// A short, single-line preview of the message that started a thread.
-    fn thread_preview(&self, root: &EventId) -> String {
+    pub fn thread_preview(&self, root: &EventId) -> String {
         let Some(msg) = self.get_event(root) else {
             return String::from(THREAD_PREVIEW_UNAVAILABLE);
         };
@@ -2301,6 +2294,9 @@ pub enum IambId {
     /// The `:threads` window.
     ThreadList,
 
+    /// The `:snoozed` window.
+    SnoozeList,
+
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
 
@@ -2331,6 +2327,7 @@ impl Display for IambId {
             IambId::ChatList => f.write_str("iamb://chats"),
             IambId::UnreadList => f.write_str("iamb://unreads"),
             IambId::ThreadList => f.write_str("iamb://threads"),
+            IambId::SnoozeList => f.write_str("iamb://snoozed"),
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
             IambId::CommandPalette => f.write_str("iamb://commands"),
             IambId::QuickSwitcher => f.write_str("iamb://switch"),
@@ -2479,6 +2476,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::ThreadList)
             },
+            Some("snoozed") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://snoozed takes no path"));
+                }
+
+                Ok(IambId::SnoozeList)
+            },
             Some("unreads-and-threads") => {
                 if url.path() != "" {
                     return Err(E::custom("iamb://unreads-and-threads takes no path"));
@@ -2574,6 +2578,9 @@ pub enum IambBufferId {
     /// The `:threads` window.
     ThreadList,
 
+    /// The `:snoozed` window.
+    SnoozeList,
+
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
 
@@ -2605,6 +2612,7 @@ impl IambBufferId {
             IambBufferId::ChatList => IambId::ChatList,
             IambBufferId::UnreadList => IambId::UnreadList,
             IambBufferId::ThreadList => IambId::ThreadList,
+            IambBufferId::SnoozeList => IambId::SnoozeList,
             IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
             IambBufferId::CommandPaletteList => IambId::CommandPalette,
             IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
@@ -2655,6 +2663,7 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::VerifyList => vec![],
             IambBufferId::Welcome => vec![],
             IambBufferId::ChatList => vec![],
+            IambBufferId::SnoozeList => vec![],
             IambBufferId::UnreadList => vec![],
             IambBufferId::ThreadList => vec![],
             IambBufferId::UnreadThreadList => vec![],

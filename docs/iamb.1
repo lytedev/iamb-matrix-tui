@@ -171,7 +171,12 @@ a thread always wins, whether it is sooner or later.
 Wake times are stored in room account data, so they survive a restart and reach
 your other clients.
 .It Sy ":snoozed"
-List what is deferred and when each entry comes back.
+Open a list of what is deferred, soonest first, with the time each entry comes
+back.
+.Sy ":unsnooze"
+cancels the snooze on the selected entry, which then returns to
+.Sy ":unreadsandthreads" .
+Selecting an entry opens the room or the thread without cancelling anything.
 .It Sy ":unsnooze"
 Cancel the snooze on the focused room, the thread being viewed, or the selected
 list entry.

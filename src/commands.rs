@@ -378,8 +378,8 @@ fn iamb_snoozed(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
         return Result::Err(CommandError::InvalidArgument);
     }
 
-    let act = IambAction::ShowSnoozed;
-    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+    let open = ctx.switch(OpenTarget::Application(IambId::SnoozeList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
 
     return Ok(step);
 }
@@ -1035,7 +1035,10 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "snoozed",
         aliases: &[],
         f: iamb_snoozed,
-        forms: &[bare("List what is deferred and when each entry comes back")],
+        forms: &[opens(
+            "List what is deferred and when each entry comes back",
+            IambId::SnoozeList,
+        )],
     },
     IambCommandInfo {
         name: "unsnooze",

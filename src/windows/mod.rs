@@ -59,7 +59,7 @@ use modalkit_ratatui::{
     WindowOps,
 };
 
-use crate::snooze::{SnoozeKey, WakeTime};
+use crate::snooze::{describe, SnoozeKey, WakeTime};
 use crate::base::{
     ChatStore,
     IambBufferId,
@@ -457,6 +457,7 @@ macro_rules! delegate {
             IambWindow::ChatList($id) => $e,
             IambWindow::UnreadList($id) => $e,
             IambWindow::ThreadList($id) => $e,
+            IambWindow::SnoozeList($id) => $e,
             IambWindow::UnreadThreadList($id) => $e,
             IambWindow::CommandPalette($id) => $e,
             IambWindow::QuickSwitcher($id) => $e,
@@ -475,6 +476,7 @@ pub enum IambWindow {
     ChatList(ChatListState),
     UnreadList(UnreadListState),
     ThreadList(ThreadListState),
+    SnoozeList(SnoozeListState),
     UnreadThreadList(UnreadThreadListState),
     CommandPalette(CommandPaletteState),
     QuickSwitcher(QuickSwitcherState),
@@ -570,6 +572,7 @@ impl IambWindow {
                     snooze_selection(l, &act, store)?
                 },
                 IambWindow::ThreadList(l) => snooze_selection(l, &act, store)?,
+                IambWindow::SnoozeList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::UnreadThreadList(l) => snooze_selection(l, &act, store)?,
                 _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
             }
@@ -600,6 +603,7 @@ pub type RoomListState = ListState<RoomItem, IambInfo>;
 pub type ChatListState = ListState<GenericChatItem, IambInfo>;
 pub type UnreadListState = ListState<GenericChatItem, IambInfo>;
 pub type ThreadListState = ListState<ThreadItem, IambInfo>;
+pub type SnoozeListState = ListState<SnoozeItem, IambInfo>;
 pub type UnreadThreadListState = ListState<UnreadThreadItem, IambInfo>;
 pub type SpaceListState = ListState<SpaceItem, IambInfo>;
 pub type VerifyListState = ListState<VerifyItem, IambInfo>;
@@ -816,6 +820,11 @@ impl IambWindow {
 
                 sorted!(state, items, chats);
             },
+            IambWindow::SnoozeList(state) => {
+                // Already ordered soonest first by snoozed_items, and that order is the useful
+                // one here, so the room sort is not applied.
+                state.set(snoozed_items(store));
+            },
             IambWindow::UnreadThreadList(state) => {
                 let mut items = chat_items(store)
                     .into_iter()
@@ -908,6 +917,11 @@ impl WindowOps<IambInfo> for IambWindow {
 
                 render_list(state, empty, area, buf, focused, store)
             },
+            IambWindow::SnoozeList(state) => {
+                let empty = "Nothing is snoozed";
+
+                render_list(state, empty, area, buf, focused, store)
+            },
             IambWindow::UnreadThreadList(state) => {
                 let empty = "You do not have any unread rooms or threads yet";
 
@@ -941,6 +955,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::ChatList(w) => w.dup(store).into(),
             IambWindow::UnreadList(w) => w.dup(store).into(),
             IambWindow::ThreadList(w) => IambWindow::ThreadList(w.dup(store)),
+            IambWindow::SnoozeList(w) => IambWindow::SnoozeList(w.dup(store)),
             IambWindow::UnreadThreadList(w) => IambWindow::UnreadThreadList(w.dup(store)),
         }
     }
@@ -1028,6 +1043,11 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
 
             Ok(IambWindow::ThreadList(list))
         },
+        IambId::SnoozeList => {
+            let list = SnoozeListState::new(IambBufferId::SnoozeList, vec![]);
+
+            Ok(IambWindow::SnoozeList(list))
+        },
         IambId::CommandPalette => {
             let win = CommandPaletteState::new(store);
 
@@ -1059,6 +1079,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => IambId::ChatList,
             IambWindow::UnreadList(_) => IambId::UnreadList,
             IambWindow::ThreadList(_) => IambId::ThreadList,
+            IambWindow::SnoozeList(_) => IambId::SnoozeList,
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
             IambWindow::CommandPalette(_) => IambId::CommandPalette,
             IambWindow::QuickSwitcher(_) => IambId::QuickSwitcher,
@@ -1075,6 +1096,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
+            IambWindow::SnoozeList(_) => bold_spans("Snoozed"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
@@ -1107,6 +1129,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
             IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
             IambWindow::ThreadList(_) => bold_spans("Threads"),
+            IambWindow::SnoozeList(_) => bold_spans("Snoozed"),
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
@@ -1338,6 +1361,129 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for ThreadItem {
     ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
         thread_prompt(self.room_id(), &self.thread_root, act, ctx)
     }
+}
+
+/// An entry in the `:snoozed` window: one deferred room or thread, and when it returns.
+#[derive(Clone)]
+pub struct SnoozeItem {
+    room_id: OwnedRoomId,
+    room_name: String,
+    thread: Option<OwnedEventId>,
+    /// A word describing the thread, so that two threads in one room are distinguishable.
+    preview: String,
+    wake_at: WakeTime,
+}
+
+impl SnoozeItem {
+    fn name(&self) -> &str {
+        match &self.thread {
+            None => self.room_name.as_str(),
+            Some(_) => self.preview.as_str(),
+        }
+    }
+}
+
+impl Display for SnoozeItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+impl ListItem<IambInfo> for SnoozeItem {
+    fn show(
+        &self,
+        selected: bool,
+        _: &ViewportContext<ListCursor>,
+        _: &mut ProgramStore,
+    ) -> Text<'_> {
+        let style = selected_style(selected);
+        let mut spans = vec![Span::styled(self.name().to_string(), style)];
+        let mut labels = vec![];
+
+        if self.thread.is_some() {
+            labels.push(vec![
+                Span::styled("Thread in ", style),
+                Span::styled(self.room_name.as_str(), style),
+            ]);
+        }
+
+        // The wake time is the reason this window exists, so it is always shown.
+        labels.push(vec![
+            Span::styled("Until ", style),
+            Span::styled(describe(self.wake_at), style),
+        ]);
+
+        append_tags(labels, &mut spans, style);
+        Text::from(Line::from(spans))
+    }
+
+    fn get_word(&self) -> Option<String> {
+        self.room_id.to_string().into()
+    }
+}
+
+impl Readable for SnoozeItem {
+    fn read_target(&self) -> ReadTarget {
+        ReadTarget {
+            room_id: self.room_id.clone(),
+            thread: self.thread.clone(),
+        }
+    }
+}
+
+impl Promptable<ProgramContext, ProgramStore, IambInfo> for SnoozeItem {
+    fn prompt(
+        &mut self,
+        act: &PromptAction,
+        ctx: &ProgramContext,
+        _: &mut ProgramStore,
+    ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
+        // Opening an entry goes where the entry points, which is the room or the thread. A snooze
+        // does not have to be cancelled to look at what is waiting.
+        match &self.thread {
+            None => room_prompt(&self.room_id, act, ctx),
+            Some(root) => thread_prompt(&self.room_id, root, act, ctx),
+        }
+    }
+}
+
+/// The rooms and threads that are deferred right now.
+///
+/// Expired entries are left out, because they are already back in the inbox.
+fn snoozed_items(store: &mut ProgramStore) -> Vec<SnoozeItem> {
+    let now = store.application.now_ms();
+    let ChatStore { rooms, snooze, .. } = &mut store.application;
+
+    let mut items = snooze
+        .entries()
+        .filter(|(_, wake_at)| **wake_at > now)
+        .map(|(key, wake_at)| (key.clone(), *wake_at))
+        .collect::<Vec<_>>();
+
+    // Soonest first, so the next thing to come back is at the top.
+    items.sort_by_key(|(_, wake_at)| *wake_at);
+
+    items
+        .into_iter()
+        .map(|(key, wake_at)| {
+            let info = rooms.get_or_default(key.room_id.clone());
+            let room_name = info.name.clone().unwrap_or_else(|| key.room_id.to_string());
+            let preview = match &key.thread {
+                None => String::new(),
+                // The same preview the :threads window shows, so one thread reads the same in
+                // both places.
+                Some(root) => info.thread_preview(root),
+            };
+
+            SnoozeItem {
+                room_id: key.room_id,
+                room_name,
+                thread: key.thread,
+                preview,
+                wake_at,
+            }
+        })
+        .collect()
 }
 
 /// An entry in the `:unreads-and-threads` window, which intermixes rooms and threads.

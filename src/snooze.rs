@@ -486,6 +486,35 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unsnoozed_entry_leaves_the_snoozed_list_and_returns_to_the_inbox() {
+        let room = room_id!("!a:example.com").to_owned();
+        let mut s = store();
+
+        s.set(SnoozeKey::room(room.clone()), NOW + HOUR);
+        assert!(s.is_deferred(&room, None, NOW));
+
+        s.clear(&SnoozeKey::room(room.clone()));
+
+        // Nothing left to list, and the entry is no longer hidden from the inbox.
+        assert_eq!(s.entries().count(), 0);
+        assert!(!s.is_deferred(&room, None, NOW));
+    }
+
+    #[test]
+    fn test_unsnoozing_a_thread_leaves_its_room_snoozed() {
+        let room = room_id!("!a:example.com").to_owned();
+        let thread = event_id!("$t:example.com").to_owned();
+        let mut s = store();
+
+        s.set(SnoozeKey::room(room.clone()), NOW + 10 * HOUR);
+        s.set(SnoozeKey::thread(room.clone(), thread.clone()), NOW + HOUR);
+        s.clear(&SnoozeKey::thread(room.clone(), thread.clone()));
+
+        // The thread falls back to its room rather than waking, which is what the floor means.
+        assert_eq!(s.wake_at(&room, Some(&thread)), Some(NOW + 10 * HOUR));
+    }
+
+    #[test]
     fn test_relative_durations_are_read() {
         assert_eq!(parse_when("30m", NOW, 9), Ok(NOW + 30 * MINUTE));
         assert_eq!(parse_when("2h", NOW, 9), Ok(NOW + 2 * HOUR));
