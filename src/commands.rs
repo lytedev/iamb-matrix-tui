@@ -107,22 +107,35 @@ fn iamb_invite(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 }
 
 fn iamb_keys(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let text = desc.arg.text.trim();
+
+    // `recover` takes the rest of the line, not a list of words. A recovery key is base58 written
+    // in space-separated groups, so splitting it on whitespace would throw most of it away.
+    if let Some(key) = text.strip_prefix("recover") {
+        let key = key.trim();
+
+        if key.is_empty() {
+            return Err(CommandError::InvalidArgument);
+        }
+
+        let vact = IambAction::Keys(KeysAction::Recover(key.to_string()));
+
+        return Ok(CommandStep::Continue(vact.into(), ctx.context.clone()));
+    }
+
     let mut args = desc.arg.strings()?;
 
-    // `recover` takes one argument where the others take two, because a recovery key names no file
-    // and needs no passphrase of its own.
-    let act = match args.first().map(String::as_str) {
-        Some("recover") if args.len() == 2 => KeysAction::Recover(args.remove(1)),
-        Some("export") | Some("import") if args.len() == 3 => {
-            let act = args.remove(0);
-            let path = args.remove(0);
-            let passphrase = args.remove(0);
+    if args.len() != 3 {
+        return Err(CommandError::InvalidArgument);
+    }
 
-            match act.as_str() {
-                "export" => KeysAction::Export(path, passphrase),
-                _ => KeysAction::Import(path, passphrase),
-            }
-        },
+    let act = args.remove(0);
+    let path = args.remove(0);
+    let passphrase = args.remove(0);
+
+    let act = match act.as_str() {
+        "export" => KeysAction::Export(path, passphrase),
+        "import" => KeysAction::Import(path, passphrase),
         _ => return Err(CommandError::InvalidArgument),
     };
 
@@ -1958,15 +1971,18 @@ mod tests {
         let act = IambAction::Keys(KeysAction::Export("/a/b/c".into(), "pword".into()));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
-        let res = cmds.input_cmd("keys recover my-recovery-key", ctx.clone()).unwrap();
-        let act = IambAction::Keys(KeysAction::Recover("my-recovery-key".into()));
+        // A real recovery key is base58 in space-separated groups, so the whole line is the key.
+        let key = "EsTc 3Zqf 8VkG 9mNb Xq7R 2wYs 5tLp 1dHj 4KvA 6nCe 7fUx 0BgM";
+        let res = cmds.input_cmd(&format!("keys recover {key}"), ctx.clone()).unwrap();
+        let act = IambAction::Keys(KeysAction::Recover(key.into()));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        // A key written without the grouping spaces works too.
+        let res = cmds.input_cmd("keys recover EsTc3Zqf8VkG", ctx.clone()).unwrap();
+        let act = IambAction::Keys(KeysAction::Recover("EsTc3Zqf8VkG".into()));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         // Invalid invocations.
-        // A recovery key is one argument. Two belong to export and import.
-        let res = cmds.input_cmd("keys recover a b", ctx.clone());
-        assert_eq!(res, Err(CommandError::InvalidArgument));
-
         let res = cmds.input_cmd("keys recover", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
 
