@@ -800,13 +800,25 @@ impl Application {
                 //
                 // The key is used once and not stored here. What it unlocks goes to the crypto
                 // store.
-                encryption
-                    .recovery()
-                    .recover(&recovery_key)
-                    .await
-                    .map_err(IambError::from)?;
+                //
+                // Run in the background. This talks to the homeserver and then downloads every key
+                // in the backup, which took about twenty seconds on a real account. Awaiting it
+                // here would freeze the interface for that whole time, because this loop draws the
+                // screen.
+                let reports = store.application.reports.clone();
 
-                Ok(Some("Unlocked the key backup".into()))
+                tokio::spawn(async move {
+                    let report = match encryption.recovery().recover(&recovery_key).await {
+                        Ok(()) => BackgroundReport::Info("Unlocked the key backup".into()),
+                        Err(e) => {
+                            BackgroundReport::Error(format!("Failed to unlock the key backup: {e}"))
+                        },
+                    };
+
+                    let _ = reports.send(report);
+                });
+
+                Ok(Some("Unlocking the key backup...".into()))
             },
             KeysAction::Import(path, passphrase) => {
                 let res = encryption
