@@ -46,6 +46,7 @@ use modalkit::prelude::*;
 use modalkit::{editing::completion::CompletionList, keybindings::dialog::PromptYesNo};
 use modalkit_ratatui::{TermOffset, TerminalCursor, WindowOps};
 
+use crate::snooze::SnoozeKey;
 use crate::base::{
     IambAction,
     IambError,
@@ -292,6 +293,30 @@ impl RoomState {
 
                 // Any notification we showed for this room is now stale.
                 store.application.open_notifications.remove(&room_id);
+
+                Ok(vec![])
+            },
+            RoomAction::Snooze(when) => {
+                let room_id = self.id().to_owned();
+                let thread = self.thread().cloned();
+                let wake_at = store.application.parse_snooze(&when)?;
+
+                store.application.snooze.set(SnoozeKey { room_id: room_id.clone(), thread }, wake_at);
+                store.application.snooze_dirty.insert(room_id);
+
+                Ok(vec![])
+            },
+            RoomAction::Unsnooze => {
+                let room_id = self.id().to_owned();
+                let thread = self.thread().cloned();
+
+                let key = SnoozeKey { room_id: room_id.clone(), thread };
+
+                if !store.application.snooze.clear(&key) {
+                    return Err(IambError::NotSnoozed.into());
+                }
+
+                store.application.snooze_dirty.insert(room_id);
 
                 Ok(vec![])
             },

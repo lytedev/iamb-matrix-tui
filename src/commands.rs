@@ -368,6 +368,37 @@ fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_snooze(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    // The whole argument is the duration, so it is taken verbatim rather than split. That keeps
+    // room for a phrase such as "next week" later without changing the command.
+    let act = IambAction::Room(RoomAction::Snooze(desc.arg.text.trim().to_string()));
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_unsnooze(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = IambAction::Room(RoomAction::Unsnooze);
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_snoozed(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::SnoozeList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_undoread(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -1005,6 +1036,30 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_react,
         forms: &[form("<shortcode>", "React to the selected message with an emoji")],
+    },
+    IambCommandInfo {
+        name: "snooze",
+        aliases: &[],
+        f: iamb_snooze,
+        forms: &[
+            bare("Defer the focused room, thread, or selected list entry for the default time"),
+            form("<duration>", "Defer it for 30m, 2h, 3d, 1w, or until tomorrow"),
+        ],
+    },
+    IambCommandInfo {
+        name: "snoozed",
+        aliases: &[],
+        f: iamb_snoozed,
+        forms: &[opens(
+            "List what is deferred and when each entry comes back",
+            IambId::SnoozeList,
+        )],
+    },
+    IambCommandInfo {
+        name: "unsnooze",
+        aliases: &[],
+        f: iamb_unsnooze,
+        forms: &[bare("Cancel the snooze on the focused room, thread, or selected list entry")],
     },
     IambCommandInfo {
         name: "read",

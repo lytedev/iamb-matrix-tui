@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gethostname::gethostname;
 use matrix_sdk::ruma::events::sticker::StickerEventContent;
+use matrix_sdk::ruma::events::RoomAccountDataEventType;
+
+use crate::snooze::{SnoozeContent, SNOOZE_EVENT_TYPE};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -233,6 +236,96 @@ async fn load_thread_receipts(client: &Client, store: &AsyncProgramStore, room_i
     }
 }
 
+/// Read one room's wake times from its account data.
+///
+/// The server holds this, so a snooze survives a restart, survives a cache wipe, and reaches the
+/// user's other machines. That is why account data was chosen over a local file: this fork is
+/// pinned into a NixOS configuration and rebuilt often, so a wipe is a real event.
+async fn load_snooze(client: &Client, store: &AsyncProgramStore, room_id: &RoomId) {
+    let Some(room) = client.get_room(room_id) else {
+        return;
+    };
+
+    let event_type = RoomAccountDataEventType::from(SNOOZE_EVENT_TYPE);
+
+    let raw = match room.account_data(event_type).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(?room_id, "failed to read snooze account data: {e}");
+            return;
+        },
+    };
+
+    // The content sits under "content", as it does for every account data event.
+    let content = match raw.get_field::<SnoozeContent>("content") {
+        Ok(Some(content)) => content,
+        Ok(None) => return,
+        Err(e) => {
+            // A malformed event must not stop the room from loading. The worst outcome is that a
+            // snooze is forgotten, which returns the entry to the inbox.
+            tracing::warn!(?room_id, "ignoring unreadable snooze account data: {e}");
+            return;
+        },
+    };
+
+    let mut locked = store.lock().await;
+    let now = locked.application.now_ms();
+
+    locked.application.snooze.load_room(&room_id.to_owned(), content, now);
+}
+
+/// Write one room's wake times back to its account data.
+///
+/// Called after a change rather than on a timer, so that a snooze reaches the other machines
+/// immediately.
+pub async fn save_snooze(client: &Client, store: &AsyncProgramStore, room_id: &RoomId) {
+    let Some(room) = client.get_room(room_id) else {
+        return;
+    };
+
+    let content = {
+        let locked = store.lock().await;
+        let now = locked.application.now_ms();
+
+        locked.application.snooze.room_content(&room_id.to_owned(), now)
+    };
+
+    // An empty event is written rather than removed, because the Matrix API cannot delete room
+    // account data.
+    let raw = match Raw::new(&content) {
+        Ok(raw) => raw.cast_unchecked(),
+        Err(e) => {
+            tracing::warn!(?room_id, "failed to encode snooze account data: {e}");
+            return;
+        },
+    };
+
+    let event_type = RoomAccountDataEventType::from(SNOOZE_EVENT_TYPE);
+
+    if let Err(e) = room.set_account_data_raw(event_type, raw).await {
+        // Reported and not retried. The in-memory wake time still works for this session, so the
+        // snooze holds until the client restarts.
+        tracing::warn!(?room_id, "failed to save snooze account data: {e}");
+    }
+}
+
+/// Write out every room whose snooze changed since the last pass.
+///
+/// The queue is drained under the lock and the writes happen outside it, so a slow homeserver
+/// cannot block the interface.
+async fn flush_snoozes(client: &Client, store: &AsyncProgramStore) {
+    let dirty = {
+        let mut locked = store.lock().await;
+
+        std::mem::take(&mut locked.application.snooze_dirty)
+    };
+
+    for room_id in dirty {
+        save_snooze(client, store, &room_id).await;
+    }
+}
+
 #[derive(Debug)]
 enum Plan {
     Messages(OwnedRoomId, Option<String>, Vec<MessageNeed>),
@@ -283,6 +376,7 @@ async fn run_plan(client: &Client, store: &AsyncProgramStore, plan: Plan, permit
                 load_insert(room_id.clone(), res, locked.deref_mut(), store_clone, message_need);
             }
             load_thread_receipts(&client, store, &room_id).await;
+            load_snooze(&client, store, &room_id).await;
         },
         Plan::Members(room_id) => {
             let res = members_load(client, &room_id).await;
@@ -519,6 +613,7 @@ async fn refresh_rooms_forever(client: &Client, store: &AsyncProgramStore) {
 
     loop {
         refresh_rooms(client, store).await;
+        flush_snoozes(client, store).await;
         interval.tick().await;
     }
 }

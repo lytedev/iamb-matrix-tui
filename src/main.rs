@@ -79,6 +79,7 @@ mod message;
 mod notifications;
 mod preview;
 mod sled_export;
+mod snooze;
 mod util;
 mod windows;
 mod worker;
