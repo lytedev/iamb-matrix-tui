@@ -28,6 +28,7 @@ use serde::{
     Serialize,
     Serializer,
 };
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
@@ -167,6 +168,11 @@ pub enum MessageAction {
     ///
     /// The [bool] argument indicates whether to skip confirmation.
     Redact(Option<String>, bool),
+
+    /// Send the selected messages to a shell command on its standard input.
+    ///
+    /// The [String] argument is the command as the user wrote it.
+    Pipe(String),
 
     /// Reply to a message.
     Reply,
@@ -2015,6 +2021,26 @@ pub struct ChatStore {
     /// recent click is kept: when several notifications are clicked in quick succession, the user
     /// only ends up looking at one of them anyway.
     pub notification_jump: Option<NotificationJump>,
+
+    /// Where background tasks leave what they want to tell the user.
+    ///
+    /// A task started by `:pipe` outlives the command that started it, and cannot reach the
+    /// screen itself, so it sends its result here instead. The main loop drains the other end on
+    /// its next pass.
+    pub reports: UnboundedSender<BackgroundReport>,
+
+    /// The receiving end of [ChatStore::reports].
+    reports_rx: UnboundedReceiver<BackgroundReport>,
+}
+
+/// Something a background task wants to show the user.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackgroundReport {
+    /// A task finished, and has something worth saying.
+    Info(String),
+
+    /// A task failed.
+    Error(String),
 }
 
 /// Where a clicked desktop notification takes the user.
@@ -2056,8 +2082,11 @@ impl ChatStore {
     /// Create a new [ChatStore].
     pub fn new(worker: Requester, settings: ApplicationSettings) -> Self {
         let picker = picker_from_settings(&settings);
+        let (reports, reports_rx) = unbounded_channel();
 
         ChatStore {
+            reports,
+            reports_rx,
             worker,
             settings,
             picker,
@@ -2077,6 +2106,17 @@ impl ChatStore {
             read_undos: Default::default(),
             notification_jump: None,
         }
+    }
+
+    /// Take everything that background tasks have left for the user.
+    pub fn take_reports(&mut self) -> Vec<BackgroundReport> {
+        let mut reports = vec![];
+
+        while let Ok(report) = self.reports_rx.try_recv() {
+            reports.push(report);
+        }
+
+        reports
     }
 
     /// Snapshot the receipts in `room_ids`, run `apply`, and record what moved for `:undoread`.

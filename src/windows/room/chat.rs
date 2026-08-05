@@ -9,8 +9,10 @@ use chrono::Local;
 use edit::edit_with_builder as external_edit;
 use edit::Builder;
 use modalkit::editing::store::{RegisterError, RegisterStore};
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use tokio;
+use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
 use matrix_sdk::{
@@ -72,6 +74,7 @@ use modalkit::errors::{EditError, EditResult, UIError};
 use modalkit::prelude::*;
 
 use crate::base::{
+    BackgroundReport,
     DownloadFlags,
     IambAction,
     IambBufferId,
@@ -313,12 +316,40 @@ impl ChatState {
         }
     }
 
+    /// Send the selected messages to a shell command on its standard input.
+    ///
+    /// The child is never waited for here. The main loop is synchronous, so a wait in it would
+    /// freeze the whole client until the child decided to exit. The write and the wait both
+    /// happen on a blocking task, and the result comes back through the report channel.
+    fn pipe_selection(&self, cmd: String, store: &mut ProgramStore) -> IambResult<EditInfo> {
+        let text = {
+            let settings = &store.application.settings;
+            let info = store.application.rooms.get_or_default(self.room_id.clone());
+
+            self.scrollback
+                .selected_text(info, settings)
+                .ok_or(IambError::NoSelectedMessage)?
+        };
+
+        let shell = std::env::var(SHELL_VAR).unwrap_or_else(|_| DEFAULT_SHELL.to_owned());
+
+        spawn_pipe(&shell, cmd, text, store.application.reports.clone())?;
+
+        Ok(None)
+    }
+
     pub async fn message_command(
         &mut self,
         act: MessageAction,
         _: ProgramContext,
         store: &mut ProgramStore,
     ) -> IambResult<EditInfo> {
+        // Piping works on the whole selection, so it runs before the lookup of the one message
+        // that every other message action needs.
+        if let MessageAction::Pipe(cmd) = act {
+            return self.pipe_selection(cmd, store);
+        }
+
         let client = &store.application.worker.client;
 
         let settings = &store.application.settings;
@@ -582,6 +613,12 @@ impl ChatState {
                 let _ = room.redact(event_id, reason, None).await.map_err(IambError::from)?;
 
                 Ok(None)
+            },
+            MessageAction::Pipe(_) => {
+                // Piping is handled at the top of this function, before the selected message is
+                // looked up, because it works on the whole selection.
+                let msg = "Cannot pipe from here";
+                Err(UIError::Failure(msg.into()))
             },
             MessageAction::Reply => {
                 self.reply_to = self.scrollback.get_key(info);
@@ -1213,6 +1250,84 @@ impl StatefulWidget for Chat<'_> {
     }
 }
 
+/// The environment variable that names the shell a `:pipe` command runs in.
+const SHELL_VAR: &str = "SHELL";
+
+/// The shell that runs a `:pipe` command when the environment names none.
+const DEFAULT_SHELL: &str = "/bin/sh";
+
+/// Start `cmd`, write `text` to its standard input, and report how it ended.
+///
+/// The command goes to the shell as a single argument, so that a pipeline or a redirection
+/// written by the user works. The text only ever reaches the child on its standard input: a
+/// message body is written by other people in a chat room, and must never become part of a
+/// command line.
+///
+/// Only the failure to start the shell is reported to the caller. Everything after that is
+/// reported through `reports`, because the caller must not wait for a child to exit.
+fn spawn_pipe(
+    shell: &str,
+    cmd: String,
+    text: String,
+    reports: UnboundedSender<BackgroundReport>,
+) -> IambResult<()> {
+    let child = Command::new(shell)
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) => {
+            return Err(UIError::Failure(format!("Could not run {shell}: {err}")));
+        },
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(UIError::Failure(format!("Could not write to {cmd}")));
+    };
+
+    tokio::task::spawn_blocking(move || {
+        // A command that stops reading early, such as `head`, breaks this pipe. That is the
+        // command doing its job, and not a failure worth telling the user about.
+        let _ = stdin.write_all(text.as_bytes());
+        drop(stdin);
+
+        let report = match child.wait_with_output() {
+            Err(err) => BackgroundReport::Error(format!("{cmd}: {err}")),
+            Ok(out) if out.status.success() => {
+                BackgroundReport::Info(pipe_report(&cmd, "took the selection", &out.stdout))
+            },
+            Ok(out) => {
+                let status = format!("{}", out.status);
+                BackgroundReport::Error(pipe_report(&cmd, &status, &out.stderr))
+            },
+        };
+
+        let _ = reports.send(report);
+    });
+
+    Ok(())
+}
+
+/// One status line about how a `:pipe` command ended.
+///
+/// What the command printed is shown when it printed anything, because a command such as
+/// `wc -l` says everything it has to say there. Only one line fits in the status bar, so the
+/// rest is dropped.
+fn pipe_report(cmd: &str, fallback: &str, output: &[u8]) -> String {
+    let output = String::from_utf8_lossy(output);
+    let line = output.lines().find(|line| !line.trim().is_empty());
+
+    match line {
+        Some(line) => format!("{cmd}: {line}"),
+        None => format!("{cmd}: {fallback}"),
+    }
+}
+
 fn open_command(open_command: Option<&Vec<String>>, target: OsString) -> IambResult<()> {
     if let Some(mut cmd) = open_command.and_then(cmd) {
         cmd.arg(target);
@@ -1338,6 +1453,54 @@ mod tests {
             cursor: Cursor::new(0, 2),
             start: Cursor::new(0, 0),
         }
+    }
+
+    /// Run `cmd` over `text` and wait for the report it leaves behind.
+    async fn pipe_and_wait(cmd: &str, text: &str) -> BackgroundReport {
+        let (reports, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        spawn_pipe(DEFAULT_SHELL, cmd.to_string(), text.to_string(), reports).unwrap();
+
+        rx.recv().await.expect("the pipe task always reports")
+    }
+
+    #[tokio::test]
+    async fn test_pipe_sends_the_text_on_standard_input() {
+        // "grep -q" says nothing and exits zero only if it found the text.
+        let report = pipe_and_wait("grep -q helium", "[now] Ada: helium\n").await;
+
+        assert_eq!(report, BackgroundReport::Info("grep -q helium: took the selection".into()));
+    }
+
+    #[tokio::test]
+    async fn test_pipe_reports_a_command_that_exits_non_zero() {
+        // The command reads all of its input first, so the failure is its own and not a broken
+        // pipe.
+        let report = pipe_and_wait("cat > /dev/null; exit 3", "[now] Ada: helium\n").await;
+
+        let BackgroundReport::Error(msg) = report else {
+            panic!("a non-zero exit must be an error: {:?}", report);
+        };
+
+        assert!(msg.contains("exit status: 3"), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_reports_a_command_that_does_not_exist() {
+        let report = pipe_and_wait("iamb-no-such-command", "[now] Ada: helium\n").await;
+
+        let BackgroundReport::Error(msg) = report else {
+            panic!("a missing command must be an error: {:?}", report);
+        };
+
+        assert!(msg.starts_with("iamb-no-such-command: "), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_shows_what_the_command_printed() {
+        let report = pipe_and_wait("cat", "[now] Ada: helium\n").await;
+
+        assert_eq!(report, BackgroundReport::Info("cat: [now] Ada: helium".into()));
     }
 
     #[test]

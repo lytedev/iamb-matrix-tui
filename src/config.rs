@@ -1273,12 +1273,11 @@ impl ApplicationSettings {
         user_style_from_color(self.get_user_color(user_id))
     }
 
-    pub fn get_user_span<'a>(&self, user_id: &'a UserId, info: &'a RoomInfo) -> Span<'a> {
-        let (color, name) = self.get_user_overrides(user_id);
+    /// The name to show for a user, without any style.
+    pub fn get_user_name<'a>(&self, user_id: &'a UserId, info: &'a RoomInfo) -> Cow<'a, str> {
+        let (_, name) = self.get_user_overrides(user_id);
 
-        let color = color.unwrap_or_else(|| user_color(user_id.as_str()));
-        let style = user_style_from_color(color);
-        let name = match (name, &self.tunables.username_display) {
+        match (name, &self.tunables.username_display) {
             (Some(name), _) => name,
             (None, UserDisplayStyle::Username) => Cow::Borrowed(user_id.as_str()),
             (None, UserDisplayStyle::LocalPart) => Cow::Borrowed(user_id.localpart()),
@@ -1289,7 +1288,15 @@ impl ApplicationSettings {
                     Cow::Borrowed(user_id.as_str())
                 }
             },
-        };
+        }
+    }
+
+    pub fn get_user_span<'a>(&self, user_id: &'a UserId, info: &'a RoomInfo) -> Span<'a> {
+        let (color, _) = self.get_user_overrides(user_id);
+
+        let color = color.unwrap_or_else(|| user_color(user_id.as_str()));
+        let style = user_style_from_color(color);
+        let name = self.get_user_name(user_id, info);
 
         Span::styled(name, style)
     }

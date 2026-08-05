@@ -138,6 +138,12 @@ pub struct ScrollbackState {
 
     /// A message that should be selected as soon as it has been loaded.
     pending_selection: Option<PendingSelection>,
+
+    /// Where a visual selection started.
+    ///
+    /// The selection covers every message between this message and the cursor. It is `None`
+    /// whenever the user is not in visual mode.
+    selection_anchor: Option<MessageCursor>,
 }
 
 /// A message that was asked for before it was loaded, to be selected once it arrives.
@@ -173,6 +179,7 @@ impl ScrollbackState {
             jumped,
             show_full_on_redraw,
             pending_selection: None,
+            selection_anchor: None,
         }
     }
 
@@ -450,6 +457,57 @@ impl ScrollbackState {
         EditRange::inclusive(self.cursor.clone(), cursor, TargetShape::LineWise)
     }
 
+    /// Start or end a visual selection to match the mode the user is in.
+    ///
+    /// Visual mode is the only mode that sets a target shape, so the shape says whether a
+    /// selection is running. Leaving visual mode sends no action to the scrollback, so the end of
+    /// a selection can only be seen on the action that follows it.
+    ///
+    /// The anchor holds a resolved key rather than the cursor itself, because the cursor of an
+    /// unscrolled scrollback names no message yet.
+    fn track_selection(&mut self, key: &MessageKey, ctx: &ProgramContext) {
+        if ctx.get_target_shape().is_none() {
+            self.selection_anchor = None;
+        } else if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(key.clone().into());
+        }
+    }
+
+    /// The messages covered by the visual selection, or only the message under the cursor.
+    fn selection_range(&self, key: MessageKey) -> EditRange<MessageCursor> {
+        match &self.selection_anchor {
+            Some(anchor) => {
+                EditRange::inclusive(anchor.clone(), key.into(), TargetShape::LineWise)
+            },
+            None => self._range_to(key.into()),
+        }
+    }
+
+    /// The rendered text of the visual selection, or of the message under the cursor.
+    ///
+    /// This is the text that a yank puts into a register, so that `:pipe` and `y` cannot drift
+    /// apart. It is `None` when the scrollback holds no message to take.
+    pub fn selected_text(&self, info: &RoomInfo, settings: &ApplicationSettings) -> Option<String> {
+        let thread = self.get_thread(info)?;
+        let key = self.cursor.to_key(thread)?.clone();
+        let range = self.selection_range(key);
+        let msgs = self.messages(range, info).map(|(_, msg)| msg);
+
+        Some(crate::message::yank::show_messages(msgs, info, settings))
+    }
+
+    /// Whether `key` is one of the messages covered by the visual selection.
+    fn selection_contains(&self, key: &MessageKey, cursor_key: &MessageKey) -> bool {
+        let Some(anchor) = self.selection_anchor.as_ref().and_then(|a| a.timestamp.as_ref()) else {
+            return false;
+        };
+
+        let (start, end) =
+            if anchor <= cursor_key { (anchor, cursor_key) } else { (cursor_key, anchor) };
+
+        start <= key && key <= end
+    }
+
     fn movement(
         &self,
         pos: MessageKey,
@@ -662,6 +720,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             jumped: self.jumped.clone(),
             show_full_on_redraw: false,
             pending_selection: self.pending_selection.clone(),
+            selection_anchor: self.selection_anchor.clone(),
         }
     }
 
@@ -708,6 +767,8 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
         let info = store.application.rooms.get_or_default(self.room_id.clone());
         let thread = self.get_thread(info).ok_or_else(no_msgs)?;
         let key = self.cursor.to_key(thread).ok_or_else(no_msgs)?.clone();
+
+        self.track_selection(&key, ctx);
 
         match operation {
             EditAction::Motion => {
@@ -791,7 +852,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
             EditAction::Yank => {
                 let range = match motion {
                     EditTarget::CurrentPosition | EditTarget::Selection => {
-                        Some(self._range_to(key.into()))
+                        Some(self.selection_range(key))
                     },
                     EditTarget::Boundary(rt, inc, term, count) => {
                         self.range(key, rt, *inc, count, ctx, info).map(|r| {
@@ -858,12 +919,16 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                 };
 
                 if let Some(range) = range {
-                    let mut yanked = EditRope::from("");
+                    let msgs = self.messages(range, info).map(|(_, msg)| msg);
+                    let text = crate::message::yank::show_messages(
+                        msgs,
+                        info,
+                        &store.application.settings,
+                    );
 
-                    for (_, msg) in self.messages(range, info) {
-                        yanked += EditRope::from(msg.event.body());
-                        yanked += EditRope::from('\n');
-                    }
+                    // A linewise register needs the closing newline, or a put runs the last
+                    // message into whatever follows it.
+                    let yanked = EditRope::from(text + "\n");
 
                     let cell = RegisterCell::new(TargetShape::LineWise, yanked);
                     let register = ctx.get_register().unwrap_or(Register::Unnamed);
@@ -875,6 +940,9 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
                     store.registers.put(&register, cell, flags)?;
                 }
+
+                // A yank consumes the selection, the same way it does in vim.
+                self.selection_anchor = None;
 
                 return Ok(None);
             },
@@ -926,11 +994,31 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
     fn selection_command(
         &mut self,
-        _: &SelectionAction,
+        act: &SelectionAction,
         _: &ProgramContext,
-        _: &mut ProgramStore,
+        store: &mut ProgramStore,
     ) -> EditResult<EditInfo, IambInfo> {
-        Err(EditError::Failure("Cannot perform selection actions in a list".into()))
+        match act {
+            // A message list has one selection, and it is linewise, so both of the swaps that vim
+            // offers do the same thing here: move the cursor to the other end of the selection.
+            SelectionAction::CursorSet(
+                SelectionCursorChange::SwapAnchor | SelectionCursorChange::SwapSide,
+            ) => {
+                let Some(anchor) = self.selection_anchor.take() else {
+                    return Ok(None);
+                };
+
+                let info = store.application.get_room_info(self.room_id.clone());
+                let thread = self.get_thread(info).ok_or_else(no_msgs)?;
+                let key = self.cursor.to_key(thread).ok_or_else(no_msgs)?.clone();
+
+                self.selection_anchor = Some(key.into());
+                self.cursor = anchor;
+
+                Ok(None)
+            },
+            _ => Err(EditError::Failure("Cannot perform selection actions in a list".into())),
+        }
     }
 
     fn history_command(
@@ -1416,8 +1504,12 @@ impl StatefulWidget for Scrollback<'_> {
 
         for (key, item) in thread.range(&corner_key..) {
             let sel = key == cursor_key;
+
+            // The cursor drives the scrolling, but every message in a visual selection is drawn
+            // as picked out, so that the user can see what a yank would take.
+            let picked = sel || state.selection_contains(key, cursor_key);
             let (txt, [mut msg_preview, mut reply_preview]) =
-                item.show_with_preview(prev, foc && sel, &state.viewctx, info, settings);
+                item.show_with_preview(prev, foc && picked, &state.viewctx, info, settings);
 
             let incomplete_ok = !full || !sel;
 
@@ -1669,6 +1761,138 @@ mod tests {
         // And one more becomes "latest" cursor:
         scrollback.edit(&EditAction::Motion, &next(1), &ctx, &mut store).unwrap();
         assert_eq!(scrollback.cursor, MessageCursor::latest());
+    }
+
+    /// Read back what a yank put into the unnamed register.
+    fn yanked(store: &mut ProgramStore) -> String {
+        store.registers.get(&Register::Unnamed).unwrap().value.to_string()
+    }
+
+    #[tokio::test]
+    async fn test_yank_takes_the_selected_message() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        // MSG2 is the "helium" message.
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        scrollback.edit(&EditAction::Motion, &prev(3), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
+
+        scrollback
+            .edit(&EditAction::Yank, &EditTarget::CurrentPosition, &ctx, &mut store)
+            .unwrap();
+
+        let text = yanked(&mut store);
+        assert!(text.ends_with("@user2:example.com: helium\n"));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_yank_keeps_every_line_of_a_multiline_message() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        // MSG3 is the multiline message.
+        scrollback.edit(&EditAction::Motion, &prev(3), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG3_KEY.clone().into());
+
+        scrollback
+            .edit(&EditAction::Yank, &EditTarget::CurrentPosition, &ctx, &mut store)
+            .unwrap();
+
+        let text = yanked(&mut store);
+        assert!(text.ends_with("@user2:example.com:\nthis\nis\na\nmultiline\nmessage\n"));
+    }
+
+    /// The context that visual mode gives to the scrollback: a linewise target shape.
+    fn visual_ctx() -> ProgramContext {
+        modalkit::editing::context::EditContextBuilder::default()
+            .target_shape(Some(TargetShape::LineWise))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_visual_selection_yanks_every_message_in_the_range() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+        let visual = visual_ctx();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        // Land on MSG5, the newest message.
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG5_KEY.clone().into());
+
+        // "V" starts the selection where the cursor already is.
+        scrollback
+            .edit(&EditAction::Motion, &EditTarget::CurrentPosition, &visual, &mut store)
+            .unwrap();
+        assert_eq!(scrollback.selection_anchor, Some(MSG5_KEY.clone().into()));
+
+        // Two motions upwards grow the selection to cover MSG3, MSG4 and MSG5.
+        scrollback.edit(&EditAction::Motion, &prev(2), &visual, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG3_KEY.clone().into());
+
+        scrollback
+            .edit(&EditAction::Yank, &EditTarget::Selection, &visual, &mut store)
+            .unwrap();
+
+        let text = yanked(&mut store);
+        // Blank lines are the separator between messages, so they are not body lines.
+        let bodies: Vec<_> =
+            text.lines().filter(|l| !l.starts_with('[') && !l.is_empty()).collect();
+        assert_eq!(bodies, vec!["this", "is", "a", "multiline", "message"]);
+        assert_eq!(text.matches('[').count(), 3);
+        assert!(text.ends_with("@user2:example.com: character\n"));
+
+        // The yank consumes the selection.
+        assert_eq!(scrollback.selection_anchor, None);
+    }
+
+    #[tokio::test]
+    async fn test_leaving_visual_mode_drops_the_selection() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+        let visual = visual_ctx();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        scrollback.edit(&EditAction::Motion, &prev(1), &visual, &mut store).unwrap();
+        assert!(scrollback.selection_anchor.is_some());
+
+        // No target shape means the user is back in normal mode.
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.selection_anchor, None);
+    }
+
+    #[tokio::test]
+    async fn test_swapping_the_anchor_moves_the_cursor_to_the_other_end() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+        let visual = visual_ctx();
+
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        scrollback
+            .edit(&EditAction::Motion, &EditTarget::CurrentPosition, &visual, &mut store)
+            .unwrap();
+        scrollback.edit(&EditAction::Motion, &prev(2), &visual, &mut store).unwrap();
+
+        let swap = SelectionAction::CursorSet(SelectionCursorChange::SwapAnchor);
+        scrollback.selection_command(&swap, &visual, &mut store).unwrap();
+
+        assert_eq!(scrollback.cursor, MSG5_KEY.clone().into());
+        assert_eq!(scrollback.selection_anchor, Some(MSG3_KEY.clone().into()));
     }
 
     #[tokio::test]

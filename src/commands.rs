@@ -276,6 +276,21 @@ fn iamb_redact(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_pipe(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    // The command is taken as it was written, and handed to a shell whole. Splitting it here
+    // would lose the pipelines and the redirections that make the command worth having.
+    let cmd = desc.arg.text.trim().to_string();
+
+    if cmd.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let ract = IambAction::from(MessageAction::Pipe(cmd));
+    let step = CommandStep::Continue(ract.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_reply(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -999,6 +1014,15 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
             bare("Mark the focused room, thread, or selected list entry as read"),
             form("all", "Mark every room and thread as read"),
         ],
+    },
+    IambCommandInfo {
+        name: "pipe",
+        aliases: &[],
+        f: iamb_pipe,
+        forms: &[form(
+            "<command>",
+            "Send the selected messages to a shell command on its standard input",
+        )],
     },
     IambCommandInfo {
         name: "redact",
