@@ -531,6 +531,11 @@ pub enum KeysAction {
     Export(String, String),
     /// Import room keys from a file, encrypted with a passphrase.
     Import(String, String),
+    /// Unlock the server-side key backup with a recovery key or passphrase.
+    ///
+    /// The [String] is the recovery key. It is not stored: the secrets it unlocks are kept by the
+    /// crypto store, and the key itself is needed only once per session.
+    Recover(String),
 }
 
 /// An action that the main program loop should.
@@ -759,6 +764,10 @@ pub enum IambError {
     /// A failure related to the cryptographic store.
     #[error("Cryptographic storage error: {0}")]
     CryptoStore(#[from] matrix_sdk::encryption::CryptoStoreError),
+
+    /// A failure while unlocking the server-side key backup.
+    #[error("Failed to unlock the key backup: {0}")]
+    Recovery(#[from] matrix_sdk::encryption::recovery::RecoveryError),
 
     #[error("Failed to import room keys: {0}")]
     FailedKeyImport(#[from] matrix_sdk::encryption::RoomKeyImportError),

@@ -226,6 +226,13 @@ Remove all left rooms from the internal database.
 Export and encrypt keys to
 .Pa path .
 .It Sy ":keys import [path] [passphrase]"
+Imports room keys from a file.
+.It Sy ":keys recover " Ar recovery-key
+Unlocks the server-side key backup with your recovery key, so that keys this
+client is missing download by themselves.
+Run this once for each session.
+The key is used and not stored: what it unlocks goes to the encrypted store.
+Without it a client can see that a backup exists and still cannot read it.
 Import and decrypt keys from
 .Pa path .
 .It Sy ":verify"

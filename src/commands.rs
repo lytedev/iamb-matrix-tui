@@ -109,17 +109,20 @@ fn iamb_invite(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 fn iamb_keys(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
-    if args.len() != 3 {
-        return Err(CommandError::InvalidArgument);
-    }
+    // `recover` takes one argument where the others take two, because a recovery key names no file
+    // and needs no passphrase of its own.
+    let act = match args.first().map(String::as_str) {
+        Some("recover") if args.len() == 2 => KeysAction::Recover(args.remove(1)),
+        Some("export") | Some("import") if args.len() == 3 => {
+            let act = args.remove(0);
+            let path = args.remove(0);
+            let passphrase = args.remove(0);
 
-    let act = args.remove(0);
-    let path = args.remove(0);
-    let passphrase = args.remove(0);
-
-    let act = match act.as_str() {
-        "export" => KeysAction::Export(path, passphrase),
-        "import" => KeysAction::Import(path, passphrase),
+            match act.as_str() {
+                "export" => KeysAction::Export(path, passphrase),
+                _ => KeysAction::Import(path, passphrase),
+            }
+        },
         _ => return Err(CommandError::InvalidArgument),
     };
 
@@ -1002,6 +1005,10 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         forms: &[
             form("export <path> <passphrase>", "Export and encrypt your E2EE room keys"),
             form("import <path> <passphrase>", "Import and decrypt E2EE room keys"),
+            form(
+                "recover <recovery-key>",
+                "Unlock the key backup so missing keys download by themselves",
+            ),
         ],
     },
     IambCommandInfo {
@@ -1951,7 +1958,18 @@ mod tests {
         let act = IambAction::Keys(KeysAction::Export("/a/b/c".into(), "pword".into()));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
+        let res = cmds.input_cmd("keys recover my-recovery-key", ctx.clone()).unwrap();
+        let act = IambAction::Keys(KeysAction::Recover("my-recovery-key".into()));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
         // Invalid invocations.
+        // A recovery key is one argument. Two belong to export and import.
+        let res = cmds.input_cmd("keys recover a b", ctx.clone());
+        assert_eq!(res, Err(CommandError::InvalidArgument));
+
+        let res = cmds.input_cmd("keys recover", ctx.clone());
+        assert_eq!(res, Err(CommandError::InvalidArgument));
+
         let res = cmds.input_cmd("keys", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
 

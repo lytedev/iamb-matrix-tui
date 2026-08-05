@@ -793,6 +793,21 @@ impl Application {
 
                 Ok(Some("Successfully exported room keys".into()))
             },
+            KeysAction::Recover(recovery_key) => {
+                // Unlocks secret storage and imports the secrets it holds, one of which is the key
+                // that reads the server-side backup. Without it a client sees the backup exist and
+                // gets 404 M_NOT_FOUND for the key, so BackupDownloadStrategy can never help.
+                //
+                // The key is used once and not stored here. What it unlocks goes to the crypto
+                // store.
+                encryption
+                    .recovery()
+                    .recover(&recovery_key)
+                    .await
+                    .map_err(IambError::from)?;
+
+                Ok(Some("Unlocked the key backup".into()))
+            },
             KeysAction::Import(path, passphrase) => {
                 let res = encryption
                     .import_room_keys(path.into(), &passphrase)
