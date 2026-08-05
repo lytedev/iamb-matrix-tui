@@ -56,6 +56,7 @@ use matrix_sdk::{
             reaction::ReactionEventContent,
             receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
             room::{
+                encrypted::RoomEncryptedEventContent,
                 encryption::RoomEncryptionEventContent,
                 member::OriginalSyncRoomMemberEvent,
                 message::{MessageType, RoomMessageEventContent},
@@ -1138,6 +1139,33 @@ impl ClientWorker {
                         settings,
                         client.media(),
                     );
+                }
+            },
+        );
+
+        // An event that could not be decrypted stays as m.room.encrypted, so it matches no other
+        // handler here and would be dropped. The room would then be silently missing messages,
+        // which is worse than showing that something is there and unreadable: the user cannot tell
+        // a quiet room from a broken one.
+        //
+        // The backfill path already keeps these, through the same insert_encrypted. Live sync did
+        // not, so a message only appeared if the user later scrolled far enough back to refetch it.
+        let _ = self.client.add_event_handler(
+            |ev: SyncMessageLikeEvent<RoomEncryptedEventContent>,
+             room: MatrixRoom,
+             store: Ctx<AsyncProgramStore>| {
+                async move {
+                    let room_id = room.room_id();
+                    let mut locked = store.lock().await;
+
+                    let sender = ev.sender().to_owned();
+                    let _ = locked.application.presences.get_or_default(sender);
+
+                    let info = locked.application.rooms.get_or_default(room_id.to_owned());
+
+                    update_event_receipts(info, &room, ev.event_id()).await;
+
+                    info.insert_encrypted(ev.into_full_event(room_id.to_owned()));
                 }
             },
         );
