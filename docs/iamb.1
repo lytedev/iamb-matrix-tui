@@ -120,8 +120,52 @@ to go to the selected message where it was sent.
 Narrowing the list does not search again; the search runs once, when the window
 opens.
 .Pp
-Encrypted rooms are missing from the results.
-The homeserver cannot read them, so it cannot search them.
+An encrypted room is answered by the local message index instead of by the
+homeserver, which cannot read it.
+That index is off until you turn it on, and it holds only what it has indexed,
+so the window title says how many rooms the search could not look in.
+See
+.Sx LOCAL INDEX
+in
+.Xr iamb 5 ,
+and
+.Sy ":reindex"
+below.
+.It Sy ":reindex"
+Index the history of the focused room, so that
+.Sy ":search"
+can find messages that were sent before the local message index was turned on.
+.Pp
+Without history the index answers almost nothing worth asking, because what a
+person searches for is usually something that was decided months ago.
+.Pp
+The forms are:
+.Bl -tag -width Ds
+.It Sy ":reindex"
+Index the history of the focused room.
+.It Sy ":reindex all"
+Index the history of every encrypted room.
+.It Sy ":reindex status"
+Say how many rooms are done, how many messages went in, and which room is being
+worked on now.
+.It Sy ":reindex stop"
+Stop indexing.
+What was already indexed stays indexed.
+.El
+.Pp
+Indexing runs in the background and is deliberately slow, so that the client
+stays usable while it runs.
+Expect hours for a large account.
+You can keep using iamb, and you can quit: a later
+.Sy ":reindex"
+continues where this one stopped rather than starting again.
+.Pp
+A room whose keys are missing cannot be indexed, and those messages will not be
+found by a search.
+The end of a run says how many events that was.
+If you have a key backup, run
+.Sy ":keys recover"
+and index again.
 .It Sy ":switch" , Sy ":switcher"
 Open the quick switcher: one fuzzy-matched list of everywhere there is to jump
 to.

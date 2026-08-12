@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::process::{Command, ExitStatus, Stdio};
 
 use clap::Parser;
 use matrix_sdk::authentication::matrix::MatrixSession;
@@ -490,6 +491,182 @@ impl<'de> Deserialize<'de> for NotifyVia {
     }
 }
 
+/// How the local message index is stored, and whether it exists at all.
+///
+/// A homeserver cannot index a room it cannot read, so `:search` finds nothing in an encrypted
+/// room. An index that runs on this machine, over the text after it is decrypted, is the only
+/// answer to that. It is also a decision the user must make, because it gives up a property that
+/// encryption otherwise provides: a client that shows a message and forgets it leaves nothing
+/// behind, and a client that indexes it leaves the words on disk for as long as the index lives.
+///
+/// For that reason this is off unless the user turns it on, and turning it on turns on the
+/// matrix-sdk event cache, which is the thing that feeds the index. The event cache writes the
+/// full decrypted JSON of an event to the sqlite store, for every room, not only the rooms that
+/// are searched. That is a larger disclosure than the index itself.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LocalIndex {
+    enabled: Option<bool>,
+    passphrase: Option<String>,
+    passphrase_command: Option<String>,
+}
+
+impl LocalIndex {
+    fn merge(profile: Self, global: Self) -> Self {
+        LocalIndex {
+            enabled: profile.enabled.or(global.enabled),
+            passphrase: profile.passphrase.or(global.passphrase),
+            passphrase_command: profile.passphrase_command.or(global.passphrase_command),
+        }
+    }
+
+    pub fn values(self) -> Result<LocalIndexValues, PassphraseError> {
+        Ok(LocalIndexValues {
+            enabled: self.enabled.unwrap_or(DEFAULT_LOCAL_INDEX_ENABLED),
+            passphrase: passphrase(self.passphrase, self.passphrase_command)?,
+        })
+    }
+}
+
+/// The local message index is off until the user asks for it.
+///
+/// See [LocalIndex] for what turning it on writes to disk.
+const DEFAULT_LOCAL_INDEX_ENABLED: bool = false;
+
+/// Why the index passphrase could not be established.
+///
+/// Every one of these stops iamb at startup. An index that quietly fell back to no passphrase, or
+/// to an empty one, would be weaker than the plain `passphrase` option it was meant to improve on,
+/// and the user would have no way to notice.
+#[derive(Debug, thiserror::Error)]
+pub enum PassphraseError {
+    #[error(
+        "settings.local_index: set passphrase or passphrase_command, not both. \
+         Remove whichever one you do not want."
+    )]
+    BothSources,
+
+    #[error("settings.local_index.passphrase_command failed to start: {command:?}: {source}")]
+    CommandFailed { command: String, source: std::io::Error },
+
+    #[error("settings.local_index.passphrase_command exited with {status}: {command:?}{stderr}")]
+    CommandStatus { command: String, status: String, stderr: String },
+
+    #[error("settings.local_index.passphrase_command printed nothing: {command:?}")]
+    CommandEmpty { command: String },
+}
+
+/// The passphrase the index is encrypted with, from whichever option supplied it.
+///
+/// The two options do the same job by different means, so setting both says nothing about which
+/// one is meant. Refuse rather than choose: a silent preference would encrypt the index with the
+/// weaker of the two and look like it had obeyed.
+///
+/// The command's first line of standard output is the passphrase. Only the line ending is
+/// removed, because a passphrase can legitimately hold spaces at either end and a tool that
+/// trimmed them would produce a passphrase that opens nothing.
+fn passphrase(
+    literal: Option<String>,
+    command: Option<String>,
+) -> Result<Option<String>, PassphraseError> {
+    match (literal, command) {
+        (Some(_), Some(_)) => Err(PassphraseError::BothSources),
+        (Some(literal), None) => Ok(Some(literal)),
+        (None, None) => Ok(None),
+        (None, Some(command)) => run_passphrase_command(command).map(Some),
+    }
+}
+
+/// Run `command` through the shell and take the first line it prints.
+///
+/// The shell runs it so that the option holds a command line rather than a list of words, which is
+/// what the user writes in every other tool that has this option.
+fn run_passphrase_command(command: String) -> Result<String, PassphraseError> {
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| PassphraseError::CommandFailed { command: command.clone(), source })?;
+
+    if !output.status.success() {
+        return Err(PassphraseError::CommandStatus {
+            command,
+            status: describe_status(output.status),
+            stderr: first_stderr_line(&output.stderr),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    match stdout
+        .split('\n')
+        .next()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+    {
+        Some(line) if !line.is_empty() => Ok(line.to_string()),
+        _ => Err(PassphraseError::CommandEmpty { command }),
+    }
+}
+
+/// How the command ended, in words a user can act on.
+///
+/// The Display of an [ExitStatus] reads "exit status: 3", which does not fit in a sentence that
+/// already says the command exited.
+fn describe_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("status {code}"),
+        None => "a signal".to_string(),
+    }
+}
+
+/// The command's own first line of error output, ready to append to a message.
+///
+/// This is what tells a locked vault apart from a misspelled entry name, and the user cannot see
+/// it otherwise: iamb captures the command's output rather than letting it reach the terminal.
+fn first_stderr_line(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let line = stderr.lines().find(|line| !line.trim().is_empty());
+
+    match line {
+        Some(line) => format!(": {}", line.trim()),
+        None => String::new(),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalIndexValues {
+    pub enabled: bool,
+
+    /// The passphrase the index directory is encrypted with.
+    ///
+    /// Without one the index is written as plain tantivy files, and the words of every indexed
+    /// message can be read out of them with no key at all.
+    ///
+    /// Two configuration options supply this, and they are mutually exclusive.
+    ///
+    /// `passphrase` holds the passphrase itself. It is the simplest thing that works, and it
+    /// protects a copy of the index that leaves this machine: a backup, a misconfigured sync, or
+    /// a disk read later. It protects against nothing that can read the configuration file, which
+    /// is anything running as this user.
+    ///
+    /// `passphrase_command` runs a command and takes its first line of output. This keeps the
+    /// passphrase out of the configuration file, and one option covers every source: a file
+    /// through `cat`, a password manager through `rbw get`, a keychain through `secret-tool
+    /// lookup`. A separate file option would add nothing that `cat` does not already do, and one
+    /// option is easier to explain than three. It is also why iamb links no keychain library:
+    /// `secret-tool` reaches the keychain without a new dependency, and without iamb having to
+    /// know which keychain this machine runs.
+    ///
+    /// The command runs once, at startup, and iamb waits for it. A command that needs an unlocked
+    /// vault, such as `rbw`, therefore fails whenever the vault is locked, which on a machine that
+    /// starts iamb unattended is most of the time. Reading a decrypted secrets file does not have
+    /// that problem, and is the better choice here.
+    ///
+    /// Neither option protects against anything that can read the crypto store, which sits beside
+    /// the index, is not encrypted either, and holds the room keys that decrypt the whole history.
+    pub passphrase: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Encryption {
     indicator: Option<EncryptionIndicator>,
@@ -700,6 +877,7 @@ pub struct TerminalValues {
 #[derive(Clone)]
 pub struct TunableValues {
     pub encryption: EncryptionValues,
+    pub local_index: LocalIndexValues,
     pub log_level: String,
     pub max_log_files: usize,
     pub message_shortcode_display: bool,
@@ -738,6 +916,10 @@ pub struct Tunables {
     /// Subsection for overriding encryption-related settings.
     #[serde(default)]
     pub encryption: Encryption,
+
+    /// Subsection for the local message index.
+    #[serde(default)]
+    pub local_index: LocalIndex,
 
     /// Subsection for overriding sort orders in UI lists.
     #[serde(default)]
@@ -782,6 +964,7 @@ impl Tunables {
     fn merge(self, other: Self) -> Self {
         Tunables {
             encryption: Encryption::merge(self.encryption, other.encryption),
+            local_index: LocalIndex::merge(self.local_index, other.local_index),
             sort: SortOverrides::merge(self.sort, other.sort),
             terminal: Terminal::merge(self.terminal, other.terminal),
             users: merge_maps(self.users, other.users),
@@ -821,9 +1004,10 @@ impl Tunables {
         }
     }
 
-    fn values(self) -> TunableValues {
-        TunableValues {
+    fn values(self) -> Result<TunableValues, PassphraseError> {
+        Ok(TunableValues {
             encryption: self.encryption.values(),
+            local_index: self.local_index.values()?,
             sort: self.sort.values(),
             terminal: self.terminal.values(),
 
@@ -859,7 +1043,7 @@ impl Tunables {
                 .unwrap_or_else(|| ".md".to_string()),
             tabstop: self.tabstop.unwrap_or(4),
             ssl_verify: self.ssl_verify.unwrap_or(true),
-        }
+        })
     }
 }
 
@@ -1075,6 +1259,10 @@ pub struct ApplicationSettings {
     pub session_json_old: PathBuf,
     pub sled_dir: PathBuf,
     pub sqlite_dir: PathBuf,
+
+    /// Where each room's local message index directory is written.
+    pub search_index_dir: PathBuf,
+
     pub profile_name: String,
     pub profile: ProfileConfig,
     pub tunables: TunableValues,
@@ -1170,7 +1358,7 @@ impl ApplicationSettings {
 
         let tunables = global.unwrap_or_default();
         let tunables = profile.settings.take().unwrap_or_default().merge(tunables);
-        let tunables = tunables.values();
+        let tunables = tunables.values()?;
 
         let dirs = dirs.unwrap_or_default();
         let dirs = profile.dirs.take().unwrap_or_default().merge(dirs);
@@ -1194,6 +1382,12 @@ impl ApplicationSettings {
         let mut sqlite_dir = profile_data_dir.clone();
         sqlite_dir.push("sqlite");
 
+        // The index sits beside the sqlite stores, under the data directory rather than the cache
+        // directory, so that clearing caches does not silently empty it. It is still disposable:
+        // every event in it can be fetched again from the homeserver.
+        let mut search_index_dir = profile_data_dir.clone();
+        search_index_dir.push("search-index");
+
         let mut session_json = profile_data_dir.clone();
         session_json.push("session.json");
 
@@ -1214,6 +1408,7 @@ impl ApplicationSettings {
             session_json,
             session_json_old,
             sqlite_dir,
+            search_index_dir,
             profile_name,
             profile,
             tunables,
@@ -1320,6 +1515,68 @@ mod tests {
     use super::*;
     use matrix_sdk::ruma::user_id;
     use std::convert::TryFrom;
+
+    /// The local index settings out of a TOML fragment, as [ApplicationSettings::load] gets them.
+    fn local_index(toml: &str) -> Result<LocalIndexValues, PassphraseError> {
+        toml::from_str::<LocalIndex>(toml).unwrap().values()
+    }
+
+    #[test]
+    fn test_a_passphrase_command_supplies_the_passphrase() {
+        let values = local_index(r#"passphrase_command = "printf 'from the vault'""#).unwrap();
+
+        assert_eq!(values.passphrase.as_deref(), Some("from the vault"));
+    }
+
+    #[test]
+    fn test_a_passphrase_command_keeps_the_spaces_and_drops_the_line_ending() {
+        // A passphrase can hold a space at either end, so only the line ending goes.
+        let values =
+            local_index(r#"passphrase_command = "printf ' padded \n second line'""#).unwrap();
+
+        assert_eq!(values.passphrase.as_deref(), Some(" padded "));
+    }
+
+    #[test]
+    fn test_two_passphrase_sources_are_refused() {
+        // Preferring one silently would encrypt the index with a passphrase the user did not
+        // choose, and look like it had obeyed.
+        let both = local_index(
+            r#"
+            passphrase = "in the file"
+            passphrase_command = "printf 'from the vault'"
+            "#,
+        );
+
+        assert!(matches!(both, Err(PassphraseError::BothSources)));
+    }
+
+    #[test]
+    fn test_a_failing_passphrase_command_is_refused() {
+        let failed = local_index(r#"passphrase_command = "exit 3""#);
+
+        assert!(matches!(failed, Err(PassphraseError::CommandStatus { .. })));
+    }
+
+    #[test]
+    fn test_a_failing_passphrase_command_repeats_what_it_said() {
+        // iamb captures the command's output, so this is the user's only sight of the reason.
+        let locked = local_index(r#"passphrase_command = "echo 'vault is locked' >&2; exit 1""#);
+
+        assert_eq!(
+            locked.unwrap_err().to_string(),
+            "settings.local_index.passphrase_command exited with status 1: \
+             \"echo 'vault is locked' >&2; exit 1\": vault is locked"
+        );
+    }
+
+    #[test]
+    fn test_a_passphrase_command_that_prints_nothing_is_refused() {
+        // An empty passphrase is a passphrase, and it protects nothing.
+        let empty = local_index(r#"passphrase_command = "true""#);
+
+        assert!(matches!(empty, Err(PassphraseError::CommandEmpty { .. })));
+    }
 
     #[test]
     fn test_user_char_span_prefers_display_name() {
@@ -1504,7 +1761,7 @@ mod tests {
         assert_eq!(res.sort.dms, None);
 
         // Check that we get the right default "rooms" and "dms" values.
-        let res = res.values();
+        let res = res.values().unwrap();
         assert_eq!(res.sort.members, vec![
             SortColumn(SortFieldUser::Server, SortOrder::Ascending),
             SortColumn(SortFieldUser::LocalPart, SortOrder::Descending),

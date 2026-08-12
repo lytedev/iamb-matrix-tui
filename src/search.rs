@@ -6,11 +6,22 @@
 //! [the worker][crate::worker], and the hits are what the
 //! [`:search` window][crate::windows::search] lists.
 //!
-//! The server cannot read an encrypted room, so it cannot index one either. A search of an
-//! encrypted room therefore returns nothing, however much was said there. Nothing here can fix
-//! that, and nothing here pretends to: the window says so instead.
+//! The server cannot read an encrypted room, so it cannot index one either. The answer to that is
+//! a second source: an index that matrix-sdk keeps on this machine, over the text after it is
+//! decrypted. See [crate::config::LocalIndex] for what that costs and why it is off by default.
+//!
+//! One search reads both sources. A room the server can read goes to the server, and an encrypted
+//! room goes to the local index, so no message can come back twice. The two sources rank their
+//! answers by measures that cannot be compared -- the server has its own, and the index has BM25
+//! -- so the merged list is put in time order instead, by [sort_newest_first].
+//!
+//! The local source is incomplete by construction: it holds only what was indexed, and a room that
+//! was never indexed answers with nothing. Nothing is indistinguishable from no match unless the
+//! interface says which it was, so every search carries a [Coverage] saying how many rooms it
+//! could not look at.
 //!
 //! [spec]: https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3search
+use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk::ruma::{
     api::client::{
         filter::RoomEventFilter,
@@ -24,11 +35,20 @@ use matrix_sdk::ruma::{
             SearchResult,
         },
     },
-    events::{room::message::Relation, AnyMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent},
+    events::{
+        room::message::Relation,
+        AnyMessageLikeEvent,
+        AnySyncMessageLikeEvent,
+        AnySyncTimelineEvent,
+        AnyTimelineEvent,
+        MessageLikeEvent,
+        SyncMessageLikeEvent,
+    },
     MilliSecondsSinceUnixEpoch,
     OwnedEventId,
     OwnedRoomId,
     OwnedUserId,
+    RoomId,
     UInt,
 };
 
@@ -70,6 +90,80 @@ pub struct MessageHit {
 
     /// What it said, as one line.
     pub body: String,
+}
+
+/// Everything one search found, and how much of the account it was able to look at.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchResults {
+    /// The messages found, newest first.
+    pub hits: Vec<MessageHit>,
+
+    /// What the search could not look at.
+    pub coverage: Coverage,
+}
+
+/// The rooms a search could not look at.
+///
+/// A search tool that returns an empty list for a room it never opened is worse than one that
+/// finds nothing, because the user cannot tell the two apart and stops trusting either. So the
+/// count travels with the results and the window shows it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Coverage {
+    /// How many encrypted rooms have no local index to ask.
+    pub unindexed_rooms: usize,
+
+    /// Whether the user has turned the local index on.
+    ///
+    /// This separates "you have not enabled this" from "these rooms are enabled but empty",
+    /// which need different things done about them.
+    pub local_index_enabled: bool,
+}
+
+impl Coverage {
+    /// What to tell the user about the rooms this search did not reach, if anything.
+    pub fn note(&self) -> Option<String> {
+        if self.unindexed_rooms == 0 {
+            return None;
+        }
+
+        let rooms = self.unindexed_rooms;
+        let plural = if rooms == 1 { "room" } else { "rooms" };
+
+        if self.local_index_enabled {
+            Some(format!("{rooms} encrypted {plural} not indexed yet"))
+        } else {
+            Some(format!("{rooms} encrypted {plural} not searched: local_index is off"))
+        }
+    }
+}
+
+/// One message the local index found, when it is a message worth showing.
+///
+/// The index stores an event identifier and nothing else of the message, so the caller has already
+/// loaded the event back. The room identifier comes from the caller because a
+/// [matrix_sdk::deserialized_responses::TimelineEvent] holds the sync form of an event, which
+/// carries no room.
+pub fn local_hit(room_id: &RoomId, event: &TimelineEvent) -> Option<MessageHit> {
+    let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+        SyncMessageLikeEvent::Original(message),
+    )) = event.raw().deserialize().ok()?
+    else {
+        return None;
+    };
+
+    let thread = match &message.content.relates_to {
+        Some(Relation::Thread(thread)) => Some(thread.event_id.clone()),
+        _ => None,
+    };
+
+    Some(MessageHit {
+        room_id: room_id.to_owned(),
+        event_id: message.event_id,
+        thread,
+        sender: message.sender,
+        timestamp: message.origin_server_ts,
+        body: one_line(message.content.body()),
+    })
 }
 
 /// Ask the homeserver for the messages that match `term`.
@@ -157,7 +251,7 @@ fn one_line(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{event_id, room_id, user_id};
+    use matrix_sdk::ruma::{event_id, room_id, serde::Raw, user_id};
     use serde_json::{from_value, json, Value};
 
     /// The `room_events` out of a response body, as the worker gets it.
@@ -304,6 +398,79 @@ mod tests {
         assert_eq!(criteria.keys, Some(vec![SearchKeys::ContentBody]));
         assert_eq!(criteria.order_by, Some(OrderBy::Recent));
         assert_eq!(criteria.filter.limit, Some(UInt::from(HITS_PER_REQUEST)));
+    }
+
+    #[test]
+    fn test_a_search_that_reached_every_room_says_nothing() {
+        let reached = Coverage { unindexed_rooms: 0, local_index_enabled: true };
+
+        assert_eq!(reached.note(), None);
+    }
+
+    #[test]
+    fn test_a_search_that_missed_rooms_says_which_reason() {
+        // The two states need different things done about them, so they cannot read alike: one
+        // asks the user to turn the index on, and the other asks them to wait for it to fill.
+        let off = Coverage { unindexed_rooms: 3, local_index_enabled: false };
+        let empty = Coverage { unindexed_rooms: 3, local_index_enabled: true };
+
+        assert_eq!(
+            off.note(),
+            Some("3 encrypted rooms not searched: local_index is off".to_string())
+        );
+        assert_eq!(empty.note(), Some("3 encrypted rooms not indexed yet".to_string()));
+    }
+
+    #[test]
+    fn test_one_missed_room_is_not_called_rooms() {
+        let one = Coverage { unindexed_rooms: 1, local_index_enabled: true };
+
+        assert_eq!(one.note(), Some("1 encrypted room not indexed yet".to_string()));
+    }
+
+    #[test]
+    fn test_a_local_hit_carries_the_room_the_index_was_asked_about() {
+        // The index returns the sync form of an event, which names no room, so a hit that lost
+        // the room would be a row the user cannot go to.
+        let event = TimelineEvent::from_plaintext(
+            Raw::new(&json!({
+                "type": "m.room.message",
+                "event_id": "$found:example.com",
+                "sender": "@dan:example.com",
+                "origin_server_ts": 1_700_000_000_000u64,
+                "content": { "msgtype": "m.text", "body": "let us   deploy\non friday" },
+            }))
+            .unwrap()
+            .cast_unchecked(),
+        );
+
+        let hit = local_hit(room_id!("!general:example.com"), &event).unwrap();
+
+        assert_eq!(hit, MessageHit {
+            room_id: room_id!("!general:example.com").to_owned(),
+            event_id: event_id!("$found:example.com").to_owned(),
+            thread: None,
+            sender: user_id!("@dan:example.com").to_owned(),
+            timestamp: MilliSecondsSinceUnixEpoch(UInt::new(1_700_000_000_000).unwrap()),
+            body: "let us deploy on friday".to_string(),
+        });
+    }
+
+    #[test]
+    fn test_a_local_result_that_is_not_a_readable_message_is_dropped() {
+        let state = TimelineEvent::from_plaintext(
+            Raw::new(&json!({
+                "type": "m.room.topic",
+                "event_id": "$topic:example.com",
+                "sender": "@dan:example.com",
+                "origin_server_ts": 1_700_000_000_000u64,
+                "content": { "topic": "deploys" },
+            }))
+            .unwrap()
+            .cast_unchecked(),
+        );
+
+        assert!(local_hit(room_id!("!general:example.com"), &state).is_none());
     }
 
     #[test]

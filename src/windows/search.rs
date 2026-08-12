@@ -20,8 +20,10 @@
 //! recognisable: the user is looking for something they remember happening, and they remember
 //! roughly when.
 //!
-//! Encrypted rooms are missing from every result. The homeserver cannot read them, so it cannot
-//! index them, and no request made from here changes that.
+//! Encrypted rooms are answered by the local index instead of by the homeserver, and the index
+//! holds only what was indexed. A room it has never seen is therefore missing from the results,
+//! and missing looks exactly like no match. The window says how many rooms that was, in its
+//! title, so that an empty list is never mistaken for an answer.
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -52,7 +54,7 @@ use crate::base::{
     ProgramContext,
     ProgramStore,
 };
-use crate::search::MessageHit;
+use crate::search::{Coverage, MessageHit, SearchResults};
 
 use crate::windows::filtered::{FilteredItem, FilteredListState};
 
@@ -83,7 +85,25 @@ const MIN_LABEL_COLUMN_WIDTH: usize = 8;
 /// Shown in place of what a column had no room for.
 const ELLIPSIS: &str = "…";
 
-/// One message the homeserver found.
+/// What one search found, and what it could not look at.
+pub struct Found {
+    /// The messages found, as rows, newest first.
+    pub items: Vec<SearchItem>,
+
+    /// The rooms the search could not look in.
+    pub coverage: Coverage,
+}
+
+impl Found {
+    pub fn new(results: SearchResults, store: &ProgramStore) -> Found {
+        Found {
+            items: SearchItem::rows(results.hits, store),
+            coverage: results.coverage,
+        }
+    }
+}
+
+/// One message a search found.
 #[derive(Clone)]
 pub struct SearchItem {
     /// The room the message is in, by the name the user knows it under.
@@ -103,12 +123,12 @@ pub struct SearchItem {
 }
 
 impl SearchItem {
-    /// Turn what the homeserver found into rows, in the order it found them.
+    /// Turn what a search found into rows, in the order it found them.
     ///
-    /// The homeserver gives identifiers, and the user recognises names, so the room and the sender
+    /// A search gives identifiers, and the user recognises names, so the room and the sender
     /// are resolved here against what the client has synced. A room or a person the client has not
     /// seen falls back to the identifier, which is still enough to tell the rows apart.
-    pub fn rows(hits: Vec<MessageHit>, store: &ProgramStore) -> Vec<SearchItem> {
+    fn rows(hits: Vec<MessageHit>, store: &ProgramStore) -> Vec<SearchItem> {
         hits.into_iter().map(|hit| SearchItem::row(hit, store)).collect()
     }
 
@@ -162,10 +182,10 @@ impl Display for SearchItem {
 }
 
 impl FilteredItem for SearchItem {
-    /// The messages the homeserver found, which belong to this window and to no other.
+    /// What this one search found, which belongs to this window and to no other.
     ///
-    /// They are shared rather than copied so that splitting the window is cheap.
-    type Context = Arc<Vec<SearchItem>>;
+    /// It is shared rather than copied so that splitting the window is cheap.
+    type Context = Arc<Found>;
 
     fn filter_buffer() -> IambBufferId {
         IambBufferId::MessageSearchFilter
@@ -175,18 +195,14 @@ impl FilteredItem for SearchItem {
         IambBufferId::MessageSearchList
     }
 
-    fn matching(
-        found: &Arc<Vec<SearchItem>>,
-        needle: &str,
-        _: &mut ProgramStore,
-    ) -> Vec<SearchItem> {
+    fn matching(found: &Arc<Found>, needle: &str, _: &mut ProgramStore) -> Vec<SearchItem> {
         let needle = needle.to_lowercase();
 
-        found.iter().filter(|item| item.matches(&needle)).cloned().collect()
+        found.items.iter().filter(|item| item.matches(&needle)).cloned().collect()
     }
 
     fn empty_message() -> &'static str {
-        "Nothing here matches. Encrypted rooms are missing: the homeserver cannot read them."
+        "Nothing here matches. The title says which rooms this search could not look in."
     }
 }
 

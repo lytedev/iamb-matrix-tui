@@ -1,4 +1,5 @@
 //! # Windows for Matrix rooms and spaces
+use crate::backfill::start_backfill;
 use std::collections::HashSet;
 
 use matrix_sdk::ruma::api::error::ErrorKind as ClientApiErrorKind;
@@ -282,6 +283,14 @@ impl RoomState {
                     Ok(vec![])
                 } else {
                     Err(IambError::NotJoined.into())
+                }
+            },
+            RoomAction::Reindex => {
+                let room_id = self.id().to_owned();
+
+                match start_backfill(vec![room_id], store)? {
+                    Some(info) => Ok(vec![(Action::ShowInfoMessage(info), ctx.clone())]),
+                    None => Ok(vec![]),
                 }
             },
             RoomAction::MarkRead => {

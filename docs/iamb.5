@@ -131,6 +131,13 @@ Configuration subsection for specific settings related to room encryption.
 See
 .Sx ENCRYPTION
 for more details.
+.It Sy local_index
+Configuration subsection for the local message index, which makes
+.Sy :search
+able to find text in encrypted rooms.
+See
+.Sx LOCAL INDEX
+for more details.
 .It Sy default_room
 The room to show by default instead of the
 .Sy :welcome
@@ -312,6 +319,95 @@ and
 Both can be used via
 .Dq Sy title|prompt .
 .El
+.Sh LOCAL INDEX
+A homeserver cannot read an encrypted room, so it cannot index one, and
+.Sy :search
+finds nothing there.
+The
+.Sy settings.local_index
+subsection turns on an index that runs on this machine, over the text after it is
+decrypted, and
+.Sy :search
+then asks it for the encrypted rooms and asks the homeserver for the rest.
+.Pp
+Turning this on writes message text to disk.
+The words of every indexed message go under
+.Pa profiles/<profile>/search-index
+in the data directory, and stay there until that directory is deleted.
+It also turns on the matrix-sdk event cache, which writes the full decrypted JSON
+of every event, in every room, to the sqlite store.
+That is a larger disclosure than the index itself.
+Decide whether you want it before you turn it on.
+.Pp
+The index holds only what was indexed while it was turned on.
+A room it has never seen is missing from the results, so the
+.Sy :search
+window shows in its title how many rooms it could not look in.
+Use
+.Sy :reindex
+to fill the index with history that already exists; see
+.Xr iamb 1 .
+.Pp
+The index is disposable.
+Delete the directory to start again.
+.Pp
+The available fields in this subsection are:
+.Bl -tag -width Ds
+.It Sy enabled
+Defaults to
+.Sy false .
+Setting this field to
+.Sy true
+turns on the index and the event cache.
+.It Sy passphrase
+The passphrase the index directory is encrypted with.
+Without a passphrase the index is written as plain files, and the words of every
+indexed message can be read out of them with no key.
+A passphrase protects a copy of the index that leaves this machine, such as a
+backup.
+It protects against nothing that can read the configuration file.
+.It Sy passphrase_command
+A command whose first line of standard output is the passphrase.
+This keeps the passphrase out of the configuration file.
+Only the line ending is removed, so a passphrase can hold spaces at either end.
+.Pp
+One option covers every source of a passphrase:
+.Dq Sy cat /run/secrets/iamb-index-passphrase
+reads a file,
+.Dq Sy rbw get iamb-index
+reads a password manager, and
+.Dq Sy secret-tool lookup service iamb key index
+reads the system keychain.
+A separate file option would add nothing that
+.Sy cat
+does not already do.
+.Pp
+The command runs once, at startup, and iamb waits for it.
+A command that needs an unlocked vault, such as
+.Sy rbw ,
+therefore fails whenever the vault is locked.
+Reading a decrypted secrets file does not have that problem, and suits a client
+that starts unattended.
+.Pp
+A command that fails, or that prints nothing, stops iamb with an error.
+The index never falls back to no passphrase.
+.El
+.Pp
+.Sy passphrase
+and
+.Sy passphrase_command
+are mutually exclusive.
+Setting both stops iamb with an error, rather than choosing one for you.
+.Pp
+Neither option protects against anything that can read the crypto store, which
+sits beside the index, is not encrypted either, and holds the room keys that
+decrypt the whole history.
+.Ss Example 1: Read the passphrase from a secrets file
+.Bd -literal -offset indent
+[settings.local_index]
+enabled = true
+passphrase_command = "cat /run/secrets/iamb-index-passphrase"
+.Ed
 .Sh MOUSE
 The
 .Sy settings.mouse

@@ -71,6 +71,7 @@ use ratatui::{
     Terminal,
 };
 
+mod backfill;
 mod base;
 mod commands;
 mod config;
@@ -89,6 +90,7 @@ mod worker;
 mod tests;
 
 use crate::{
+    backfill::start_backfill,
     base::{
         AsyncProgramStore,
         BackgroundReport,
@@ -105,6 +107,7 @@ use crate::{
         ProgramAction,
         ProgramContext,
         ProgramStore,
+        ReindexAction,
     },
     config::{ApplicationSettings, Iamb},
     windows::IambWindow,
@@ -690,6 +693,7 @@ impl Application {
                 None
             },
             IambAction::Keys(act) => self.keys_command(act, ctx, store).await?,
+            IambAction::Reindex(act) => self.reindex_command(act, store)?,
             IambAction::Message(act) => {
                 self.screen.current_window_mut()?.message_command(act, ctx, store).await?
             },
@@ -773,6 +777,51 @@ impl Application {
                     room.forget().await.map_err(IambError::from)?;
                 }
                 Ok(vec![])
+            },
+        }
+    }
+
+    /// Start, stop, or report on the backfill of the local message index.
+    ///
+    /// Nothing here awaits the walk. The walk takes hours, and this loop draws the screen, so
+    /// awaiting it would freeze the client for the whole backfill. It is spawned instead and
+    /// reports through the same channel that unlocking the key backup reports through.
+    fn reindex_command(
+        &mut self,
+        action: ReindexAction,
+        store: &mut ProgramStore,
+    ) -> IambResult<EditInfo> {
+        match action {
+            ReindexAction::All => {
+                let rooms = store
+                    .application
+                    .worker
+                    .client
+                    .joined_rooms()
+                    .into_iter()
+                    .filter(|room| room.encryption_state().is_encrypted())
+                    .map(|room| room.room_id().to_owned())
+                    .collect();
+
+                start_backfill(rooms, store)
+            },
+            ReindexAction::Stop => {
+                if !store.application.backfill.is_running() {
+                    return Err(IambError::NoBackfill.into());
+                }
+
+                store.application.backfill.stop();
+
+                Ok(Some("Stopping...".into()))
+            },
+            ReindexAction::Status => {
+                if !store.application.backfill.is_running() {
+                    return Err(IambError::NoBackfill.into());
+                }
+
+                let described = store.application.backfill.progress().describe();
+
+                Ok(Some(described.into()))
             },
         }
     }

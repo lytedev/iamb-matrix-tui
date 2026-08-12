@@ -25,6 +25,42 @@ username_display = "username"
 indicator = "only-encrypted"
 location = "title|prompt"
 
+# A homeserver cannot search a room it cannot read, so ":search" finds nothing
+# in an encrypted room. Turn this on to index the text of encrypted rooms on
+# this machine instead. Understand what it writes to disk before you do:
+#
+#   * The words of every indexed message go into ~/.local/share/iamb/profiles/
+#     <profile>/search-index/, and stay there until you delete it.
+#   * It also turns on the matrix-sdk event cache, which writes the full
+#     decrypted JSON of every event, in every room, to the sqlite store.
+#
+# The passphrase encrypts the index directory. Without one the index is written
+# as plain files and its words can be read with no key.
+#
+# Give it in one of two ways, never both:
+#
+#   passphrase          the passphrase itself, in this file
+#   passphrase_command  a command whose first line of output is the passphrase
+#
+# One command option covers every source, so there is no separate file option:
+# "cat" already reads a file.
+#
+#   passphrase_command = "cat /run/secrets/iamb-index-passphrase"
+#   passphrase_command = "rbw get iamb-index"
+#   passphrase_command = "secret-tool lookup service iamb key index"
+#
+# The command runs once at startup and iamb waits for it, so a command that
+# needs an unlocked vault, such as "rbw", fails whenever the vault is locked.
+# Reading a decrypted secrets file suits a client that starts unattended.
+#
+# Turning this on indexes what arrives from now on. Run ":reindex" to index the
+# history that already exists, which is what most searches are looking for.
+#
+# The index is disposable. Delete the directory to start again.
+[settings.local_index]
+enabled = false
+passphrase_command = "cat /run/secrets/iamb-index-passphrase"
+
 [settings.image_preview]
 protocol.type = "sixel"
 size = { "width" = 66, "height" = 10 }

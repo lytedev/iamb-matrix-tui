@@ -103,6 +103,15 @@ impl<T: FilteredItem> FilteredListState<T> {
         FilteredListState { filter, list, context }
     }
 
+    /// What the rows were built from.
+    ///
+    /// The window title needs it: a title is drawn from the window and not from a row, and some
+    /// of what the user has to be told about a result set is true of the set rather than of any
+    /// row in it.
+    pub fn context(&self) -> &T::Context {
+        &self.context
+    }
+
     /// How many rows the list currently holds.
     #[cfg(test)]
     pub fn len(&self) -> usize {

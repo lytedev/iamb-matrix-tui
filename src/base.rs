@@ -98,6 +98,7 @@ use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
 use matrix_sdk::ruma::UInt;
 
+use crate::backfill::Backfill;
 use crate::snooze::{parse_when, SnoozeKey, SnoozeStore, WakeTime};
 use crate::preview::{source_from_event, spawn_insert_preview};
 use crate::{
@@ -452,6 +453,13 @@ pub enum RoomAction {
     /// Accept an invitation to join this room.
     InviteAccept,
 
+    /// Fill the local message index with this room's history.
+    ///
+    /// This is a room action rather than a plain [ReindexAction] so that a bare `:reindex` means
+    /// the room the user is looking at, which is the room they are wondering about when a search
+    /// of it finds nothing.
+    Reindex,
+
     /// Reject an invitation to join this room.
     InviteReject,
 
@@ -531,6 +539,19 @@ pub enum HomeserverAction {
     Forget,
 }
 
+/// What `:reindex` was asked to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReindexAction {
+    /// Walk the history of every encrypted room that has not been walked.
+    All,
+
+    /// Stop the running walk, keeping what it has already recorded.
+    Stop,
+
+    /// Say how far the running walk has got.
+    Status,
+}
+
 /// An action performed against the user's room keys.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeysAction {
@@ -555,6 +576,9 @@ pub enum IambAction {
 
     /// Perform an action over room keys.
     Keys(KeysAction),
+
+    /// Fill the local message index with history that already exists.
+    Reindex(ReindexAction),
 
     /// Perform an action on the currently selected message.
     Message(MessageAction),
@@ -638,6 +662,7 @@ impl ApplicationAction for IambAction {
             IambAction::UndoRead => SequenceStatus::Break,
             IambAction::Homeserver(..) => SequenceStatus::Break,
             IambAction::Keys(..) => SequenceStatus::Break,
+            IambAction::Reindex(..) => SequenceStatus::Break,
             IambAction::Message(..) => SequenceStatus::Break,
             IambAction::Space(..) => SequenceStatus::Break,
             IambAction::Room(..) => SequenceStatus::Break,
@@ -656,6 +681,7 @@ impl ApplicationAction for IambAction {
             IambAction::UndoRead => SequenceStatus::Atom,
             IambAction::Homeserver(..) => SequenceStatus::Atom,
             IambAction::Keys(..) => SequenceStatus::Atom,
+            IambAction::Reindex(..) => SequenceStatus::Atom,
             IambAction::Message(..) => SequenceStatus::Atom,
             IambAction::Space(..) => SequenceStatus::Atom,
             IambAction::OpenLink(..) => SequenceStatus::Atom,
@@ -674,6 +700,7 @@ impl ApplicationAction for IambAction {
             IambAction::UndoRead => SequenceStatus::Ignore,
             IambAction::Homeserver(..) => SequenceStatus::Ignore,
             IambAction::Keys(..) => SequenceStatus::Ignore,
+            IambAction::Reindex(..) => SequenceStatus::Ignore,
             IambAction::Message(..) => SequenceStatus::Ignore,
             IambAction::Space(..) => SequenceStatus::Ignore,
             IambAction::Room(..) => SequenceStatus::Ignore,
@@ -695,6 +722,7 @@ impl ApplicationAction for IambAction {
             IambAction::Space(..) => false,
             IambAction::Room(..) => false,
             IambAction::Keys(..) => false,
+            IambAction::Reindex(..) => false,
             IambAction::Send(..) => false,
             IambAction::OpenLink(..) => false,
             IambAction::ToggleScrollbackFocus => false,
@@ -748,6 +776,22 @@ pub type MessageReactions = HashMap<OwnedEventId, (String, OwnedUserId)>;
 /// Errors encountered during application use.
 #[derive(thiserror::Error, Debug)]
 pub enum IambError {
+    /// The local message index is not turned on, so there is nothing to fill.
+    #[error("The local message index is off. Set settings.local_index.enabled to use :reindex.")]
+    LocalIndexDisabled,
+
+    /// A backfill was asked for while one was already running.
+    #[error("Already indexing. Use :reindex status to see how far, or :reindex stop.")]
+    BackfillRunning,
+
+    /// A room was named for indexing that the homeserver can already search.
+    #[error("The homeserver can already search this room. :reindex is for encrypted rooms.")]
+    RoomNotEncrypted,
+
+    /// Something was asked of a backfill that is not running.
+    #[error("Nothing is being indexed. Use :reindex to start.")]
+    NoBackfill,
+
     /// An invalid history visibility was specified.
     #[error("Invalid history visibility setting: {0}")]
     InvalidHistoryVisibility(String),
@@ -2160,6 +2204,12 @@ pub struct ChatStore {
 
     /// The receiving end of [ChatStore::reports].
     reports_rx: UnboundedReceiver<BackgroundReport>,
+
+    /// The running backfill of the local message index, if there is one.
+    ///
+    /// Shared with the background task that walks the history, which is why it is behind an Arc:
+    /// the commands that watch and stop the walk run on the main loop, and the walk does not.
+    pub backfill: Arc<Backfill>,
 }
 
 /// Something a background task wants to show the user.
@@ -2257,6 +2307,7 @@ impl ChatStore {
         ChatStore {
             reports,
             reports_rx,
+            backfill: Default::default(),
             worker,
             settings,
             snooze: SnoozeStore::default(),
