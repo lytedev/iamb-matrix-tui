@@ -21,6 +21,7 @@ use crate::base::{
     IambId,
     IambInfo,
     KeysAction,
+    ReindexAction,
     MemberUpdateAction,
     MessageAction,
     ProgramCommand,
@@ -444,6 +445,27 @@ fn iamb_commands(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult 
 
     let open = ctx.switch(OpenTarget::Application(IambId::CommandPalette));
     let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
+/// `:reindex` fills the local message index with history that already exists.
+///
+/// With no argument it walks the focused room, because that is the room the user is looking at and
+/// wondering why a search of it finds nothing. `all` walks every encrypted room.
+///
+/// The walk runs in the background and reports as it goes, so `status` and `stop` are how the user
+/// reaches it once it is running.
+fn iamb_reindex(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let act = match desc.arg.text.trim() {
+        "" => IambAction::Room(RoomAction::Reindex),
+        "all" => IambAction::Reindex(ReindexAction::All),
+        "stop" => IambAction::Reindex(ReindexAction::Stop),
+        "status" => IambAction::Reindex(ReindexAction::Status),
+        _ => return Result::Err(CommandError::InvalidArgument),
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
 
     return Ok(step);
 }
@@ -1203,6 +1225,17 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_spaces,
         forms: &[opens("List the spaces you have joined", IambId::SpaceList)],
+    },
+    IambCommandInfo {
+        name: "reindex",
+        aliases: &[],
+        f: iamb_reindex,
+        forms: &[
+            bare("Index the history of the focused room, so :search can find it"),
+            form("all", "Index the history of every encrypted room"),
+            form("status", "Say how far the running indexing has got"),
+            form("stop", "Stop the running indexing, keeping what it has done"),
+        ],
     },
     IambCommandInfo {
         name: "search",
@@ -2025,6 +2058,33 @@ mod tests {
 
         // It acts on the selection, so it takes no argument.
         let res = cmds.input_cmd("context here", ctx.clone());
+        assert_eq!(res, Err(CommandError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_cmd_reindex() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        // A bare :reindex means the room the user is looking at, so it goes through the room
+        // rather than naming one.
+        let res = cmds.input_cmd("reindex", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::Reindex);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd("reindex all", ctx.clone()).unwrap();
+        let act = IambAction::Reindex(ReindexAction::All);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd("reindex status", ctx.clone()).unwrap();
+        let act = IambAction::Reindex(ReindexAction::Status);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd("reindex stop", ctx.clone()).unwrap();
+        let act = IambAction::Reindex(ReindexAction::Stop);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd("reindex everything", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
     }
 
