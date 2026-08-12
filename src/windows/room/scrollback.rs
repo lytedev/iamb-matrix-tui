@@ -1475,6 +1475,35 @@ impl StatefulWidget for Scrollback<'_> {
             return;
         };
 
+        // The message that started the thread, drawn above the replies.
+        //
+        // It lives in the main scrollback, not in the thread, so the thread alone opens without
+        // the message it is about. It is drawn rather than inserted, because Message is not Clone
+        // and copying it into the thread would give one message two homes that then drift apart.
+        //
+        // The cost of drawing it is that it cannot be selected here. Selecting it, and reacting or
+        // replying to it, still works in the main scrollback.
+        let op = state.thread().and_then(|root| {
+            // Skip it when the thread already holds it, so it cannot be drawn twice.
+            if thread.keys().any(|(_, id)| id == root) {
+                None
+            } else {
+                info.get_event(root)
+            }
+        });
+
+        let op_lines: Vec<_> = match op {
+            None => vec![],
+            Some(msg) => {
+                let (txt, _) = msg.show_with_preview(None, false, &state.viewctx, info, settings);
+
+                txt.lines
+            },
+        };
+
+        // The replies get what is left of the pane.
+        let height = height.saturating_sub(op_lines.len());
+
         if state.cursor.timestamp < state.viewctx.corner.timestamp {
             state.viewctx.corner = state.cursor.clone();
         }
@@ -1483,6 +1512,19 @@ impl StatefulWidget for Scrollback<'_> {
         let cursor_key = if let Some(k) = cursor.to_key(thread) {
             k
         } else {
+            // A thread whose replies are not loaded still has an opening message, and showing it
+            // is the whole point of opening the thread. Draw it before giving up.
+            let mut y = area.top();
+
+            for line in op_lines.iter() {
+                let _ = buf.set_line(area.left(), y, line, area.width);
+                y += 1;
+
+                if y >= area.bottom() {
+                    break;
+                }
+            }
+
             if state.need_more_messages(info) {
                 self.store.application.need_load.need_messages(state.room_id.to_owned());
             }
@@ -1556,6 +1598,13 @@ impl StatefulWidget for Scrollback<'_> {
 
         let mut y = area.top();
         let x = area.left();
+
+        // Above the replies, and outside the `lines` machinery on purpose: `lines` decides the
+        // viewport corner, and the opening message is not part of the thread's own ordering.
+        for line in op_lines.iter() {
+            let _ = buf.set_line(x, y, line, area.width);
+            y += 1;
+        }
 
         let mut image_previews = vec![];
         for ((_, _), _, txt, line_preview) in lines.into_iter() {

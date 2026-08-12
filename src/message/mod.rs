@@ -1074,14 +1074,13 @@ impl Message {
 
         // Show the message that this one replied to, if any.
         //
-        // The thread root is different from a reply. It is the same message above every entry in
-        // the thread, so repeating it on each one is noise. It is shown once, above the first
-        // message drawn, which is where a reader looks for it.
+        // The thread root is deliberately absent here. The scrollback draws it in full above the
+        // replies, so quoting it on each message would show the same text twice, and once per
+        // reply at that.
         //
-        // A genuine reply is still shown on every message that has one, because each reply points
+        // A genuine reply is still quoted on every message that has one, because each reply points
         // somewhere different.
-        let root = self.thread_root().filter(|_| prev.is_none());
-        let reply = self.reply_to().or(root).map(|e| info.get_event(&e));
+        let reply = self.reply_to().map(|e| info.get_event(&e));
         let proto_reply = reply.as_ref().and_then(|r| {
             if let Some(r) = r {
                 // Format the reply header, push it into the `Text` buffer, and get any image.
