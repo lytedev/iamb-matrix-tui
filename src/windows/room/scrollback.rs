@@ -1471,34 +1471,34 @@ impl StatefulWidget for Scrollback<'_> {
             return;
         }
 
-        let Some(thread) = state.get_thread(info) else {
-            return;
-        };
-
-        // The message that started the thread, drawn above the replies.
-        //
-        // It lives in the main scrollback, not in the thread, so the thread alone opens without
-        // the message it is about. It is drawn rather than inserted, because Message is not Clone
-        // and copying it into the thread would give one message two homes that then drift apart.
-        //
-        // The cost of drawing it is that it cannot be selected here. Selecting it, and reacting or
-        // replying to it, still works in the main scrollback.
-        let op = state.thread().and_then(|root| {
-            // Skip it when the thread already holds it, so it cannot be drawn twice.
-            if thread.keys().any(|(_, id)| id == root) {
-                None
-            } else {
-                info.get_event(root)
-            }
-        });
-
-        let op_lines: Vec<_> = match op {
+        // The opening message is worked out before the thread is looked up, because a thread that
+        // has just been started has no collection at all. Looking the thread up first returned
+        // here and drew nothing, which is what an empty pane above a new reply was.
+        let op_lines: Vec<_> = match state.thread().and_then(|root| info.get_event(root)) {
             None => vec![],
             Some(msg) => {
                 let (txt, _) = msg.show_with_preview(None, false, &state.viewctx, info, settings);
 
                 txt.lines
             },
+        };
+
+        let draw_op = |buf: &mut Buffer| {
+            let mut y = area.top();
+
+            for line in op_lines.iter() {
+                if y >= area.bottom() {
+                    break;
+                }
+
+                let _ = buf.set_line(area.left(), y, line, area.width);
+                y += 1;
+            }
+        };
+
+        let Some(thread) = state.get_thread(info) else {
+            draw_op(buf);
+            return;
         };
 
         // The replies get what is left of the pane.
@@ -1514,16 +1514,7 @@ impl StatefulWidget for Scrollback<'_> {
         } else {
             // A thread whose replies are not loaded still has an opening message, and showing it
             // is the whole point of opening the thread. Draw it before giving up.
-            let mut y = area.top();
-
-            for line in op_lines.iter() {
-                let _ = buf.set_line(area.left(), y, line, area.width);
-                y += 1;
-
-                if y >= area.bottom() {
-                    break;
-                }
-            }
+            draw_op(buf);
 
             if state.need_more_messages(info) {
                 self.store.application.need_load.need_messages(state.room_id.to_owned());
