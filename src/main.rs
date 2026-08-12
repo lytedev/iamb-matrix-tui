@@ -388,7 +388,7 @@ impl Application {
             self.redraw(self.dirty, self.store.clone().lock().await.deref_mut())?;
             self.dirty = false;
 
-            if let Some(jump) = self.store.lock().await.application.notification_jump.take() {
+            if let Some(jump) = self.store.lock().await.application.message_jump.take() {
                 let switch = WindowAction::Switch(OpenTarget::Application(jump.window));
                 let select = IambAction::Room(RoomAction::SelectMessage(jump.event_id));
                 let ctx = ProgramContext::default();

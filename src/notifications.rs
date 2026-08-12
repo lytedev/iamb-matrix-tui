@@ -23,7 +23,7 @@ use matrix_sdk::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    base::{AsyncProgramStore, IambError, IambId, IambResult, NotificationJump, ProgramStore},
+    base::{AsyncProgramStore, IambError, IambId, IambResult, MessageJump, ProgramStore},
     config::{ApplicationSettings, NotifyVia},
 };
 
@@ -60,9 +60,9 @@ impl From<&NotificationTarget> for IambId {
     }
 }
 
-impl From<&NotificationTarget> for NotificationJump {
+impl From<&NotificationTarget> for MessageJump {
     fn from(target: &NotificationTarget) -> Self {
-        NotificationJump {
+        MessageJump {
             window: IambId::from(target),
             event_id: target.event_id.clone(),
         }
@@ -253,7 +253,7 @@ async fn send_notification_desktop(
             {
                 let (dismiss, dismissed) = tokio::sync::oneshot::channel();
                 let focus_tui = focus_tui.map(ToOwned::to_owned);
-                let jump = NotificationJump::from(&target);
+                let jump = MessageJump::from(&target);
                 let store = _store.clone();
 
                 tokio::spawn(async move {
@@ -309,7 +309,7 @@ async fn wait_for_click(
 /// Bring iamb back to the front and queue the jump to the message that was notified about.
 #[cfg(all(feature = "desktop", unix, not(target_os = "macos")))]
 async fn jump_to_notification(
-    jump: NotificationJump,
+    jump: MessageJump,
     focus_tui: Option<String>,
     store: &AsyncProgramStore,
 ) {
@@ -327,7 +327,7 @@ async fn jump_to_notification(
         }
     }
 
-    store.lock().await.application.notification_jump = Some(jump);
+    store.lock().await.application.message_jump = Some(jump);
 }
 
 async fn global_or_room_mode(
@@ -574,7 +574,7 @@ mod tests {
 
     /// A click has to carry the notified message, not just the room, so that it can be selected.
     #[test]
-    fn test_notification_jump_keeps_the_event() {
+    fn test_message_jump_keeps_the_event() {
         let room_id = room_id!("!room:example.com").to_owned();
         let thread_root = event_id!("$root:example.com").to_owned();
         let event_id = event_id!("$message:example.com").to_owned();
@@ -585,7 +585,7 @@ mod tests {
             event_id: event_id.clone(),
         };
 
-        assert_eq!(NotificationJump::from(&target), NotificationJump {
+        assert_eq!(MessageJump::from(&target), MessageJump {
             window: IambId::Room(room_id, Some(thread_root)),
             event_id,
         });

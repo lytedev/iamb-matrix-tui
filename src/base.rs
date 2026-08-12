@@ -2090,13 +2090,17 @@ pub struct ChatStore {
     /// Read operations that `:undoread` can walk back through, oldest first.
     pub read_undos: Vec<ReadUndoEntry>,
 
-    /// Where a clicked desktop notification wants the main loop to take the user.
+    /// Where something outside the room windows wants the main loop to take the user.
     ///
-    /// Notifications are handled off the main loop, which is blocked reading terminal input, so
-    /// the click leaves the target here and the loop picks it up on its next pass. Only the most
-    /// recent click is kept: when several notifications are clicked in quick succession, the user
-    /// only ends up looking at one of them anyway.
-    pub notification_jump: Option<NotificationJump>,
+    /// Going to one message means two actions in order: switch to its window, then select it once
+    /// that window is showing. Only the main loop can emit an ordered pair of actions, so anything
+    /// that wants a jump leaves the target here and the loop picks it up on its next pass. A
+    /// clicked desktop notification is handled off the main loop entirely, which is blocked
+    /// reading terminal input, and needs this; a window such as `:search` needs it because its
+    /// own prompt can only return actions for itself.
+    ///
+    /// Only the most recent target is kept, because the user only ends up looking at one of them.
+    pub message_jump: Option<MessageJump>,
 
     /// Where background tasks leave what they want to tell the user.
     ///
@@ -2119,14 +2123,28 @@ pub enum BackgroundReport {
     Error(String),
 }
 
-/// Where a clicked desktop notification takes the user.
+/// One message to take the user to, wherever the request came from.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NotificationJump {
-    /// The window to switch to: the room, or the thread the notified message lives in.
+pub struct MessageJump {
+    /// The window to switch to: the room, or the thread the message lives in.
     pub window: IambId,
 
-    /// The notified message, to be selected once the window is showing it.
+    /// The message, to be selected once the window is showing it.
     pub event_id: OwnedEventId,
+}
+
+impl MessageJump {
+    /// Go to `event_id` in `room_id`, inside `thread` when the message is in one.
+    ///
+    /// A message in a thread is not in the room's own scrollback, so a jump that ignored the
+    /// thread would land on a window that cannot show the message at all.
+    pub fn to_message(
+        room_id: OwnedRoomId,
+        thread: Option<OwnedEventId>,
+        event_id: OwnedEventId,
+    ) -> Self {
+        MessageJump { window: IambId::Room(room_id, thread), event_id }
+    }
 }
 
 /// How many read operations `:undoread` can walk back through.
@@ -2209,7 +2227,7 @@ impl ChatStore {
             focused: true,
             open_notifications: Default::default(),
             read_undos: Default::default(),
-            notification_jump: None,
+            message_jump: None,
         }
     }
 
