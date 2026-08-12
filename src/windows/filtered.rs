@@ -9,6 +9,11 @@
 //! [FilteredItem]: given what the user typed, hand back the rows to show, best first. Everything
 //! else -- routing keys between the filter bar and the list, drawing, and submitting the selected
 //! row -- is shared.
+//!
+//! Rows can also come from something that only this one window knows, such as the results a
+//! `:search` fetched. [FilteredItem::Context] is that: a value the window is opened with and
+//! keeps, and that [FilteredItem::matching] is given every time it rebuilds. A window whose rows
+//! all come from the store, as both of the above do, uses `()` and ignores it.
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::StatefulWidget};
 
 use modalkit::{
@@ -54,6 +59,11 @@ const FILTER_BAR_PROMPT: &str = "filter: ";
 pub trait FilteredItem:
     ListItem<IambInfo> + Promptable<ProgramContext, ProgramStore, IambInfo> + Clone
 {
+    /// Whatever the rows come from that the store does not already hold.
+    ///
+    /// It is cloned when the window is split, so each half keeps its own.
+    type Context: Clone;
+
     /// The buffer that backs the filter bar.
     fn filter_buffer() -> IambBufferId;
 
@@ -66,7 +76,7 @@ pub trait FilteredItem:
     /// it is empty when nothing has been. Implementations decide for themselves what matching and
     /// ordering mean, and are responsible for putting the best row first, since that is the one
     /// that starts out selected.
-    fn matching(needle: &str, store: &mut ProgramStore) -> Vec<Self>;
+    fn matching(context: &Self::Context, needle: &str, store: &mut ProgramStore) -> Vec<Self>;
 
     /// What to show in place of the list when nothing matches.
     fn empty_message() -> &'static str;
@@ -79,15 +89,18 @@ pub struct FilteredListState<T: FilteredItem> {
 
     /// The rows matching the filter.
     list: ListState<T, IambInfo>,
+
+    /// What the rows are built from, beyond the store and the filter.
+    context: T::Context,
 }
 
 impl<T: FilteredItem> FilteredListState<T> {
-    pub fn new(store: &mut ProgramStore) -> Self {
+    pub fn new(context: T::Context, store: &mut ProgramStore) -> Self {
         let buffer = store.load_buffer(T::filter_buffer());
         let filter = TextBoxState::new(buffer);
         let list = ListState::new(T::list_buffer(), vec![]);
 
-        FilteredListState { filter, list }
+        FilteredListState { filter, list, context }
     }
 
     /// How many rows the list currently holds.
@@ -105,7 +118,7 @@ impl<T: FilteredItem> FilteredListState<T> {
     pub fn rebuild(&mut self, store: &mut ProgramStore) {
         let needle = self.filter.get().to_string().trim().to_string();
 
-        self.list.set(T::matching(&needle, store));
+        self.list.set(T::matching(&self.context, &needle, store));
     }
 }
 
@@ -210,7 +223,11 @@ impl<T: FilteredItem> WindowOps<IambInfo> for FilteredListState<T> {
     }
 
     fn dup(&self, store: &mut ProgramStore) -> Self {
-        FilteredListState { filter: self.filter.dup(store), list: self.list.dup(store) }
+        FilteredListState {
+            filter: self.filter.dup(store),
+            list: self.list.dup(store),
+            context: self.context.clone(),
+        }
     }
 
     fn close(&mut self, flags: CloseFlags, store: &mut ProgramStore) -> bool {

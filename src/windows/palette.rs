@@ -225,6 +225,9 @@ impl Display for PaletteItem {
 }
 
 impl FilteredItem for PaletteItem {
+    /// Every command comes from the store, so there is nothing else to carry.
+    type Context = ();
+
     fn filter_buffer() -> IambBufferId {
         IambBufferId::CommandPaletteFilter
     }
@@ -233,7 +236,7 @@ impl FilteredItem for PaletteItem {
         IambBufferId::CommandPaletteList
     }
 
-    fn matching(needle: &str, store: &mut ProgramStore) -> Vec<PaletteItem> {
+    fn matching(_: &(), needle: &str, store: &mut ProgramStore) -> Vec<PaletteItem> {
         let needle = needle.to_lowercase();
 
         PaletteItem::all(store)

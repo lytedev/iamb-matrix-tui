@@ -1049,12 +1049,12 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
             Ok(IambWindow::SnoozeList(list))
         },
         IambId::CommandPalette => {
-            let win = CommandPaletteState::new(store);
+            let win = CommandPaletteState::new((), store);
 
             Ok(IambWindow::CommandPalette(win))
         },
         IambId::QuickSwitcher => {
-            let win = QuickSwitcherState::new(store);
+            let win = QuickSwitcherState::new((), store);
 
             Ok(IambWindow::QuickSwitcher(win))
         },

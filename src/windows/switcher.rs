@@ -325,6 +325,9 @@ impl Display for SwitchItem {
 }
 
 impl FilteredItem for SwitchItem {
+    /// Every entry comes from the store, so there is nothing else to carry.
+    type Context = ();
+
     fn filter_buffer() -> IambBufferId {
         IambBufferId::QuickSwitcherFilter
     }
@@ -333,7 +336,7 @@ impl FilteredItem for SwitchItem {
         IambBufferId::QuickSwitcherList
     }
 
-    fn matching(needle: &str, store: &mut ProgramStore) -> Vec<SwitchItem> {
+    fn matching(_: &(), needle: &str, store: &mut ProgramStore) -> Vec<SwitchItem> {
         let mut items = SwitchItem::rooms(store);
 
         items.extend(SwitchItem::threads(store));
