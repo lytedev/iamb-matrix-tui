@@ -97,8 +97,14 @@ pub struct FilteredListState<T: FilteredItem> {
 impl<T: FilteredItem> FilteredListState<T> {
     pub fn new(context: T::Context, store: &mut ProgramStore) -> Self {
         let buffer = store.load_buffer(T::filter_buffer());
-        let filter = TextBoxState::new(buffer);
+        let mut filter = TextBoxState::new(buffer);
         let list = ListState::new(T::list_buffer(), vec![]);
+
+        // The store keeps one buffer per id and hands the same one to every window that asks for
+        // it, so the text typed into the last one of these windows is still in it. A window that
+        // opens with an old filter shows a list narrowed by something the user typed long ago, and
+        // looks empty or wrong.
+        filter.reset();
 
         FilteredListState { filter, list, context }
     }
@@ -262,5 +268,38 @@ impl<T: FilteredItem> WindowOps<IambInfo> for FilteredListState<T> {
 
     fn get_selected_word(&self) -> Option<String> {
         self.list.get_selected_word()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::tests::mock_store;
+    use crate::windows::palette::CommandPaletteState;
+    use crate::windows::switcher::QuickSwitcherState;
+
+    #[tokio::test]
+    async fn test_the_switcher_opens_with_an_empty_filter() {
+        let mut store = mock_store().await;
+
+        let mut first = QuickSwitcherState::new((), &mut store);
+        first.filter.set_text("something typed a while ago");
+
+        let second = QuickSwitcherState::new((), &mut store);
+
+        assert_eq!(second.filter.get_text().trim(), "");
+    }
+
+    #[tokio::test]
+    async fn test_the_palette_opens_with_an_empty_filter() {
+        let mut store = mock_store().await;
+
+        let mut first = CommandPaletteState::new((), &mut store);
+        first.filter.set_text("something typed a while ago");
+
+        let second = CommandPaletteState::new((), &mut store);
+
+        assert_eq!(second.filter.get_text().trim(), "");
     }
 }
