@@ -2,11 +2,13 @@
 use std::borrow::Cow;
 use std::cmp::{Ord, Ordering, PartialOrd};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
-use std::ops::{Deref, DerefMut};
+use std::iter::Chain;
+use std::ops::{Deref, DerefMut, RangeBounds};
+use std::option;
 
 use chrono::{DateTime, Local as LocalTz};
 use humansize::{format_size, DECIMAL};
@@ -120,6 +122,111 @@ impl Messages {
         // Remove any echo.
         let key = (MessageTimeStamp::LocalEcho, event_id);
         let _ = self.0.remove(&key);
+    }
+}
+
+/// The messages of one thread, with the message that started the thread in front of them.
+///
+/// The root of a thread belongs to the main scrollback, not to the thread's own map, so a thread
+/// alone reads as a conversation without its opening. This view puts the root back in front of the
+/// replies. It borrows both, because a [Message] is not [Clone] and because one message with two
+/// homes drifts apart from itself when an edit reaches only one of them.
+///
+/// The view is read-only. To change a message, go to the map that owns it.
+#[derive(Clone, Copy)]
+pub struct ThreadView<'a> {
+    root: Option<(&'a MessageKey, &'a Message)>,
+    replies: Option<&'a Messages>,
+}
+
+impl<'a> ThreadView<'a> {
+    /// A view of `replies` with `root` in front of them.
+    ///
+    /// The replies are absent until the thread is loaded, and the root is dropped when the replies
+    /// already hold it, so that it cannot appear two times.
+    pub fn with_root(
+        replies: Option<&'a Messages>,
+        root: Option<(&'a MessageKey, &'a Message)>,
+    ) -> Self {
+        let root = root.filter(|(key, _)| !replies.is_some_and(|r| r.contains_key(*key)));
+
+        ThreadView { root, replies }
+    }
+
+    /// The replies alone, without the root in front of them.
+    ///
+    /// Read receipts use this. The main scrollback already counts the root, and a receipt for the
+    /// thread must not move onto a message that the thread does not contain.
+    pub fn replies(&self) -> Option<&'a Messages> {
+        self.replies
+    }
+
+    pub fn range<R>(&self, range: R) -> ThreadRange<'a>
+    where
+        R: RangeBounds<MessageKey>,
+    {
+        let root = self.root.filter(|(key, _)| range.contains(*key));
+        let replies = match self.replies {
+            Some(replies) => replies.range(range),
+            None => Default::default(),
+        };
+
+        ThreadRange(root.into_iter().chain(replies))
+    }
+
+    pub fn get(&self, key: &MessageKey) -> Option<&'a Message> {
+        match self.root {
+            Some((root, msg)) if root == key => Some(msg),
+            _ => self.replies?.get(key),
+        }
+    }
+
+    pub fn contains_key(&self, key: &MessageKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn first_key_value(&self) -> Option<(&'a MessageKey, &'a Message)> {
+        self.root.or_else(|| self.replies?.first_key_value())
+    }
+
+    pub fn last_key_value(&self) -> Option<(&'a MessageKey, &'a Message)> {
+        self.replies.and_then(|r| r.last_key_value()).or(self.root)
+    }
+}
+
+impl<'a> From<&'a Messages> for ThreadView<'a> {
+    fn from(replies: &'a Messages) -> Self {
+        ThreadView { root: None, replies: Some(replies) }
+    }
+}
+
+/// The messages of a [ThreadView] within a range of keys.
+pub struct ThreadRange<'a>(
+    Chain<
+        option::IntoIter<(&'a MessageKey, &'a Message)>,
+        btree_map::Range<'a, MessageKey, Message>,
+    >,
+);
+
+impl Default for ThreadRange<'_> {
+    fn default() -> Self {
+        let replies: btree_map::Range<'_, MessageKey, Message> = Default::default();
+
+        ThreadRange(None.into_iter().chain(replies))
+    }
+}
+
+impl<'a> Iterator for ThreadRange<'a> {
+    type Item = (&'a MessageKey, &'a Message);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+impl DoubleEndedIterator for ThreadRange<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back()
     }
 }
 
@@ -345,7 +452,7 @@ impl MessageCursor {
         MessageCursor::default()
     }
 
-    pub fn to_key<'a>(&'a self, thread: &'a Messages) -> Option<&'a MessageKey> {
+    pub fn to_key<'a>(&'a self, thread: &ThreadView<'a>) -> Option<&'a MessageKey> {
         if let Some(ref key) = self.timestamp {
             Some(key)
         } else {
@@ -353,7 +460,7 @@ impl MessageCursor {
         }
     }
 
-    pub fn from_cursor(cursor: &Cursor, thread: &Messages) -> Option<Self> {
+    pub fn from_cursor(cursor: &Cursor, thread: &ThreadView) -> Option<Self> {
         let ev_hash = cursor.get_x();
         let ev_term = OwnedEventId::try_from("$").ok()?;
 
@@ -377,7 +484,7 @@ impl MessageCursor {
             .map(|((ts, ev), _)| Self::from((*ts, ev.clone())))
     }
 
-    pub fn to_cursor(&self, thread: &Messages) -> Option<Cursor> {
+    pub fn to_cursor(&self, thread: &ThreadView) -> Option<Cursor> {
         let (ts, event_id) = self.to_key(thread)?;
 
         let y = usize::try_from(ts).ok()?;
@@ -1380,6 +1487,7 @@ pub mod tests {
     #[test]
     fn test_mc_to_key() {
         let messages = mock_messages();
+        let view = ThreadView::from(&messages);
         let mc1 = MessageCursor::from(MSG1_KEY.clone());
         let mc2 = MessageCursor::from(MSG2_KEY.clone());
         let mc3 = MessageCursor::from(MSG3_KEY.clone());
@@ -1387,12 +1495,12 @@ pub mod tests {
         let mc5 = MessageCursor::from(MSG5_KEY.clone());
         let mc6 = MessageCursor::latest();
 
-        let k1 = mc1.to_key(&messages).unwrap();
-        let k2 = mc2.to_key(&messages).unwrap();
-        let k3 = mc3.to_key(&messages).unwrap();
-        let k4 = mc4.to_key(&messages).unwrap();
-        let k5 = mc5.to_key(&messages).unwrap();
-        let k6 = mc6.to_key(&messages).unwrap();
+        let k1 = mc1.to_key(&view).unwrap();
+        let k2 = mc2.to_key(&view).unwrap();
+        let k3 = mc3.to_key(&view).unwrap();
+        let k4 = mc4.to_key(&view).unwrap();
+        let k5 = mc5.to_key(&view).unwrap();
+        let k6 = mc6.to_key(&view).unwrap();
 
         // These should all be equal to their MSGN_KEYs.
         assert_eq!(k1, &MSG1_KEY.clone());
@@ -1406,12 +1514,14 @@ pub mod tests {
 
         // MessageCursor::latest() fails to convert for a room w/o messages.
         let messages_empty = Messages::new(ReceiptThread::Main);
-        assert_eq!(mc6.to_key(&messages_empty), None);
+        let empty_view = ThreadView::from(&messages_empty);
+        assert_eq!(mc6.to_key(&empty_view), None);
     }
 
     #[test]
     fn test_mc_to_from_cursor() {
         let messages = mock_messages();
+        let view = ThreadView::from(&messages);
         let mc1 = MessageCursor::from(MSG1_KEY.clone());
         let mc2 = MessageCursor::from(MSG2_KEY.clone());
         let mc3 = MessageCursor::from(MSG3_KEY.clone());
@@ -1420,9 +1530,9 @@ pub mod tests {
         let mc6 = MessageCursor::latest();
 
         let identity = |mc: &MessageCursor| {
-            let c = mc.to_cursor(&messages).unwrap();
+            let c = mc.to_cursor(&view).unwrap();
 
-            MessageCursor::from_cursor(&c, &messages).unwrap()
+            MessageCursor::from_cursor(&c, &view).unwrap()
         };
 
         // These should all convert to a Cursor and back to the original value.
