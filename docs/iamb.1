@@ -146,6 +146,11 @@ would.
 .Sy <C-K>
 is bound in normal and visual mode only, so it does not shadow the Vim digraph
 key while you are typing a message.
+.It Sy ":context"
+Open the selected message where it lives, and select it there.
+A thread reply is read in its thread, and the message that started a thread is
+read in the main scrollback, so this goes to the one the message belongs to.
+It reports an error when the message is already being read where it lives.
 .It Sy ":snooze [duration]"
 Defer the focused room, the thread being viewed, or the selected list entry, so
 that it leaves

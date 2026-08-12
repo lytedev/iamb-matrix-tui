@@ -476,6 +476,13 @@ pub enum RoomAction {
     /// Move the scrollback cursor onto a message, loading it first if necessary.
     SelectMessage(OwnedEventId),
 
+    /// Open the selected message where it lives, and select it there.
+    ///
+    /// A message can be looked at from more than one place: a thread reply is read in the thread,
+    /// and the message that started a thread is read in the main scrollback. This goes to the one
+    /// the message belongs to.
+    Context,
+
     /// Update a user's membership in this room.
     MemberUpdate(MemberUpdateAction, String, Option<String>, bool),
 
@@ -822,6 +829,9 @@ pub enum IambError {
 
     #[error("This room or thread is not snoozed")]
     NotSnoozed,
+
+    #[error("This message is already being read where it lives")]
+    AlreadyInContext,
 
     #[error("{0}")]
     BadSnoozeDuration(String),

@@ -209,6 +209,14 @@ impl ChatState {
         }
     }
 
+    /// The event id of the message the cursor is on, if there is one.
+    ///
+    /// Exposed so that a room-level action can act on the selection without reaching into the
+    /// scrollback, which is private for good reason.
+    pub fn selected_event(&self, info: &mut RoomInfo) -> Option<OwnedEventId> {
+        self.scrollback.get_key(info).map(|(_, event_id)| event_id)
+    }
+
     pub fn thread(&self) -> Option<&OwnedEventId> {
         self.scrollback.thread()
     }
