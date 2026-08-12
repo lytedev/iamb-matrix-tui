@@ -16,6 +16,7 @@ use gethostname::gethostname;
 use matrix_sdk::ruma::events::sticker::StickerEventContent;
 use matrix_sdk::ruma::events::RoomAccountDataEventType;
 
+use crate::search::{hits, search_request, MessageHit, MAX_HITS};
 use crate::snooze::{SnoozeContent, SNOOZE_EVENT_TYPE};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
@@ -745,6 +746,7 @@ pub enum WorkerTask {
     GetRoom(OwnedRoomId, ClientReply<IambResult<FetchedRoom>>),
     JoinRoom(String, ClientReply<IambResult<OwnedRoomId>>),
     Members(OwnedRoomId, ClientReply<IambResult<Vec<RoomMember>>>),
+    SearchMessages(String, ClientReply<IambResult<Vec<MessageHit>>>),
     SpaceMembers(OwnedRoomId, ClientReply<IambResult<Vec<OwnedRoomId>>>),
     TypingNotice(OwnedRoomId),
     Verify(VerifyAction, SasVerification, ClientReply<IambResult<EditInfo>>),
@@ -787,6 +789,12 @@ impl Debug for WorkerTask {
             WorkerTask::Members(room_id, _) => {
                 f.debug_tuple("WorkerTask::Members")
                     .field(room_id)
+                    .field(&format_args!("_"))
+                    .finish()
+            },
+            WorkerTask::SearchMessages(term, _) => {
+                f.debug_tuple("WorkerTask::SearchMessages")
+                    .field(term)
                     .field(&format_args!("_"))
                     .finish()
             },
@@ -931,6 +939,20 @@ impl Requester {
         return response.recv();
     }
 
+    /// Ask the homeserver for the messages that match `term`, newest first.
+    ///
+    /// This blocks the caller until the search comes back, the same way asking for a room's
+    /// members does. That is what makes it safe to search on the network at all: the search runs
+    /// once, when the user submits `:search`, and never again while they filter what it found. A
+    /// search that ran as the user typed would be one request per keystroke.
+    pub fn search_messages(&self, term: String) -> IambResult<Vec<MessageHit>> {
+        let (reply, response) = oneshot();
+
+        self.tx.send(WorkerTask::SearchMessages(term, reply)).unwrap();
+
+        return response.recv();
+    }
+
     pub fn space_members(&self, space: OwnedRoomId) -> IambResult<Vec<OwnedRoomId>> {
         let (reply, response) = oneshot();
 
@@ -1034,6 +1056,10 @@ impl ClientWorker {
             WorkerTask::Members(room_id, reply) => {
                 assert!(self.initialized);
                 reply.send(self.members(room_id).await);
+            },
+            WorkerTask::SearchMessages(term, reply) => {
+                assert!(self.initialized);
+                reply.send(self.search_messages(term).await);
             },
             WorkerTask::SpaceMembers(space, reply) => {
                 assert!(self.initialized);
@@ -1566,6 +1592,35 @@ impl ClientWorker {
         } else {
             Err(IambError::UnknownRoom(room_id).into())
         }
+    }
+
+    /// Collect the messages matching `term`, following the homeserver's paging.
+    ///
+    /// One request rarely returns everything, so this keeps asking with the `next_batch` the last
+    /// answer gave until the server runs out, or until [MAX_HITS] have been collected. The user
+    /// is waiting on this, so the cap is what keeps a term such as "the" from spending a minute
+    /// paging through years of chat before anything appears.
+    async fn search_messages(&mut self, term: String) -> IambResult<Vec<MessageHit>> {
+        let mut collected = Vec::new();
+        let mut next_batch = None;
+
+        loop {
+            let request = search_request(term.clone(), next_batch);
+            let response = self.client.send(request).await.map_err(IambError::from)?;
+            let results = response.search_categories.room_events;
+
+            collected.extend(hits(&results));
+
+            next_batch = results.next_batch;
+
+            if next_batch.is_none() || collected.len() >= MAX_HITS {
+                break;
+            }
+        }
+
+        collected.truncate(MAX_HITS);
+
+        Ok(collected)
     }
 
     async fn space_members(&mut self, space: OwnedRoomId) -> IambResult<Vec<OwnedRoomId>> {

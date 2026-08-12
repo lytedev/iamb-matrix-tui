@@ -78,6 +78,7 @@ mod keybindings;
 mod message;
 mod notifications;
 mod preview;
+mod search;
 mod sled_export;
 mod snooze;
 mod util;
