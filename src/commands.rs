@@ -448,6 +448,23 @@ fn iamb_commands(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult 
     return Ok(step);
 }
 
+/// `:search <term>` opens the messages the homeserver found for a term.
+///
+/// The whole of the argument is the term, quoting and all, because a search term is prose rather
+/// than a list of options: somebody looking for `deploy on friday` means those three words.
+fn iamb_search(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let term = desc.arg.text.trim();
+
+    if term.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::MessageSearch(term.to_string())));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_switch(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -1188,6 +1205,12 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         forms: &[opens("List the spaces you have joined", IambId::SpaceList)],
     },
     IambCommandInfo {
+        name: "search",
+        aliases: &[],
+        f: iamb_search,
+        forms: &[form("<term>", "Search every readable room for messages matching a term")],
+    },
+    IambCommandInfo {
         name: "switch",
         aliases: &["switcher"],
         f: iamb_switch,
@@ -1394,6 +1417,22 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         assert!(cmds.input_cmd(":switch foo", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_search() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+        let window = IambId::MessageSearch("deploy on friday".to_string());
+        let act = WindowAction::Switch(OpenTarget::Application(window));
+
+        // The whole argument is the term, so a term of several words stays one term.
+        let res = cmds.input_cmd(":search deploy on friday", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        // Searching for nothing at all is a mistake rather than a search of everything.
+        assert!(cmds.input_cmd(":search", ctx.clone()).is_err());
+        assert!(cmds.input_cmd(":search    ", ctx).is_err());
     }
 
     #[test]

@@ -105,6 +105,23 @@ Mark every room and thread as read.
 View a list of joined rooms.
 .It Sy ":spaces"
 View a list of joined spaces.
+.It Sy ":search" Ar term
+Search every room the homeserver can read for messages matching
+.Ar term ,
+and list what it finds, newest first.
+The whole argument is the term, so
+.Sy ":search deploy on friday"
+searches for those three words.
+.Pp
+The list works like the quick switcher: type to narrow it down by message text,
+sender, or room, move through it with the usual movement keys, and press
+.Sy <Enter>
+to go to the selected message where it was sent.
+Narrowing the list does not search again; the search runs once, when the window
+opens.
+.Pp
+Encrypted rooms are missing from the results.
+The homeserver cannot read them, so it cannot search them.
 .It Sy ":switch" , Sy ":switcher"
 Open the quick switcher: one fuzzy-matched list of everywhere there is to jump
 to.

@@ -2400,6 +2400,12 @@ pub enum IambId {
 
     /// The `:switch` window.
     QuickSwitcher,
+
+    /// The `:search` window for one search term.
+    ///
+    /// The term is part of the identity of the window, so that two searches are two windows
+    /// rather than one window that keeps changing what it holds.
+    MessageSearch(String),
 }
 
 impl Display for IambId {
@@ -2426,8 +2432,24 @@ impl Display for IambId {
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
             IambId::CommandPalette => f.write_str("iamb://commands"),
             IambId::QuickSwitcher => f.write_str("iamb://switch"),
+            IambId::MessageSearch(term) => f.write_str(search_url(term).as_str()),
         }
     }
+}
+
+/// The query parameter a `:search` window's URL carries its term in.
+const SEARCH_TERM_KEY: &str = "q";
+
+/// The window URL for a search of `term`.
+///
+/// A term is arbitrary text and a window identifier is a URL, so the term goes in a query
+/// parameter, which is the part of a URL that is allowed to hold arbitrary text. [Url] escapes it.
+fn search_url(term: &str) -> Url {
+    let mut url = Url::parse("iamb://search").expect("iamb://search is a valid URL");
+
+    url.query_pairs_mut().append_pair(SEARCH_TERM_KEY, term);
+
+    url
 }
 
 impl ApplicationWindowId for IambId {}
@@ -2599,6 +2621,14 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::QuickSwitcher)
             },
+            Some("search") => {
+                let Some((_, term)) = url.query_pairs().find(|(key, _)| key == SEARCH_TERM_KEY)
+                else {
+                    return Err(E::custom("iamb://search needs a search term"));
+                };
+
+                Ok(IambId::MessageSearch(term.into_owned()))
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2690,6 +2720,12 @@ pub enum IambBufferId {
 
     /// The quick switcher's filter bar.
     QuickSwitcherFilter,
+
+    /// The `:search` window's result list.
+    MessageSearchList,
+
+    /// The `:search` window's filter bar.
+    MessageSearchFilter,
 }
 
 impl IambBufferId {
@@ -2713,6 +2749,11 @@ impl IambBufferId {
             IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
             IambBufferId::QuickSwitcherList => IambId::QuickSwitcher,
             IambBufferId::QuickSwitcherFilter => IambId::QuickSwitcher,
+
+            // A search window is identified by its term, which a buffer identifier does not
+            // carry, so a mark in one cannot name the window it came from.
+            IambBufferId::MessageSearchList => return None,
+            IambBufferId::MessageSearchFilter => return None,
         };
 
         Some(id)
@@ -2766,6 +2807,8 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::CommandPaletteFilter => vec![],
             IambBufferId::QuickSwitcherList => vec![],
             IambBufferId::QuickSwitcherFilter => vec![],
+            IambBufferId::MessageSearchList => vec![],
+            IambBufferId::MessageSearchFilter => vec![],
         }
     }
 }
@@ -3434,6 +3477,25 @@ pub mod tests {
         }
 
         assert!(serde_json::from_str::<IambId>("\"iamb://threads/extra\"").is_err());
+    }
+
+    #[test]
+    fn test_search_window_urls_survive_any_term() {
+        // A term is arbitrary text, and the layout is saved and restored as these URLs, so a
+        // term with a space or a slash in it has to come back as the term it went in as.
+        for term in ["deploy", "deploy on friday", "a/b?c#d", "ok 💕"] {
+            let id = IambId::MessageSearch(term.to_string());
+            let json = serde_json::to_string(&id).unwrap();
+            let parsed: IambId = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(parsed, id);
+        }
+
+        let deploy = IambId::MessageSearch("deploy".to_string());
+        assert_eq!(deploy.to_string(), "iamb://search?q=deploy");
+
+        // A search window is its term, so there is no window to restore without one.
+        assert!(serde_json::from_str::<IambId>("\"iamb://search\"").is_err());
     }
 
     fn create_reaction_event(

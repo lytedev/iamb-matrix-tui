@@ -84,6 +84,7 @@ use crate::base::{
 
 use self::{
     palette::CommandPaletteState,
+    search::{MessageSearchState, SearchItem},
     room::RoomState,
     switcher::QuickSwitcherState,
     welcome::WelcomeState,
@@ -94,6 +95,7 @@ use feruca::Collator;
 pub mod filtered;
 pub mod palette;
 pub mod room;
+pub mod search;
 pub mod switcher;
 pub mod welcome;
 
@@ -461,6 +463,7 @@ macro_rules! delegate {
             IambWindow::UnreadThreadList($id) => $e,
             IambWindow::CommandPalette($id) => $e,
             IambWindow::QuickSwitcher($id) => $e,
+            IambWindow::MessageSearch($id, _) => $e,
         }
     };
 }
@@ -480,6 +483,9 @@ pub enum IambWindow {
     UnreadThreadList(UnreadThreadListState),
     CommandPalette(CommandPaletteState),
     QuickSwitcher(QuickSwitcherState),
+
+    /// The `:search` window, together with the term it was opened for.
+    MessageSearch(MessageSearchState, String),
 }
 
 impl IambWindow {
@@ -774,6 +780,7 @@ impl IambWindow {
             // typed into their filter bar.
             IambWindow::CommandPalette(state) => state.rebuild(store),
             IambWindow::QuickSwitcher(state) => state.rebuild(store),
+            IambWindow::MessageSearch(state, _) => state.rebuild(store),
 
             IambWindow::DirectList(state) => {
                 let items = store.application.sync_info.dms.clone();
@@ -888,6 +895,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::Welcome(state) => return state.draw(area, buf, focused, store),
             IambWindow::CommandPalette(state) => return state.draw(area, buf, focused, store),
             IambWindow::QuickSwitcher(state) => return state.draw(area, buf, focused, store),
+            IambWindow::MessageSearch(state, _) => return state.draw(area, buf, focused, store),
             _ => {},
         }
 
@@ -935,7 +943,8 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::Room(_) |
             IambWindow::Welcome(_) |
             IambWindow::CommandPalette(_) |
-            IambWindow::QuickSwitcher(_) => {},
+            IambWindow::QuickSwitcher(_) |
+            IambWindow::MessageSearch(..) => {},
         }
     }
 
@@ -944,6 +953,9 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::Room(w) => w.dup(store).into(),
             IambWindow::CommandPalette(w) => IambWindow::CommandPalette(w.dup(store)),
             IambWindow::QuickSwitcher(w) => IambWindow::QuickSwitcher(w.dup(store)),
+            IambWindow::MessageSearch(w, term) => {
+                IambWindow::MessageSearch(w.dup(store), term.clone())
+            },
             IambWindow::DirectList(w) => w.dup(store).into(),
             IambWindow::MemberList(w, room_id, last_fetch) => {
                 IambWindow::MemberList(w.dup(store), room_id.clone(), *last_fetch)
@@ -987,6 +999,14 @@ impl WindowOps<IambInfo> for IambWindow {
 }
 
 /// Build a window with an empty list, which [IambWindow::refresh] then fills in.
+/// The title of a `:search` window, which is the term it was opened for.
+///
+/// The term is what tells two search windows apart, so it belongs in the title rather than only
+/// in the window's URL.
+fn search_title(term: &str) -> Line<'static> {
+    Line::from(vec![bold_span("Search: "), Span::raw(term.to_string())])
+}
+
 fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
     match id {
         IambId::Room(room_id, thread) => {
@@ -1058,6 +1078,16 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
 
             Ok(IambWindow::QuickSwitcher(win))
         },
+        IambId::MessageSearch(term) => {
+            // The search runs here, when the window is opened, rather than in the command that
+            // opens it. That is what makes a window restored from a saved layout show results
+            // rather than an empty list, and it means reopening the same search refreshes it.
+            let found = store.application.worker.search_messages(term.clone())?;
+            let found = Arc::new(SearchItem::rows(found, store));
+            let win = MessageSearchState::new(found, store);
+
+            Ok(IambWindow::MessageSearch(win, term))
+        },
         IambId::UnreadThreadList => {
             let list = UnreadThreadListState::new(IambBufferId::UnreadThreadList, vec![]);
 
@@ -1083,6 +1113,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
             IambWindow::CommandPalette(_) => IambId::CommandPalette,
             IambWindow::QuickSwitcher(_) => IambId::QuickSwitcher,
+            IambWindow::MessageSearch(_, term) => IambId::MessageSearch(term.clone()),
         }
     }
 
@@ -1100,6 +1131,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
+            IambWindow::MessageSearch(_, term) => search_title(term),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -1133,6 +1165,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
+            IambWindow::MessageSearch(_, term) => search_title(term),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
