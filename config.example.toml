@@ -53,6 +53,9 @@ location = "title|prompt"
 # needs an unlocked vault, such as "rbw", fails whenever the vault is locked.
 # Reading a decrypted secrets file suits a client that starts unattended.
 #
+# Turning this on indexes what arrives from now on. Run ":reindex" to index the
+# history that already exists, which is what most searches are looking for.
+#
 # The index is disposable. Delete the directory to start again.
 [settings.local_index]
 enabled = false
