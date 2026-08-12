@@ -35,6 +35,7 @@ use matrix_sdk::{
     event_handler::Ctx,
     reqwest,
     room::{Messages, MessagesOptions, Room as MatrixRoom, RoomMember},
+    search_index::SearchIndexStoreKind,
     ruma::{
         api::client::{
             filter::{FilterDefinition, LazyLoadOptions, RoomEventFilter, RoomFilter},
@@ -824,6 +825,42 @@ impl Debug for WorkerTask {
     }
 }
 
+/// Where to keep the local message index, when the user asked for one.
+///
+/// [None] leaves the client on the SDK default, which is an index in memory. An index in memory
+/// is never written to disk and is thrown away when iamb exits, so it costs nothing to leave the
+/// feature compiled in while the setting is off.
+///
+/// An index is encrypted when the configuration file gives a passphrase. Without one it is a
+/// plain tantivy directory, and the words of every indexed message can be read out of it without
+/// a key. Say so, because the setting is easy to leave out by accident.
+fn search_index_store(settings: &ApplicationSettings) -> Option<SearchIndexStoreKind> {
+    if !settings.tunables.local_index.enabled {
+        return None;
+    }
+
+    let dir = settings.search_index_dir.clone();
+
+    // The SDK creates one directory per room under this one, but not this one.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("Could not create the local message index directory: {e}");
+
+        return None;
+    }
+
+    match &settings.tunables.local_index.passphrase {
+        Some(passphrase) => Some(SearchIndexStoreKind::EncryptedDirectory(dir, passphrase.clone())),
+        None => {
+            tracing::warn!(
+                "The local message index has no passphrase, so it is written unencrypted. \
+                 Set settings.local_index.passphrase to encrypt it."
+            );
+
+            Some(SearchIndexStoreKind::UnencryptedDirectory(dir))
+        },
+    }
+}
+
 async fn create_client_inner(
     homeserver: &Option<Url>,
     settings: &ApplicationSettings,
@@ -849,6 +886,11 @@ async fn create_client_inner(
         .sqlite_store(settings.sqlite_dir.as_path(), None)
         .request_config(req_config)
         .with_encryption_settings(DEFAULT_ENCRYPTION_SETTINGS);
+
+    let builder = match search_index_store(settings) {
+        Some(kind) => builder.search_index_store(kind),
+        None => builder,
+    };
 
     let builder = if let Some(url) = homeserver {
         // Use the explicitly specified homeserver.
@@ -1488,6 +1530,18 @@ impl ClientWorker {
                 let session = MatrixSession::from(&resp);
                 self.settings.write_session(session)?;
             },
+        }
+
+        // Subscribing the event cache is what starts the indexing task, because the index is fed
+        // from event cache updates and from nothing else. Do it before the first sync, so that no
+        // message arrives while nothing is listening.
+        //
+        // This also makes the event cache write events to the sqlite store, where before today it
+        // held an empty database. That is the larger part of what the setting turns on.
+        if self.settings.tunables.local_index.enabled {
+            if let Err(e) = client.event_cache().subscribe() {
+                tracing::error!("Could not start the local message index: {e}");
+            }
         }
 
         self.sync_handle = tokio::spawn(async move {
