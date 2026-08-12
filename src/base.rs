@@ -1120,6 +1120,13 @@ pub struct RoomInfo {
     /// A map of message identifiers to thread replies.
     threads: HashMap<OwnedEventId, Messages>,
 
+    /// Edits whose target message is not loaded yet, kept by the identifier of that target.
+    ///
+    /// Backwards pagination gives the newest event first, so an edit usually arrives before the
+    /// message that it edits. Without this map the edit has nothing to apply to, and the room
+    /// keeps the message as the sender first wrote it.
+    pending_edits: HashMap<OwnedEventId, RoomMessageEventContentWithoutRelation>,
+
     /// Whether the scrollback for this room is currently being fetched.
     pub fetching: bool,
 
@@ -1151,6 +1158,7 @@ impl Default for RoomInfo {
             user_receipts: Default::default(),
             reactions: Default::default(),
             threads: Default::default(),
+            pending_edits: Default::default(),
             fetching: Default::default(),
             fetch_id: Default::default(),
             fetch_last: Default::default(),
@@ -1492,20 +1500,21 @@ impl RoomInfo {
         let event_id = msg.event_id;
         let new_msgtype = msg.new_content;
 
-        let Some(EventLocation::Message(thread, key)) = self.keys.get(&event_id) else {
-            return;
-        };
+        if !self.apply_edit(&event_id, new_msgtype.clone()) {
+            self.pending_edits.insert(event_id, new_msgtype);
+        }
+    }
 
-        let source = if let Some(thread) = thread {
-            self.threads
-                .entry(thread.clone())
-                .or_insert_with(|| Messages::thread(thread.clone()))
-        } else {
-            &mut self.messages
-        };
-
-        let Some(msg) = source.get_mut(key) else {
-            return;
+    /// Apply the new content of an edit to the message that it edits.
+    ///
+    /// This returns `false` when the room does not hold that message.
+    fn apply_edit(
+        &mut self,
+        event_id: &EventId,
+        new_msgtype: RoomMessageEventContentWithoutRelation,
+    ) -> bool {
+        let Some(msg) = self.get_event_mut(event_id) else {
+            return false;
         };
 
         match &mut msg.event {
@@ -1520,12 +1529,15 @@ impl RoomInfo {
             MessageEvent::Sticker(_) |
             MessageEvent::EncryptedOriginal(_) |
             MessageEvent::EncryptedRedacted(_) => {
-                return;
+                // The message is here, but an edit cannot change it.
+                return true;
             },
         }
 
         msg.html = msg.event.html();
         msg.event.strip_reply_fallback();
+
+        true
     }
 
     pub fn insert_any_state(&mut self, msg: AnySyncStateEvent) {
@@ -1575,8 +1587,16 @@ impl RoomInfo {
         let key = (msg.origin_server_ts().into(), event_id.clone());
 
         let loc = EventLocation::Message(None, key.clone());
-        self.keys.insert(event_id, loc);
+        self.keys.insert(event_id.clone(), loc);
         self.messages.insert_message(key, msg);
+        self.apply_pending_edit(&event_id);
+    }
+
+    /// Apply an edit that reached this room before the message that it edits.
+    fn apply_pending_edit(&mut self, event_id: &EventId) {
+        if let Some(new_msgtype) = self.pending_edits.remove(event_id) {
+            self.apply_edit(event_id, new_msgtype);
+        }
     }
 
     fn insert_thread(&mut self, msg: RoomMessageEvent, thread_root: OwnedEventId) {
@@ -1588,8 +1608,9 @@ impl RoomInfo {
             .entry(thread_root.clone())
             .or_insert_with(|| Messages::thread(thread_root.clone()));
         let loc = EventLocation::Message(Some(thread_root), key.clone());
-        self.keys.insert(event_id, loc);
+        self.keys.insert(event_id.clone(), loc);
         replies.insert_message(key, msg);
+        self.apply_pending_edit(&event_id);
     }
 
     /// Insert a new message event.
@@ -3226,6 +3247,47 @@ pub mod tests {
         // A lookup that reads only the main scrollback misses this event altogether, and the
         // preview then tells the user that the message is not loaded.
         assert_eq!(shown_body(&room, &reply_id), "a corrected reply");
+    }
+
+    /// An `m.room.message` event, as the server sends it in a `/messages` chunk.
+    fn mock_text_event(event_id: &EventId, ts: u64, content: Value) -> RoomMessageEvent {
+        serde_json::from_value(Value::Object(Map::from_iter([
+            ("type".to_owned(), Value::String("m.room.message".into())),
+            ("content".to_owned(), content),
+            ("event_id".to_owned(), serde_json::to_value(event_id).unwrap()),
+            ("sender".to_owned(), serde_json::to_value(&*TEST_USER1).unwrap()),
+            ("origin_server_ts".to_owned(), serde_json::to_value(ts).unwrap()),
+            ("room_id".to_owned(), serde_json::to_value(&*TEST_ROOM1_ID).unwrap()),
+        ])))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_an_edit_that_arrives_before_its_target_still_shows() {
+        let mut room = RoomInfo::default();
+
+        let original_id = EventId::new_v1(server_name!("example.com"));
+        let edit_id = EventId::new_v1(server_name!("example.com"));
+
+        // Backwards pagination gives the newest event first, so the edit reaches the room
+        // before the message that it edits.
+        room.insert(mock_text_event(
+            &edit_id,
+            2,
+            serde_json::json!({
+                "msgtype": "m.text",
+                "body": "* the whole post",
+                "m.new_content": { "msgtype": "m.text", "body": "the whole post" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": original_id },
+            }),
+        ));
+        room.insert(mock_text_event(
+            &original_id,
+            1,
+            serde_json::json!({ "msgtype": "m.text", "body": "half of the post" }),
+        ));
+
+        assert_eq!(shown_body(&room, &original_id), "the whole post");
     }
 
     #[test]
