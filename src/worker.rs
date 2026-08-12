@@ -16,7 +16,16 @@ use gethostname::gethostname;
 use matrix_sdk::ruma::events::sticker::StickerEventContent;
 use matrix_sdk::ruma::events::RoomAccountDataEventType;
 
-use crate::search::{hits, search_request, sort_newest_first, MessageHit, MAX_HITS};
+use crate::search::{
+    hits,
+    local_hit,
+    search_request,
+    sort_newest_first,
+    Coverage,
+    MessageHit,
+    SearchResults,
+    MAX_HITS,
+};
 use crate::snooze::{SnoozeContent, SNOOZE_EVENT_TYPE};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
@@ -35,7 +44,6 @@ use matrix_sdk::{
     event_handler::Ctx,
     reqwest,
     room::{Messages, MessagesOptions, Room as MatrixRoom, RoomMember},
-    search_index::SearchIndexStoreKind,
     ruma::{
         api::client::{
             filter::{FilterDefinition, LazyLoadOptions, RoomEventFilter, RoomFilter},
@@ -84,6 +92,7 @@ use matrix_sdk::{
         OwnedUserId,
         RoomId,
     },
+    search_index::SearchIndexStoreKind,
     Client,
     ClientBuildError,
     Error as MatrixError,
@@ -747,7 +756,7 @@ pub enum WorkerTask {
     GetRoom(OwnedRoomId, ClientReply<IambResult<FetchedRoom>>),
     JoinRoom(String, ClientReply<IambResult<OwnedRoomId>>),
     Members(OwnedRoomId, ClientReply<IambResult<Vec<RoomMember>>>),
-    SearchMessages(String, ClientReply<IambResult<Vec<MessageHit>>>),
+    SearchMessages(String, ClientReply<IambResult<SearchResults>>),
     SpaceMembers(OwnedRoomId, ClientReply<IambResult<Vec<OwnedRoomId>>>),
     TypingNotice(OwnedRoomId),
     Verify(VerifyAction, SasVerification, ClientReply<IambResult<EditInfo>>),
@@ -987,7 +996,7 @@ impl Requester {
     /// members does. That is what makes it safe to search on the network at all: the search runs
     /// once, when the user submits `:search`, and never again while they filter what it found. A
     /// search that ran as the user typed would be one request per keystroke.
-    pub fn search_messages(&self, term: String) -> IambResult<Vec<MessageHit>> {
+    pub fn search_messages(&self, term: String) -> IambResult<SearchResults> {
         let (reply, response) = oneshot();
 
         self.tx.send(WorkerTask::SearchMessages(term, reply)).unwrap();
@@ -1648,16 +1657,35 @@ impl ClientWorker {
         }
     }
 
-    /// Collect the messages matching `term`, following the homeserver's paging.
+    /// Collect the messages matching `term` from both places one can be found.
+    ///
+    /// The homeserver answers for the rooms it can read, and the local index answers for the
+    /// encrypted rooms it holds. Neither source can answer for the other's rooms, so no message
+    /// arrives twice and the two lists are simply joined.
+    ///
+    /// The joined list is put in time order rather than kept in either source's ranking, because
+    /// the homeserver's rank and the index's BM25 score measure different things and interleaving
+    /// them produces an order that means nothing. Time order also makes the cap honest: what
+    /// [MAX_HITS] drops is the oldest of everything found, not whichever source came last.
+    async fn search_messages(&mut self, term: String) -> IambResult<SearchResults> {
+        let mut hits = self.search_server(term.clone()).await?;
+        let (local, coverage) = self.search_local_index(term).await;
+
+        hits.extend(local);
+
+        sort_newest_first(&mut hits);
+        hits.truncate(MAX_HITS);
+
+        Ok(SearchResults { hits, coverage })
+    }
+
+    /// Ask the homeserver for the messages matching `term`.
     ///
     /// One request rarely returns everything, so this keeps asking with the `next_batch` the last
     /// answer gave until the server runs out, or until [MAX_HITS] have been collected. The user
     /// is waiting on this, so the cap is what keeps a term such as "the" from spending a minute
     /// paging through years of chat before anything appears.
-    ///
-    /// The whole set is put in order before the cap is applied, because the homeserver orders
-    /// each room's matches on its own rather than across the search.
-    async fn search_messages(&mut self, term: String) -> IambResult<Vec<MessageHit>> {
+    async fn search_server(&mut self, term: String) -> IambResult<Vec<MessageHit>> {
         let mut collected = Vec::new();
         let mut next_batch = None;
 
@@ -1675,10 +1703,57 @@ impl ClientWorker {
             }
         }
 
-        sort_newest_first(&mut collected);
-        collected.truncate(MAX_HITS);
-
         Ok(collected)
+    }
+
+    /// Ask the local index for the messages matching `term` in the encrypted rooms.
+    ///
+    /// Only encrypted rooms are asked. An unencrypted room is the homeserver's to answer for, and
+    /// its answer covers the whole history rather than only what was indexed here.
+    ///
+    /// A room is asked only when its index directory already exists. This is not an optimisation:
+    /// `Room::search` creates the directory for a room that has none, so searching every joined
+    /// room would leave an empty index behind for each of them. Testing the directory is also how
+    /// this tells "indexed and no match" from "never indexed", which is what the returned
+    /// [Coverage] carries to the window.
+    ///
+    /// A search that fails is reported as an un-indexed room rather than as an error for the whole
+    /// search, so that one unreadable index or one query the tantivy parser rejects does not throw
+    /// away what the homeserver found.
+    async fn search_local_index(&mut self, term: String) -> (Vec<MessageHit>, Coverage) {
+        let enabled = self.settings.tunables.local_index.enabled;
+        let mut collected = Vec::new();
+        let mut unindexed_rooms = 0;
+
+        for room in self.client.joined_rooms() {
+            if !room.encryption_state().is_encrypted() {
+                continue;
+            }
+
+            let indexed =
+                enabled && self.settings.search_index_dir.join(room.room_id().as_str()).is_dir();
+
+            if !indexed {
+                unindexed_rooms += 1;
+                continue;
+            }
+
+            let mut search = room.search_messages(term.clone(), MAX_HITS);
+
+            match search.next_events().await {
+                Ok(Some(events)) => {
+                    collected
+                        .extend(events.iter().filter_map(|event| local_hit(room.room_id(), event)));
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    tracing::warn!(room_id = ?room.room_id(), "local index search failed: {e}");
+                    unindexed_rooms += 1;
+                },
+            }
+        }
+
+        (collected, Coverage { unindexed_rooms, local_index_enabled: enabled })
     }
 
     async fn space_members(&mut self, space: OwnedRoomId) -> IambResult<Vec<OwnedRoomId>> {
