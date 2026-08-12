@@ -35,6 +35,7 @@ use ratatui::{
 use modalkit::actions::{
     Action,
     Editable,
+    WindowAction,
     EditorAction,
     Jumpable,
     PromptAction,
@@ -48,6 +49,7 @@ use modalkit_ratatui::{TermOffset, TerminalCursor, WindowOps};
 
 use crate::snooze::SnoozeKey;
 use crate::base::{
+    EventLocation,
     IambAction,
     IambError,
     IambId,
@@ -319,6 +321,39 @@ impl RoomState {
                 store.application.snooze_dirty.insert(room_id);
 
                 Ok(vec![])
+            },
+            RoomAction::Context => {
+                // The room id is taken before the chat is borrowed, because `id()` borrows self.
+                let room_id = self.id().to_owned();
+
+                let RoomState::Chat(chat) = self else {
+                    return Err(IambError::NoSelectedRoom.into());
+                };
+
+                let info = store.application.rooms.get_or_default(room_id.clone());
+
+                let Some(event_id) = chat.selected_event(info) else {
+                    return Err(IambError::NoSelectedMessage.into());
+                };
+
+                // Where the message lives, which is not always where it is being read. The
+                // keys map is the only record of that.
+                let thread = match info.keys.get(&event_id) {
+                    Some(EventLocation::Message(thread, _)) => thread.clone(),
+                    _ => None,
+                };
+
+                // Already there. Say so rather than switching to the window that is open, which
+                // looks like the command did nothing.
+                if thread.as_ref() == chat.thread() {
+                    return Err(IambError::AlreadyInContext.into());
+                }
+
+                let target = OpenTarget::Application(IambId::Room(room_id, thread));
+                let open = WindowAction::Switch(target);
+                let select = IambAction::Room(RoomAction::SelectMessage(event_id));
+
+                Ok(vec![(open.into(), ctx.clone()), (select.into(), ctx)])
             },
             RoomAction::SelectMessage(event_id) => {
                 match self {

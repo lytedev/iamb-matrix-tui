@@ -384,6 +384,17 @@ fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_context(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = IambAction::Room(RoomAction::Context);
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_snooze(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     // The whole argument is the duration, so it is taken verbatim rather than split. That keeps
     // room for a phrase such as "next week" later without changing the command.
@@ -1056,6 +1067,12 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_react,
         forms: &[form("<shortcode>", "React to the selected message with an emoji")],
+    },
+    IambCommandInfo {
+        name: "context",
+        aliases: &[],
+        f: iamb_context,
+        forms: &[bare("Open the selected message where it lives, and select it there")],
     },
     IambCommandInfo {
         name: "snooze",
@@ -1955,6 +1972,20 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         let res = cmds.input_cmd("redact Removed Removed", ctx.clone());
+        assert_eq!(res, Err(CommandError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_cmd_context() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let res = cmds.input_cmd("context", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::Context);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        // It acts on the selection, so it takes no argument.
+        let res = cmds.input_cmd("context here", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
     }
 
