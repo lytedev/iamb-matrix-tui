@@ -54,7 +54,7 @@ use crate::{
         RoomInfo,
     },
     config::ApplicationSettings,
-    message::{Message, MessageCursor, MessageKey, Messages},
+    message::{Message, MessageCursor, MessageKey, Messages, ThreadRange, ThreadView},
 };
 
 fn no_msgs() -> EditError<IambInfo> {
@@ -62,7 +62,7 @@ fn no_msgs() -> EditError<IambInfo> {
     EditError::Failure(msg.to_string())
 }
 
-fn nth_key_before(pos: MessageKey, n: usize, thread: &Messages) -> MessageKey {
+fn nth_key_before(pos: MessageKey, n: usize, thread: &ThreadView) -> MessageKey {
     let mut end = &pos;
     let iter = thread.range(..=&pos).rev().enumerate();
 
@@ -77,7 +77,7 @@ fn nth_key_before(pos: MessageKey, n: usize, thread: &Messages) -> MessageKey {
     end.clone()
 }
 
-fn nth_before(pos: MessageKey, n: usize, thread: &Messages) -> MessageCursor {
+fn nth_before(pos: MessageKey, n: usize, thread: &ThreadView) -> MessageCursor {
     let key = nth_key_before(pos, n, thread);
 
     if matches!(thread.last_key_value(), Some((last, _)) if &key == last) {
@@ -87,7 +87,7 @@ fn nth_before(pos: MessageKey, n: usize, thread: &Messages) -> MessageCursor {
     }
 }
 
-fn nth_key_after(pos: MessageKey, n: usize, thread: &Messages) -> Option<MessageKey> {
+fn nth_key_after(pos: MessageKey, n: usize, thread: &ThreadView) -> Option<MessageKey> {
     let mut end = &pos;
     let mut iter = thread.range(&pos..).enumerate();
 
@@ -103,11 +103,11 @@ fn nth_key_after(pos: MessageKey, n: usize, thread: &Messages) -> Option<Message
     iter.next().map(|_| end.clone())
 }
 
-fn nth_after(pos: MessageKey, n: usize, thread: &Messages) -> MessageCursor {
+fn nth_after(pos: MessageKey, n: usize, thread: &ThreadView) -> MessageCursor {
     nth_key_after(pos, n, thread).map(MessageCursor::from).unwrap_or_default()
 }
 
-fn prevmsg<'a>(key: &MessageKey, thread: &'a Messages) -> Option<&'a Message> {
+fn prevmsg<'a>(key: &MessageKey, thread: &ThreadView<'a>) -> Option<&'a Message> {
     thread.range(..key).next_back().map(|(_, v)| v)
 }
 
@@ -256,21 +256,42 @@ impl ScrollbackState {
     }
 
     pub fn get_mut<'a>(&mut self, info: &'a mut RoomInfo) -> Option<&'a mut Message> {
-        let thread = self.get_thread_mut(info);
+        let key = self.get_key(info)?;
 
-        if let Some(k) = &self.cursor.timestamp {
-            thread.get_mut(k)
-        } else {
-            thread.last_entry().map(|o| o.into_mut())
+        if let Some(root) = &self.thread {
+            if &key.1 == root {
+                // The message a thread is about belongs to the main scrollback, so a change to it
+                // goes through the room rather than through the thread's own map.
+                return info.get_event_mut(root);
+            }
         }
+
+        self.get_thread_mut(info).get_mut(&key)
     }
 
     pub fn thread(&self) -> Option<&OwnedEventId> {
         self.thread.as_ref()
     }
 
-    pub fn get_thread<'a>(&self, info: &'a RoomInfo) -> Option<&'a Messages> {
-        info.get_thread(self.thread.as_deref())
+    /// The messages this scrollback shows.
+    ///
+    /// In a thread this is the root followed by the replies. The root is a message like any other
+    /// here: the cursor can land on it, and it scrolls out of view.
+    pub fn get_thread<'a>(&self, info: &'a RoomInfo) -> Option<ThreadView<'a>> {
+        let replies = info.get_thread(self.thread.as_deref());
+
+        let Some(root) = self.thread.as_deref() else {
+            return Some(ThreadView::from(replies?));
+        };
+
+        let root = info.get_message_key(root).zip(info.get_event(root));
+
+        if replies.is_none() && root.is_none() {
+            // Neither the replies nor the message the thread is about have been loaded.
+            return None;
+        }
+
+        Some(ThreadView::with_root(replies, root))
     }
 
     pub fn get_thread_mut<'a>(&self, info: &'a mut RoomInfo) -> &'a mut Messages {
@@ -281,13 +302,13 @@ impl ScrollbackState {
         &self,
         range: EditRange<MessageCursor>,
         info: &'a RoomInfo,
-    ) -> impl Iterator<Item = (&'a MessageKey, &'a Message)> {
+    ) -> ThreadRange<'a> {
         let Some(thread) = self.get_thread(info) else {
             return Default::default();
         };
 
-        let start = range.start.to_key(thread);
-        let end = range.end.to_key(thread);
+        let start = range.start.to_key(&thread);
+        let end = range.end.to_key(&thread);
 
         let (start, end) = if let (Some(start), Some(end)) = (start, end) {
             (start, end)
@@ -348,7 +369,7 @@ impl ScrollbackState {
             return;
         };
 
-        let selidx = if let Some(key) = self.cursor.to_key(thread) {
+        let selidx = if let Some(key) = self.cursor.to_key(&thread) {
             key
         } else {
             return;
@@ -364,7 +385,7 @@ impl ScrollbackState {
 
                 for (key, item) in thread.range(..=&idx).rev() {
                     let sel = selidx == key;
-                    let prev = prevmsg(key, thread);
+                    let prev = prevmsg(key, &thread);
                     let len = item.show(prev, sel, &self.viewctx, info, settings).lines.len();
 
                     if key == &idx {
@@ -387,7 +408,7 @@ impl ScrollbackState {
 
                 for (key, item) in thread.range(..=&idx).rev() {
                     let sel = key == selidx;
-                    let prev = prevmsg(key, thread);
+                    let prev = prevmsg(key, &thread);
                     let len = item.show(prev, sel, &self.viewctx, info, settings).lines.len();
 
                     lines += len;
@@ -433,7 +454,7 @@ impl ScrollbackState {
         let mut lines = 0;
 
         let cursor_key = self.cursor.timestamp.as_ref().unwrap_or(last_key);
-        let mut prev = prevmsg(cursor_key, thread);
+        let mut prev = prevmsg(cursor_key, &thread);
 
         for (idx, item) in thread.range(corner_key.clone()..) {
             if idx == cursor_key {
@@ -489,7 +510,7 @@ impl ScrollbackState {
     /// apart. It is `None` when the scrollback holds no message to take.
     pub fn selected_text(&self, info: &RoomInfo, settings: &ApplicationSettings) -> Option<String> {
         let thread = self.get_thread(info)?;
-        let key = self.cursor.to_key(thread)?.clone();
+        let key = self.cursor.to_key(&thread)?.clone();
         let range = self.selection_range(key);
         let msgs = self.messages(range, info).map(|(_, msg)| msg);
 
@@ -551,8 +572,8 @@ impl ScrollbackState {
                 let thread = self.get_thread(info)?;
 
                 match dir {
-                    MoveDir1D::Previous => nth_before(pos, count, thread).into(),
-                    MoveDir1D::Next => nth_after(pos, count, thread).into(),
+                    MoveDir1D::Previous => nth_before(pos, count, &thread).into(),
+                    MoveDir1D::Next => nth_after(pos, count, &thread).into(),
                 }
             },
             MoveType::ViewportPos(MovePosition::Beginning) => {
@@ -766,7 +787,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
     ) -> EditResult<EditInfo, IambInfo> {
         let info = store.application.rooms.get_or_default(self.room_id.clone());
         let thread = self.get_thread(info).ok_or_else(no_msgs)?;
-        let key = self.cursor.to_key(thread).ok_or_else(no_msgs)?.clone();
+        let key = self.cursor.to_key(&thread).ok_or_else(no_msgs)?.clone();
 
         self.track_selection(&key, ctx);
 
@@ -792,7 +813,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let mark = ctx.resolve(mark);
                         let cursor = store.cursors.get_mark(self.id.clone(), mark)?;
 
-                        if let Some(mc) = MessageCursor::from_cursor(&cursor, thread) {
+                        if let Some(mc) = MessageCursor::from_cursor(&cursor, &thread) {
                             Some(mc)
                         } else {
                             let msg = "Failed to restore mark";
@@ -866,7 +887,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let mark = ctx.resolve(mark);
                         let cursor = store.cursors.get_mark(self.id.clone(), mark)?;
 
-                        if let Some(c) = MessageCursor::from_cursor(&cursor, thread) {
+                        if let Some(c) = MessageCursor::from_cursor(&cursor, &thread) {
                             self._range_to(c).into()
                         } else {
                             let msg = "Failed to restore mark";
@@ -966,7 +987,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
     ) -> EditResult<EditInfo, IambInfo> {
         let info = store.application.get_room_info(self.room_id.clone());
         let thread = self.get_thread(info).ok_or_else(no_msgs)?;
-        let cursor = self.cursor.to_cursor(thread).ok_or_else(no_msgs)?;
+        let cursor = self.cursor.to_cursor(&thread).ok_or_else(no_msgs)?;
         store.cursors.set_mark(self.id.clone(), name, cursor);
 
         Ok(None)
@@ -1010,7 +1031,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
                 let info = store.application.get_room_info(self.room_id.clone());
                 let thread = self.get_thread(info).ok_or_else(no_msgs)?;
-                let key = self.cursor.to_key(thread).ok_or_else(no_msgs)?.clone();
+                let key = self.cursor.to_key(&thread).ok_or_else(no_msgs)?.clone();
 
                 self.selection_anchor = Some(key.into());
                 self.cursor = anchor;
@@ -1059,7 +1080,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                     self.push_jump();
                 }
 
-                if let Some(mc) = MessageCursor::from_cursor(ngroup.leader.cursor(), thread) {
+                if let Some(mc) = MessageCursor::from_cursor(ngroup.leader.cursor(), &thread) {
                     self.cursor = mc;
 
                     Ok(None)
@@ -1074,7 +1095,7 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                 let reg = ctx.get_register().unwrap_or(Register::UnnamedCursorGroup);
 
                 // Lists don't have groups; override any previously saved group.
-                let cursor = self.cursor.to_cursor(thread).ok_or_else(|| {
+                let cursor = self.cursor.to_cursor(&thread).ok_or_else(|| {
                     let msg = "Cannot save position in message history";
                     EditError::Failure(msg.into())
                 })?;
@@ -1176,7 +1197,7 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
         let info = store.application.get_room_info(self.room_id.clone());
         let thread = self.get_thread(info).ok_or_else(no_msgs)?;
 
-        let Some(key) = self.cursor.to_key(thread) else {
+        let Some(key) = self.cursor.to_key(&thread) else {
             let msg = "No message currently selected";
             let err = EditError::Failure(msg.into());
             return Err(err);
@@ -1248,7 +1269,7 @@ impl ScrollActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
                 for (key, item) in thread.range(..=&corner_key).rev() {
                     let sel = key == cursor_key;
-                    let prev = prevmsg(key, thread);
+                    let prev = prevmsg(key, &thread);
                     let txt = item.show(prev, sel, &self.viewctx, info, settings);
                     let len = txt.height().max(1);
                     let max = len.saturating_sub(1);
@@ -1273,7 +1294,7 @@ impl ScrollActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                 }
             },
             MoveDir2D::Down => {
-                let mut prev = prevmsg(&corner_key, thread);
+                let mut prev = prevmsg(&corner_key, &thread);
 
                 for (key, item) in thread.range(&corner_key..) {
                     let sel = key == cursor_key;
@@ -1339,7 +1360,7 @@ impl ScrollActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                 let settings = &store.application.settings;
                 let thread = self.get_thread(info).ok_or_else(no_msgs)?;
 
-                if let Some(key) = self.cursor.to_key(thread).cloned() {
+                if let Some(key) = self.cursor.to_key(&thread).cloned() {
                     self.scrollview(key, pos, info, settings);
                 }
 
@@ -1424,6 +1445,22 @@ fn render_jump_to_recent(area: Rect, buf: &mut Buffer, focused: bool) -> Rect {
     return top;
 }
 
+/// Tell the user that the scrollback goes on above the pane.
+///
+/// This is the counterpart of [render_jump_to_recent], which says the same about the bottom.
+fn render_more_above(bar: Rect, buf: &mut Buffer, focused: bool) {
+    let msg = vec![
+        Span::raw("Use "),
+        Span::styled("k", Style::default().add_modifier(StyleModifier::BOLD)),
+        Span::raw(if focused { "" } else { " in scrollback" }),
+        Span::raw(" to scroll up to earlier messages"),
+    ];
+
+    Paragraph::new(Line::from(msg))
+        .alignment(Alignment::Center)
+        .render(bar, buf);
+}
+
 pub struct Scrollback<'a> {
     room_focused: bool,
     focused: bool,
@@ -1471,51 +1508,18 @@ impl StatefulWidget for Scrollback<'_> {
             return;
         }
 
-        // The opening message is worked out before the thread is looked up, because a thread that
-        // has just been started has no collection at all. Looking the thread up first returned
-        // here and drew nothing, which is what an empty pane above a new reply was.
-        let op_lines: Vec<_> = match state.thread().and_then(|root| info.get_event(root)) {
-            None => vec![],
-            Some(msg) => {
-                let (txt, _) = msg.show_with_preview(None, false, &state.viewctx, info, settings);
-
-                txt.lines
-            },
-        };
-
-        let draw_op = |buf: &mut Buffer| {
-            let mut y = area.top();
-
-            for line in op_lines.iter() {
-                if y >= area.bottom() {
-                    break;
-                }
-
-                let _ = buf.set_line(area.left(), y, line, area.width);
-                y += 1;
-            }
-        };
-
         let Some(thread) = state.get_thread(info) else {
-            draw_op(buf);
             return;
         };
-
-        // The replies get what is left of the pane.
-        let height = height.saturating_sub(op_lines.len());
 
         if state.cursor.timestamp < state.viewctx.corner.timestamp {
             state.viewctx.corner = state.cursor.clone();
         }
 
         let cursor = &state.cursor;
-        let cursor_key = if let Some(k) = cursor.to_key(thread) {
+        let cursor_key = if let Some(k) = cursor.to_key(&thread) {
             k
         } else {
-            // A thread whose replies are not loaded still has an opening message, and showing it
-            // is the whole point of opening the thread. Draw it before giving up.
-            draw_op(buf);
-
             if state.need_more_messages(info) {
                 self.store.application.need_load.need_messages(state.room_id.to_owned());
             }
@@ -1526,14 +1530,14 @@ impl StatefulWidget for Scrollback<'_> {
         let corner_key = if let Some(k) = &corner.timestamp {
             k.clone()
         } else {
-            nth_key_before(cursor_key.clone(), height, thread)
+            nth_key_before(cursor_key.clone(), height, &thread)
         };
 
         let foc = self.focused || cursor.timestamp.is_some();
         let full = std::mem::take(&mut state.show_full_on_redraw) || cursor.timestamp.is_none();
         let mut lines = vec![];
         let mut sawit = false;
-        let mut prev = prevmsg(&corner_key, thread);
+        let mut prev = prevmsg(&corner_key, &thread);
 
         for (key, item) in thread.range(&corner_key..) {
             let sel = key == cursor_key;
@@ -1582,6 +1586,23 @@ impl StatefulWidget for Scrollback<'_> {
             let _ = lines.drain(..n);
         }
 
+        // Whether the scrollback goes on above the pane.
+        //
+        // The check reads the lines that the pane takes rather than the viewport corner, because
+        // the corner is set from them below and is still the corner of the frame before this one.
+        let more_above = match (lines.first(), thread.first_key_value()) {
+            (Some((key, row, _, _)), Some((first, _))) => *key != first || *row > 0,
+            _ => false,
+        };
+
+        // The hint takes the top row from the message it interrupts, so that the newest messages
+        // keep the bottom of the pane. That message continues above, so the hint stays true.
+        let hint_above = more_above && area.height > 5 && area.width > 20;
+
+        if hint_above {
+            let _ = lines.remove(0);
+        }
+
         if let Some(((ts, event_id), row, _, _)) = lines.first() {
             state.viewctx.corner.timestamp = Some((*ts, event_id.clone()));
             state.viewctx.corner.text_row = *row;
@@ -1590,10 +1611,8 @@ impl StatefulWidget for Scrollback<'_> {
         let mut y = area.top();
         let x = area.left();
 
-        // Above the replies, and outside the `lines` machinery on purpose: `lines` decides the
-        // viewport corner, and the opening message is not part of the thread's own ordering.
-        for line in op_lines.iter() {
-            let _ = buf.set_line(x, y, line, area.width);
+        if hint_above {
+            render_more_above(Rect::new(x, y, area.width, 1), buf, self.focused);
             y += 1;
         }
 
@@ -1627,8 +1646,14 @@ impl StatefulWidget for Scrollback<'_> {
             // If the cursor is at the last message, then update the read marker. When
             // `read_receipt_manual` is set, viewing never does this, and the marker only moves
             // when the user runs `:read`.
-            if let Some((k, _)) = thread.last_key_value() {
-                info.set_receipt(thread.1.clone(), settings.profile.user_id.clone(), k.1.clone());
+            //
+            // The replies alone carry the marker. The message a thread is about belongs to the
+            // main scrollback, which counts it already, so a thread with no replies must not move
+            // a receipt.
+            if let Some((replies, (k, _))) =
+                thread.replies().zip(thread.replies().and_then(|r| r.last_key_value()))
+            {
+                info.set_receipt(replies.1.clone(), settings.profile.user_id.clone(), k.1.clone());
             }
         }
 
@@ -1645,8 +1670,112 @@ impl StatefulWidget for Scrollback<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{base::Need, tests::*};
-    use matrix_sdk::ruma::server_name;
+    use crate::{
+        base::{EventLocation, Need},
+        message::MessageTimeStamp,
+        tests::*,
+    };
+    use matrix_sdk::ruma::{events::room::message::RoomMessageEventContent, server_name, UInt};
+
+    /// Give the room a thread that MSG2 started, with `replies` replies in it.
+    ///
+    /// MSG2 stays in the main scrollback and out of the thread's own map, the way the homeserver
+    /// gives a thread to us.
+    fn mock_thread(info: &mut RoomInfo, replies: usize) -> Vec<MessageKey> {
+        let mut keys = vec![];
+
+        for i in 0..replies {
+            let event_id = EventId::new_v1(server_name!("example.com"));
+            let ts = UInt::new(9 + i as u64).unwrap();
+            let key: MessageKey = (MessageTimeStamp::OriginServer(ts), event_id.clone());
+
+            let location = EventLocation::Message(Some(MSG2_EVID.clone()), key.clone());
+            info.keys.insert(event_id, location);
+
+            let content = RoomMessageEventContent::text_plain(format!("reply {i}"));
+            let msg = mock_room1_message(content, TEST_USER1.clone(), key.clone());
+            info.get_thread_mut(Some(MSG2_EVID.clone())).insert(key.clone(), msg);
+
+            keys.push(key);
+        }
+
+        keys
+    }
+
+    #[tokio::test]
+    async fn test_thread_puts_the_root_before_the_replies() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        let replies = mock_thread(info, 2);
+
+        let scrollback = ScrollbackState::new(room_id, Some(MSG2_EVID.clone()));
+        let thread = scrollback.get_thread(info).unwrap();
+        let keys: Vec<_> = thread.range(..).map(|(key, _)| key.clone()).collect();
+
+        assert_eq!(keys, [vec![MSG2_KEY.clone()], replies].concat());
+    }
+
+    #[tokio::test]
+    async fn test_thread_cursor_can_select_the_root() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        mock_thread(info, 2);
+
+        let mut scrollback = ScrollbackState::new(room_id, Some(MSG2_EVID.clone()));
+
+        assert!(scrollback.goto_event(&MSG2_EVID, info));
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
+    }
+
+    #[tokio::test]
+    async fn test_thread_without_replies_still_shows_the_root() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let info = store.application.rooms.get_or_default(room_id.clone());
+
+        let scrollback = ScrollbackState::new(room_id, Some(MSG2_EVID.clone()));
+        let thread = scrollback.get_thread(info).unwrap();
+
+        assert_eq!(thread.first_key_value().map(|(key, _)| key), Some(&*MSG2_KEY));
+        assert_eq!(thread.last_key_value().map(|(key, _)| key), Some(&*MSG2_KEY));
+
+        // An unscrolled cursor lands on the root, so a command acts on the message the thread is
+        // about rather than on nothing.
+        assert_eq!(MessageCursor::latest().to_key(&thread), Some(&*MSG2_KEY));
+    }
+
+    #[tokio::test]
+    async fn test_thread_root_scrolls_out_of_view() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        mock_thread(info, 4);
+
+        let mut scrollback = ScrollbackState::new(room_id, Some(MSG2_EVID.clone()));
+        let ctx = ProgramContext::default();
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        // The thread is a date divider, the root and four replies, so it is taller than the pane.
+        let area = Rect::new(0, 0, 60, 3);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        // The newest replies fill the pane, and the root is above it.
+        assert_ne!(scrollback.viewctx.corner.timestamp, Some(MSG2_KEY.clone()));
+
+        // Scrolling up brings the root back, and it is the top of the thread.
+        for _ in 0..4 {
+            scrollback
+                .dirscroll(MoveDir2D::Up, ScrollSize::Page, &1.into(), &ctx, &mut store)
+                .unwrap();
+        }
+
+        assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG2_KEY.clone(), 0));
+    }
 
     #[tokio::test]
     async fn test_goto_event_selects_a_loaded_message() {
@@ -2084,6 +2213,33 @@ mod tests {
             .dirscroll(next, ScrollSize::HalfPage, &2.into(), &ctx, &mut store)
             .unwrap();
         assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG3_KEY.clone(), 4));
+    }
+
+    /// Everything the pane drew, as one string.
+    fn drawn(buffer: &Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_the_pane_says_when_messages_are_above_it() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        // The room draws eleven lines, so some of them are above a pane of this height.
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(drawn(&buffer).contains("to scroll up to earlier messages"));
+
+        // A pane that holds the whole room has nothing above it, so it says nothing.
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG2_KEY.clone(), 0));
+        assert!(!drawn(&buffer).contains("to scroll up to earlier messages"));
     }
 
     #[tokio::test]
