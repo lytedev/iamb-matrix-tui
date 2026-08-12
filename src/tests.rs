@@ -27,6 +27,7 @@ use crate::{
         ApplicationSettings,
         DirectoryValues,
         Encryption,
+        LocalIndex,
         Notifications,
         NotifyVia,
         ProfileConfig,
@@ -173,6 +174,7 @@ pub fn mock_tunables() -> TunableValues {
     TunableValues {
         default_room: None,
         encryption: Encryption::default().values(),
+        local_index: LocalIndex::default().values(),
         log_level: "warn".into(),
         snooze_default: "1h".into(),
         snooze_tomorrow_hour: 9,
@@ -222,6 +224,7 @@ pub fn mock_settings() -> ApplicationSettings {
         session_json_old: PathBuf::new(),
         sled_dir: PathBuf::new(),
         sqlite_dir: PathBuf::new(),
+        search_index_dir: PathBuf::new(),
 
         profile_name: "test".into(),
         profile: ProfileConfig {

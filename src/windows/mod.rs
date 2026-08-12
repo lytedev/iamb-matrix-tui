@@ -84,8 +84,8 @@ use crate::base::{
 
 use self::{
     palette::CommandPaletteState,
-    search::{MessageSearchState, SearchItem},
     room::RoomState,
+    search::{Found, MessageSearchState},
     switcher::QuickSwitcherState,
     welcome::WelcomeState,
 };
@@ -999,12 +999,25 @@ impl WindowOps<IambInfo> for IambWindow {
 }
 
 /// Build a window with an empty list, which [IambWindow::refresh] then fills in.
-/// The title of a `:search` window, which is the term it was opened for.
+/// The title of a `:search` window: the term it was opened for, and what it could not look at.
 ///
 /// The term is what tells two search windows apart, so it belongs in the title rather than only
 /// in the window's URL.
-fn search_title(term: &str) -> Line<'static> {
-    Line::from(vec![bold_span("Search: "), Span::raw(term.to_string())])
+///
+/// The rooms the search could not look in belong here too, and this is the only place they fit. A
+/// row is one message found, so a room that was never indexed has no row to appear on, and its
+/// absence would otherwise read as a message that nobody sent.
+fn search_title(state: &MessageSearchState, term: &str) -> Line<'static> {
+    let mut spans = vec![bold_span("Search: "), Span::raw(term.to_string())];
+
+    if let Some(note) = state.context().coverage.note() {
+        spans.push(Span::styled(
+            format!(" ({note})"),
+            Style::default().add_modifier(StyleModifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
@@ -1083,7 +1096,7 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
             // opens it. That is what makes a window restored from a saved layout show results
             // rather than an empty list, and it means reopening the same search refreshes it.
             let found = store.application.worker.search_messages(term.clone())?;
-            let found = Arc::new(SearchItem::rows(found, store));
+            let found = Arc::new(Found::new(found, store));
             let win = MessageSearchState::new(found, store);
 
             Ok(IambWindow::MessageSearch(win, term))
@@ -1131,7 +1144,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
-            IambWindow::MessageSearch(_, term) => search_title(term),
+            IambWindow::MessageSearch(state, term) => search_title(state, term),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -1165,7 +1178,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
             IambWindow::CommandPalette(_) => bold_spans("Commands"),
             IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
-            IambWindow::MessageSearch(_, term) => search_title(term),
+            IambWindow::MessageSearch(state, term) => search_title(state, term),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
