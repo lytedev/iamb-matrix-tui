@@ -166,7 +166,6 @@ pub fn mock_dirs() -> DirectoryValues {
         data: PathBuf::new(),
         logs: PathBuf::new(),
         downloads: None,
-        image_previews: PathBuf::new(),
     }
 }
 
@@ -213,6 +212,7 @@ pub fn mock_tunables() -> TunableValues {
         image_preview: None,
         user_gutter_width: 30,
         tabstop: 4,
+        default_split: Default::default(),
         ssl_verify: true,
     }
 }

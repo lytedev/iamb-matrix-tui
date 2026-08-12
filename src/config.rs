@@ -424,6 +424,14 @@ pub enum UserDisplayStyle {
     DisplayName,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDirection {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NotifyVia {
     /// Deliver notifications via terminal bell.
@@ -765,12 +773,14 @@ pub struct Notifications {
 
 #[derive(Clone)]
 pub struct ImagePreviewValues {
+    pub lazy_load: bool,
     pub size: ImagePreviewSize,
     pub protocol: Option<ImagePreviewProtocolValues>,
 }
 
 #[derive(Clone, Default, Deserialize)]
 pub struct ImagePreview {
+    pub lazy_load: Option<bool>,
     pub size: Option<ImagePreviewSize>,
     pub protocol: Option<ImagePreviewProtocolValues>,
 }
@@ -778,13 +788,14 @@ pub struct ImagePreview {
 impl ImagePreview {
     fn values(self) -> ImagePreviewValues {
         ImagePreviewValues {
+            lazy_load: self.lazy_load.unwrap_or(true),
             size: self.size.unwrap_or_default(),
             protocol: self.protocol,
         }
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Debug)]
 pub struct ImagePreviewSize {
     pub width: usize,
     pub height: usize,
@@ -908,6 +919,7 @@ pub struct TunableValues {
     pub user_gutter_width: usize,
     pub external_edit_file_suffix: String,
     pub tabstop: usize,
+    pub default_split: SplitDirection,
     pub ssl_verify: bool,
 }
 
@@ -957,6 +969,7 @@ pub struct Tunables {
     pub user_gutter_width: Option<usize>,
     pub external_edit_file_suffix: Option<String>,
     pub tabstop: Option<usize>,
+    pub default_split: Option<SplitDirection>,
     pub ssl_verify: Option<bool>,
 }
 
@@ -1000,6 +1013,7 @@ impl Tunables {
                 .external_edit_file_suffix
                 .or(other.external_edit_file_suffix),
             tabstop: self.tabstop.or(other.tabstop),
+            default_split: self.default_split.or(other.default_split),
             ssl_verify: self.ssl_verify.or(other.ssl_verify),
         }
     }
@@ -1042,6 +1056,7 @@ impl Tunables {
                 .external_edit_file_suffix
                 .unwrap_or_else(|| ".md".to_string()),
             tabstop: self.tabstop.unwrap_or(4),
+            default_split: self.default_split.unwrap_or_default(),
             ssl_verify: self.ssl_verify.unwrap_or(true),
         })
     }
@@ -1075,19 +1090,17 @@ pub struct DirectoryValues {
     pub data: PathBuf,
     pub logs: PathBuf,
     pub downloads: Option<PathBuf>,
-    pub image_previews: PathBuf,
 }
 
 impl DirectoryValues {
     fn create_dir_all(&self) -> std::io::Result<()> {
         use std::fs::create_dir_all;
 
-        let Self { cache, data, logs, downloads, image_previews } = self;
+        let Self { cache, data, logs, downloads } = self;
 
         create_dir_all(cache)?;
         create_dir_all(data)?;
         create_dir_all(logs)?;
-        create_dir_all(image_previews)?;
 
         if let Some(downloads) = downloads {
             create_dir_all(downloads)?;
@@ -1103,7 +1116,6 @@ pub struct Directories {
     pub data: Option<String>,
     pub logs: Option<String>,
     pub downloads: Option<String>,
-    pub image_previews: Option<String>,
 }
 
 impl Directories {
@@ -1113,7 +1125,6 @@ impl Directories {
             data: self.data.or(other.data),
             logs: self.logs.or(other.logs),
             downloads: self.downloads.or(other.downloads),
-            image_previews: self.image_previews.or(other.image_previews),
         }
     }
 
@@ -1168,20 +1179,7 @@ impl Directories {
             })
             .or_else(dirs::download_dir);
 
-        let image_previews = self
-            .image_previews
-            .map(|dir| {
-                let dir = shellexpand::full(&dir)
-                    .expect("unable to expand shell variables in dirs.cache");
-                Path::new(dir.as_ref()).to_owned()
-            })
-            .unwrap_or_else(|| {
-                let mut dir = cache.clone();
-                dir.push("image_preview_downloads");
-                dir
-            });
-
-        DirectoryValues { cache, data, logs, downloads, image_previews }
+        DirectoryValues { cache, data, logs, downloads }
     }
 }
 

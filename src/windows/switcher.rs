@@ -205,7 +205,7 @@ impl SwitchItem {
 
                 let info = store.application.rooms.get_or_default(room_id.to_owned());
                 let name = info.name.clone().unwrap_or_else(|| room_id.to_string());
-                let unread = info.unreads(&store.application.settings);
+                let unread = info.unreads(room.is_marked_unread(), &store.application.settings);
 
                 items.push(SwitchItem {
                     name,
