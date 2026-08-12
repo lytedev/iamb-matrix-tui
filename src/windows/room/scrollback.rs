@@ -1641,13 +1641,16 @@ impl StatefulWidget for Scrollback<'_> {
         // keep the bottom of the pane. That message continues above, so the hint stays true.
         let hint_above = more_above && area.height > 5 && area.width > 20;
 
-        if hint_above {
-            let _ = lines.remove(0);
-        }
-
+        // The corner must keep the row that the hint covers. A corner that skips that row makes the
+        // next render start one row lower, and the pane then walks the messages up one row per
+        // frame until it holds almost nothing.
         if let Some(((ts, event_id), row, _, _)) = lines.first() {
             state.viewctx.corner.timestamp = Some((*ts, event_id.clone()));
             state.viewctx.corner.text_row = *row;
+        }
+
+        if hint_above {
+            let _ = lines.remove(0);
         }
 
         let mut y = area.top();
@@ -2282,6 +2285,43 @@ mod tests {
         scrollback.draw(area, &mut buffer, true, &mut store);
         assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG2_KEY.clone(), 0));
         assert!(!drawn(&buffer).contains("to scroll up to earlier messages"));
+    }
+
+    /// A redraw that gets no new message must not move the pane.
+    ///
+    /// The hint about the messages above the pane covers the top row. If the corner moves past that
+    /// row, then each redraw drops one more message row and the pane empties from the bottom.
+    #[tokio::test]
+    async fn test_a_second_render_of_the_same_state_draws_the_same_pane() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        // The room draws more lines than this pane holds, so the pane shows the hint.
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        // Scroll away from the newest message. The pane then keeps its own corner, instead of
+        // taking a fresh one from the cursor on every render.
+        let ctx = ProgramContext::default();
+        scrollback
+            .dirscroll(MoveDir2D::Up, ScrollSize::Cell, &1.into(), &ctx, &mut store)
+            .unwrap();
+        assert!(scrollback.cursor.timestamp.is_some());
+
+        let mut first = Buffer::empty(area);
+        scrollback.draw(area, &mut first, true, &mut store);
+        let corner = scrollback.viewctx.corner.clone();
+        assert!(drawn(&first).contains("to scroll up to earlier messages"));
+
+        let mut second = Buffer::empty(area);
+        scrollback.draw(area, &mut second, true, &mut store);
+
+        assert_eq!(scrollback.viewctx.corner, corner);
+        assert_eq!(drawn(&second), drawn(&first));
     }
 
     #[tokio::test]
