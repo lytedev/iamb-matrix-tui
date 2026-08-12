@@ -47,7 +47,7 @@ use matrix_sdk::ruma::{
 };
 
 use ratatui::{
-    style::{Modifier as StyleModifier, Style},
+    style::{Color, Modifier as StyleModifier, Style},
     symbols::line::THICK_VERTICAL,
     text::{Line, Span, Text},
 };
@@ -886,8 +886,14 @@ impl<'a> MessageFormatter<'a> {
         }
 
         // If we have threaded replies to this message, show how many.
+        //
+        // Drawn in the colour a link uses, and underlined, because it is the one line that takes
+        // the reader somewhere else. In the default style it disappeared into the message it
+        // belongs to, and a thread was easy to walk past.
         let plural = len != 1;
-        let style = Style::default();
+        let style = Style::default()
+            .fg(Color::Blue)
+            .add_modifier(StyleModifier::UNDERLINED);
         let mut threaded =
             printer::TextPrinter::new(self.width(), style, self.settings).literal(true);
         let len = Span::styled(len.to_string(), style.add_modifier(StyleModifier::BOLD));
