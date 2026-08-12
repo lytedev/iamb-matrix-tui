@@ -1445,6 +1445,22 @@ fn render_jump_to_recent(area: Rect, buf: &mut Buffer, focused: bool) -> Rect {
     return top;
 }
 
+/// Tell the user that the scrollback goes on above the pane.
+///
+/// This is the counterpart of [render_jump_to_recent], which says the same about the bottom.
+fn render_more_above(bar: Rect, buf: &mut Buffer, focused: bool) {
+    let msg = vec![
+        Span::raw("Use "),
+        Span::styled("k", Style::default().add_modifier(StyleModifier::BOLD)),
+        Span::raw(if focused { "" } else { " in scrollback" }),
+        Span::raw(" to scroll up to earlier messages"),
+    ];
+
+    Paragraph::new(Line::from(msg))
+        .alignment(Alignment::Center)
+        .render(bar, buf);
+}
+
 pub struct Scrollback<'a> {
     room_focused: bool,
     focused: bool,
@@ -1570,6 +1586,23 @@ impl StatefulWidget for Scrollback<'_> {
             let _ = lines.drain(..n);
         }
 
+        // Whether the scrollback goes on above the pane.
+        //
+        // The check reads the lines that the pane takes rather than the viewport corner, because
+        // the corner is set from them below and is still the corner of the frame before this one.
+        let more_above = match (lines.first(), thread.first_key_value()) {
+            (Some((key, row, _, _)), Some((first, _))) => *key != first || *row > 0,
+            _ => false,
+        };
+
+        // The hint takes the top row from the message it interrupts, so that the newest messages
+        // keep the bottom of the pane. That message continues above, so the hint stays true.
+        let hint_above = more_above && area.height > 5 && area.width > 20;
+
+        if hint_above {
+            let _ = lines.remove(0);
+        }
+
         if let Some(((ts, event_id), row, _, _)) = lines.first() {
             state.viewctx.corner.timestamp = Some((*ts, event_id.clone()));
             state.viewctx.corner.text_row = *row;
@@ -1577,6 +1610,11 @@ impl StatefulWidget for Scrollback<'_> {
 
         let mut y = area.top();
         let x = area.left();
+
+        if hint_above {
+            render_more_above(Rect::new(x, y, area.width, 1), buf, self.focused);
+            y += 1;
+        }
 
         let mut image_previews = vec![];
         for ((_, _), _, txt, line_preview) in lines.into_iter() {
@@ -2175,6 +2213,33 @@ mod tests {
             .dirscroll(next, ScrollSize::HalfPage, &2.into(), &ctx, &mut store)
             .unwrap();
         assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG3_KEY.clone(), 4));
+    }
+
+    /// Everything the pane drew, as one string.
+    fn drawn(buffer: &Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_the_pane_says_when_messages_are_above_it() {
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        // The room draws eleven lines, so some of them are above a pane of this height.
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(drawn(&buffer).contains("to scroll up to earlier messages"));
+
+        // A pane that holds the whole room has nothing above it, so it says nothing.
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG2_KEY.clone(), 0));
+        assert!(!drawn(&buffer).contains("to scroll up to earlier messages"));
     }
 
     #[tokio::test]
