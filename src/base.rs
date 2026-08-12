@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use matrix_sdk::ruma::events::receipt::ReceiptThread;
+use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::sticker::StickerEvent;
 use ratatui::{
     buffer::Buffer,
@@ -94,13 +95,12 @@ use modalkit::{
 use crate::config::ImagePreviewProtocolValues;
 use crate::message::emoji::{complete_emoji_names, complete_emojis, EMOJI_SIGIL};
 use crate::message::mention::{complete_mentions, MentionCandidate, MENTION_SIGIL};
-use crate::message::ImageStatus;
 use crate::notifications::NotificationHandle;
 use matrix_sdk::ruma::UInt;
 
 use crate::backfill::Backfill;
 use crate::snooze::{parse_when, SnoozeKey, SnoozeStore, WakeTime};
-use crate::preview::{source_from_event, spawn_insert_preview};
+use crate::preview::{source_from_event, PreviewManager};
 use crate::{
     message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages},
     worker::Requester,
@@ -508,6 +508,9 @@ pub enum RoomAction {
 
     /// List the values in a list room property.
     Show(RoomField),
+
+    /// Mark the room as read/unread.
+    SetUnread(bool),
 }
 
 /// An action that sends a message to a room.
@@ -1513,12 +1516,10 @@ impl RoomInfo {
     /// Insert a sticker
     pub fn insert_sticker(
         &mut self,
-        room_id: OwnedRoomId,
-        store: AsyncProgramStore,
-        picker: Option<Picker>,
         sticker: StickerEvent,
         settings: &ApplicationSettings,
-        media: matrix_sdk::Media,
+        previews: &mut PreviewManager,
+        worker: &Requester,
     ) {
         match sticker {
             MessageLikeEvent::Original(ref sticker_content) => {
@@ -1530,21 +1531,13 @@ impl RoomInfo {
                 self.keys.insert(sticker_content.event_id.clone(), loc);
                 self.messages.insert_message(key.clone(), sticker.clone());
 
-                if picker.is_some() {
-                    if let (Some(msg), Some(image_preview)) = (
-                        self.get_event_mut(&sticker_content.event_id),
-                        &settings.tunables.image_preview,
-                    ) {
-                        msg.image_preview = ImageStatus::Downloading(image_preview.size.clone());
-                        spawn_insert_preview(
-                            store,
-                            room_id,
-                            sticker_content.event_id.clone(),
-                            sticker_content.content.source.clone().into(),
-                            media,
-                            settings.dirs.image_previews.clone(),
-                        )
-                    }
+                if let (Some(msg), Some(image_preview)) = (
+                    self.get_event_mut(&sticker_content.event_id),
+                    &settings.tunables.image_preview,
+                ) {
+                    let source: MediaSource = sticker_content.content.source.clone().into();
+                    msg.image_preview = Some(source.clone());
+                    previews.register_preview(settings, source, image_preview.size, worker);
                 }
             },
             MessageLikeEvent::Redacted(ref redaction) => {
@@ -1609,7 +1602,10 @@ impl RoomInfo {
     }
 
     /// Indicates whether this room has unread messages.
-    pub fn unreads(&self, settings: &ApplicationSettings) -> UnreadInfo {
+    ///
+    /// `marked_unread` is the room's manual unread flag, which the server holds and this type
+    /// does not, so the caller reads it with [MatrixRoom::is_marked_unread].
+    pub fn unreads(&self, marked_unread: bool, settings: &ApplicationSettings) -> UnreadInfo {
         let last_message = self.messages.last_key_value();
 
         let user_id = &settings.profile.user_id;
@@ -1620,14 +1616,17 @@ impl RoomInfo {
 
         match (last_message, last_receipt) {
             (Some(((ts, _), _)), Some((read_ts, _))) => {
-                UnreadInfo { unread: ts > read_ts, latest: Some(*ts) }
+                UnreadInfo {
+                    unread: marked_unread | (ts > read_ts),
+                    latest: Some(*ts),
+                }
             },
             (Some(((ts, _), _)), None) => {
                 // If we've never loaded/generated a room's receipt (example,
                 // a newly joined but never viewed room), show it as unread.
                 UnreadInfo { unread: true, latest: Some(*ts) }
             },
-            (None, _) => UnreadInfo::default(),
+            (None, _) => UnreadInfo { unread: marked_unread, latest: None },
         }
     }
 
@@ -1706,33 +1705,23 @@ impl RoomInfo {
         }
     }
 
-    /// Insert a new message event, and spawn a task for image-preview if it has an image
-    /// attachment.
+    /// Insert a new message event, and prepare for image-preview if it has an image attachment.
     pub fn insert_with_preview(
         &mut self,
-        room_id: OwnedRoomId,
-        store: AsyncProgramStore,
-        picker: Option<Picker>,
         ev: RoomMessageEvent,
-        settings: &mut ApplicationSettings,
-        media: matrix_sdk::Media,
+        settings: &ApplicationSettings,
+        previews: &mut PreviewManager,
+        worker: &Requester,
     ) {
-        let source = picker.and_then(|_| source_from_event(&ev));
+        let source = source_from_event(&ev);
         self.insert(ev);
 
         if let Some((event_id, source)) = source {
             if let (Some(msg), Some(image_preview)) =
                 (self.get_event_mut(&event_id), &settings.tunables.image_preview)
             {
-                msg.image_preview = ImageStatus::Downloading(image_preview.size.clone());
-                spawn_insert_preview(
-                    store,
-                    room_id,
-                    event_id,
-                    source,
-                    media,
-                    settings.dirs.image_previews.clone(),
-                )
+                msg.image_preview = Some(source.clone());
+                previews.register_preview(settings, source, image_preview.size, worker)
             }
         }
     }
@@ -2162,8 +2151,8 @@ pub struct ChatStore {
     /// Information gathered by the background thread.
     pub sync_info: SyncInfo,
 
-    /// Image preview "protocol" picker.
-    pub picker: Option<Picker>,
+    /// Rendered image previews.
+    pub previews: PreviewManager,
 
     /// Last draw time, used to match with RoomInfo's draw_last.
     pub draw_curr: Option<Instant>,
@@ -2312,7 +2301,7 @@ impl ChatStore {
             settings,
             snooze: SnoozeStore::default(),
             snooze_dirty: Default::default(),
-            picker,
+            previews: PreviewManager::new(picker),
             cmds: crate::commands::setup_commands(),
 
             collator: Default::default(),
@@ -3439,7 +3428,7 @@ pub mod tests {
         // Marking the room read with no thread covers every thread in it.
         room.mark_read(&user_id, None);
         assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
-        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.unreads(false, &settings).is_unread());
     }
 
     #[test]
@@ -3448,13 +3437,13 @@ pub mod tests {
         let user_id = settings.profile.user_id.clone();
 
         room.mark_read(&user_id, None);
-        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.unreads(false, &settings).is_unread());
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
 
         // Scrollback fetches and ephemeral receipt events replay whatever the server knows,
         // which can be a receipt we have already advanced past locally.
         room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root.clone());
-        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.unreads(false, &settings).is_unread());
 
         room.set_receipt(
             ReceiptThread::Thread(followed_root.clone()),
@@ -3467,10 +3456,10 @@ pub mod tests {
         let (mut room, settings, followed_root, ignored_root) = mock_room_with_threads();
 
         room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root);
-        assert!(room.unreads(&settings).is_unread());
+        assert!(room.unreads(false, &settings).is_unread());
 
         room.set_receipt(ReceiptThread::Main, user_id, ignored_root);
-        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.unreads(false, &settings).is_unread());
     }
 
     #[test]
@@ -3589,7 +3578,7 @@ pub mod tests {
         });
 
         let room = store.rooms.get(&room_id).unwrap();
-        assert!(!room.unreads(&settings).is_unread());
+        assert!(!room.unreads(false, &settings).is_unread());
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
         assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
 
@@ -3601,7 +3590,7 @@ pub mod tests {
         assert!(entry.targets.iter().all(|t| t.previous.is_none()));
 
         let room = store.rooms.get(&room_id).unwrap();
-        assert!(room.unreads(&settings).is_unread());
+        assert!(room.unreads(false, &settings).is_unread());
         assert!(room.thread_unreads(&followed_root, &settings).is_unread());
         assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
     }
