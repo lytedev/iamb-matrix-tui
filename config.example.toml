@@ -25,6 +25,24 @@ username_display = "username"
 indicator = "only-encrypted"
 location = "title|prompt"
 
+# A homeserver cannot search a room it cannot read, so ":search" finds nothing
+# in an encrypted room. Turn this on to index the text of encrypted rooms on
+# this machine instead. Understand what it writes to disk before you do:
+#
+#   * The words of every indexed message go into ~/.local/share/iamb/profiles/
+#     <profile>/search-index/, and stay there until you delete it.
+#   * It also turns on the matrix-sdk event cache, which writes the full
+#     decrypted JSON of every event, in every room, to the sqlite store.
+#
+# The passphrase encrypts the index directory. It protects a copy of the index
+# that leaves this machine, such as a backup. It protects nothing against
+# anything that can read this file.
+#
+# The index is disposable. Delete the directory to start again.
+[settings.local_index]
+enabled = false
+passphrase = "change me"
+
 [settings.image_preview]
 protocol.type = "sixel"
 size = { "width" = 66, "height" = 10 }

@@ -490,6 +490,64 @@ impl<'de> Deserialize<'de> for NotifyVia {
     }
 }
 
+/// How the local message index is stored, and whether it exists at all.
+///
+/// A homeserver cannot index a room it cannot read, so `:search` finds nothing in an encrypted
+/// room. An index that runs on this machine, over the text after it is decrypted, is the only
+/// answer to that. It is also a decision the user must make, because it gives up a property that
+/// encryption otherwise provides: a client that shows a message and forgets it leaves nothing
+/// behind, and a client that indexes it leaves the words on disk for as long as the index lives.
+///
+/// For that reason this is off unless the user turns it on, and turning it on turns on the
+/// matrix-sdk event cache, which is the thing that feeds the index. The event cache writes the
+/// full decrypted JSON of an event to the sqlite store, for every room, not only the rooms that
+/// are searched. That is a larger disclosure than the index itself.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LocalIndex {
+    enabled: Option<bool>,
+    passphrase: Option<String>,
+}
+
+impl LocalIndex {
+    fn merge(profile: Self, global: Self) -> Self {
+        LocalIndex {
+            enabled: profile.enabled.or(global.enabled),
+            passphrase: profile.passphrase.or(global.passphrase),
+        }
+    }
+
+    pub fn values(self) -> LocalIndexValues {
+        LocalIndexValues {
+            enabled: self.enabled.unwrap_or(DEFAULT_LOCAL_INDEX_ENABLED),
+            passphrase: self.passphrase,
+        }
+    }
+}
+
+/// The local message index is off until the user asks for it.
+///
+/// See [LocalIndex] for what turning it on writes to disk.
+const DEFAULT_LOCAL_INDEX_ENABLED: bool = false;
+
+#[derive(Clone, Debug)]
+pub struct LocalIndexValues {
+    pub enabled: bool,
+
+    /// The passphrase the index directory is encrypted with.
+    ///
+    /// Without one the index is written as plain tantivy files, and the words of every indexed
+    /// message can be read out of them with no key at all.
+    ///
+    /// A passphrase in the configuration file protects against a copy of the index that leaves
+    /// this machine: a backup, a misconfigured sync, or a disk read later. It protects against
+    /// nothing that can read the configuration file, which is anything running as this user.
+    /// It also protects against nothing that can read the crypto store, which sits beside the
+    /// index, is not encrypted either, and holds the room keys that decrypt the whole history.
+    /// The stronger answer is a prompt at startup, which a terminal client that starts
+    /// unattended cannot ask for.
+    pub passphrase: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Encryption {
     indicator: Option<EncryptionIndicator>,
@@ -700,6 +758,7 @@ pub struct TerminalValues {
 #[derive(Clone)]
 pub struct TunableValues {
     pub encryption: EncryptionValues,
+    pub local_index: LocalIndexValues,
     pub log_level: String,
     pub max_log_files: usize,
     pub message_shortcode_display: bool,
@@ -738,6 +797,10 @@ pub struct Tunables {
     /// Subsection for overriding encryption-related settings.
     #[serde(default)]
     pub encryption: Encryption,
+
+    /// Subsection for the local message index.
+    #[serde(default)]
+    pub local_index: LocalIndex,
 
     /// Subsection for overriding sort orders in UI lists.
     #[serde(default)]
@@ -782,6 +845,7 @@ impl Tunables {
     fn merge(self, other: Self) -> Self {
         Tunables {
             encryption: Encryption::merge(self.encryption, other.encryption),
+            local_index: LocalIndex::merge(self.local_index, other.local_index),
             sort: SortOverrides::merge(self.sort, other.sort),
             terminal: Terminal::merge(self.terminal, other.terminal),
             users: merge_maps(self.users, other.users),
@@ -824,6 +888,7 @@ impl Tunables {
     fn values(self) -> TunableValues {
         TunableValues {
             encryption: self.encryption.values(),
+            local_index: self.local_index.values(),
             sort: self.sort.values(),
             terminal: self.terminal.values(),
 
@@ -1075,6 +1140,10 @@ pub struct ApplicationSettings {
     pub session_json_old: PathBuf,
     pub sled_dir: PathBuf,
     pub sqlite_dir: PathBuf,
+
+    /// Where each room's local message index directory is written.
+    pub search_index_dir: PathBuf,
+
     pub profile_name: String,
     pub profile: ProfileConfig,
     pub tunables: TunableValues,
@@ -1194,6 +1263,12 @@ impl ApplicationSettings {
         let mut sqlite_dir = profile_data_dir.clone();
         sqlite_dir.push("sqlite");
 
+        // The index sits beside the sqlite stores, under the data directory rather than the cache
+        // directory, so that clearing caches does not silently empty it. It is still disposable:
+        // every event in it can be fetched again from the homeserver.
+        let mut search_index_dir = profile_data_dir.clone();
+        search_index_dir.push("search-index");
+
         let mut session_json = profile_data_dir.clone();
         session_json.push("session.json");
 
@@ -1214,6 +1289,7 @@ impl ApplicationSettings {
             session_json,
             session_json_old,
             sqlite_dir,
+            search_index_dir,
             profile_name,
             profile,
             tunables,
