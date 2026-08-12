@@ -15,9 +15,10 @@
 //! succeeds almost regardless of what was typed, which is the same reason the switcher only
 //! fuzzy-matches names.
 //!
-//! The order is the order the homeserver gave, which is newest first. Ranking the rows again
-//! would throw that away, and recency is what makes a result recognisable: the user is looking
-//! for something they remember happening, and they remember roughly when.
+//! The rows stay newest first, the order [crate::search::sort_newest_first] put them in. Ranking
+//! them again by how well they match would throw that away, and recency is what makes a result
+//! recognisable: the user is looking for something they remember happening, and they remember
+//! roughly when.
 //!
 //! Encrypted rooms are missing from every result. The homeserver cannot read them, so it cannot
 //! index them, and no request made from here changes that.
@@ -400,8 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_filter_keeps_the_order_the_homeserver_gave() {
-        // The homeserver returns newest first, and re-ranking would throw that away.
+    fn test_the_filter_keeps_the_rows_in_the_order_they_arrived() {
+        // The rows reach the window newest first, and re-ranking would throw that away.
         let rows = vec![
             row("general", "@dan:example.com", "deploy three"),
             row("general", "@dan:example.com", "deploy two"),

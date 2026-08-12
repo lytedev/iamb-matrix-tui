@@ -38,13 +38,13 @@ use matrix_sdk::ruma::{
 /// with.
 pub const HITS_PER_REQUEST: u32 = 100;
 
-/// How many hits are collected before the search stops asking for more.
+/// How many hits are kept.
 ///
 /// The window filters the hits it was given without going back to the network, so the whole set
 /// has to be in hand before the user types anything. That argues for fetching everything, and a
 /// common word matches thousands of messages, which argues for stopping. This is the compromise:
 /// enough that the filter has something real to work on, few enough that the search returns in a
-/// moment. Hits arrive newest first, so what is dropped is the oldest.
+/// moment. The hits are put in order before the cap is applied, so what is dropped is the oldest.
 pub const MAX_HITS: usize = 200;
 
 /// One message the homeserver found.
@@ -74,9 +74,10 @@ pub struct MessageHit {
 
 /// Ask the homeserver for the messages that match `term`.
 ///
-/// Only `content.body` is searched, because that is the text the user remembers typing. The
-/// results come back newest first, since a message somebody is looking for is far more often a
-/// recent one than the best-ranked one out of years of chat.
+/// Only `content.body` is searched, because that is the text the user remembers typing. The order
+/// asked for is recency, since a message somebody is looking for is far more often a recent one
+/// than the best-ranked one out of years of chat. What comes back still has to be put in order by
+/// [sort_newest_first]; see there for why.
 ///
 /// `next_batch` continues an earlier search, and is the token that search handed back.
 pub fn search_request(term: String, next_batch: Option<String>) -> SearchRequest {
@@ -104,6 +105,19 @@ pub fn search_request(term: String, next_batch: Option<String>) -> SearchRequest
 /// cannot parse, and none of those are something to jump to.
 pub fn hits(results: &ResultRoomEvents) -> Vec<MessageHit> {
     results.results.iter().filter_map(hit).collect()
+}
+
+/// Put the newest hit first.
+///
+/// The homeserver's "recent" ordering is per room, not across the search: it returns each room's
+/// matches newest first and then puts the rooms one after another. Verified against Synapse, where
+/// a term found in 21 rooms came back as 21 descending runs rather than one.
+///
+/// The user reads one list, so the list needs one order. The cap on how many hits are kept also
+/// depends on it: without this, dropping the tail would drop whichever rooms happened to come
+/// last rather than the oldest messages.
+pub fn sort_newest_first(hits: &mut [MessageHit]) {
+    hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 }
 
 /// One result, when it is a message.
@@ -149,6 +163,18 @@ mod tests {
     /// The `room_events` out of a response body, as the worker gets it.
     fn results(results: Value) -> ResultRoomEvents {
         from_value(json!({ "count": 1, "results": results })).unwrap()
+    }
+
+    /// A hit that is nothing but its timestamp, for checking the order.
+    fn at(millis: u64) -> MessageHit {
+        MessageHit {
+            room_id: room_id!("!general:example.com").to_owned(),
+            event_id: event_id!("$found:example.com").to_owned(),
+            thread: None,
+            sender: user_id!("@dan:example.com").to_owned(),
+            timestamp: MilliSecondsSinceUnixEpoch(UInt::new(millis).unwrap()),
+            body: "deploy".to_string(),
+        }
     }
 
     fn message(extra: Value) -> Value {
@@ -243,6 +269,30 @@ mod tests {
         let multiline = message(json!({ "body": "one\n\ntwo   three\tfour" }));
 
         assert_eq!(hits(&results(json!([multiline])))[0].body, "one two three four");
+    }
+
+    #[test]
+    fn test_hits_are_put_in_order_across_every_room() {
+        // The homeserver returns each room's matches newest first, one room after another, so a
+        // hit from a quiet room can arrive before a much newer hit from a busy one.
+        let mut hits = vec![
+            at(1_700_000_003_000),
+            at(1_700_000_001_000),
+            at(1_700_000_004_000),
+            at(1_700_000_002_000),
+        ];
+
+        sort_newest_first(&mut hits);
+
+        let order = hits.iter().map(|hit| hit.timestamp.0).collect::<Vec<_>>();
+        let newest_first = vec![
+            UInt::new(1_700_000_004_000).unwrap(),
+            UInt::new(1_700_000_003_000).unwrap(),
+            UInt::new(1_700_000_002_000).unwrap(),
+            UInt::new(1_700_000_001_000).unwrap(),
+        ];
+
+        assert_eq!(order, newest_first);
     }
 
     #[test]

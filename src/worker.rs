@@ -16,7 +16,7 @@ use gethostname::gethostname;
 use matrix_sdk::ruma::events::sticker::StickerEventContent;
 use matrix_sdk::ruma::events::RoomAccountDataEventType;
 
-use crate::search::{hits, search_request, MessageHit, MAX_HITS};
+use crate::search::{hits, search_request, sort_newest_first, MessageHit, MAX_HITS};
 use crate::snooze::{SnoozeContent, SNOOZE_EVENT_TYPE};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
@@ -1600,6 +1600,9 @@ impl ClientWorker {
     /// answer gave until the server runs out, or until [MAX_HITS] have been collected. The user
     /// is waiting on this, so the cap is what keeps a term such as "the" from spending a minute
     /// paging through years of chat before anything appears.
+    ///
+    /// The whole set is put in order before the cap is applied, because the homeserver orders
+    /// each room's matches on its own rather than across the search.
     async fn search_messages(&mut self, term: String) -> IambResult<Vec<MessageHit>> {
         let mut collected = Vec::new();
         let mut next_batch = None;
@@ -1618,6 +1621,7 @@ impl ClientWorker {
             }
         }
 
+        sort_newest_first(&mut collected);
         collected.truncate(MAX_HITS);
 
         Ok(collected)
