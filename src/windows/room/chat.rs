@@ -1178,6 +1178,11 @@ pub struct Chat<'a> {
     focused: bool,
 }
 
+/// The most rows the message bar grows to before it scrolls instead.
+///
+/// The bar wraps, so this counts the rows on screen and not the lines in the buffer.
+const COMPOSE_BAR_MAX_HEIGHT: usize = 5;
+
 impl<'a> Chat<'a> {
     pub fn new(store: &'a mut ProgramStore) -> Chat<'a> {
         Chat { store, focused: false }
@@ -1218,9 +1223,9 @@ impl StatefulWidget for Chat<'_> {
         };
 
         // Determine the region to show each UI element.
-        let lines = state.tbox.has_lines(5).max(1) as u16;
+        let lines = state.tbox.has_lines(COMPOSE_BAR_MAX_HEIGHT).max(1) as u16;
         let drawh = area.height;
-        let texth = lines.min(drawh).clamp(1, 5);
+        let texth = lines.min(drawh).clamp(1, COMPOSE_BAR_MAX_HEIGHT as u16);
         let desch = if desc_spans.is_some() {
             drawh.saturating_sub(texth).min(1)
         } else {
@@ -1442,6 +1447,7 @@ mod tests {
     use modalkit::editing::cursor::Cursor;
 
     use crate::tests::{mock_store, TEST_ROOM1_ID};
+    use ratatui::buffer::Buffer;
 
     macro_rules! move_line {
         ($dir: expr, $count: expr) => {
@@ -1548,6 +1554,61 @@ mod tests {
 
         assert_eq!(taken.as_deref(), Some("@ada"));
         assert_eq!(list.selected, Some(BEST_MATCH_INDEX));
+    }
+
+    /// Render `text` into a message bar `columns` wide, and give back the rows drawn into.
+    ///
+    /// The bar is drawn through the same [TextBox] and the same prompt that [Chat::render] uses,
+    /// so what comes back is what the user sees.
+    async fn compose_bar_rows(text: &str, columns: u16) -> Vec<String> {
+        let mut store = mock_store().await;
+        let id = IambBufferId::Room(TEST_ROOM1_ID.clone(), None, RoomFocus::MessageBar);
+        let ebuf = store.load_buffer(id);
+        let mut tbox = TextBoxState::new(ebuf);
+
+        tbox.set_text(text);
+
+        let area = Rect::new(0, 0, columns, COMPOSE_BAR_MAX_HEIGHT as u16);
+        let mut buf = Buffer::empty(area);
+
+        TextBox::new().prompt(Span::raw("> ")).render(area, &mut buf, &mut tbox);
+
+        (0..area.height)
+            .map(|y| (0..columns).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|row| row.trim_end().to_string())
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_the_compose_bar_wraps_a_line_wider_than_the_pane() {
+        let long = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+        let rows = compose_bar_rows(long, 20).await;
+
+        // The whole message has to be on screen. A bar that drew one row would hide most of it.
+        assert!(rows.len() > 1, "{:?}", rows);
+
+        let drawn: String = rows.join("").replace(['>', ' '], "");
+        assert_eq!(drawn, long.replace(' ', ""), "{:?}", rows);
+    }
+
+    #[tokio::test]
+    async fn test_the_compose_bar_asks_for_a_row_for_every_wrapped_row() {
+        let long = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+        let columns = 20;
+        let rows = compose_bar_rows(long, columns).await;
+
+        // The height in Chat::render comes from has_lines, so it has to count wrapped rows and not
+        // buffer lines. A bar that wrapped but asked for one row would hide what the user types.
+        let mut store = mock_store().await;
+        let id = IambBufferId::Room(TEST_ROOM1_ID.clone(), None, RoomFocus::MessageBar);
+        let ebuf = store.load_buffer(id);
+        let mut tbox = TextBoxState::new(ebuf);
+
+        tbox.set_text(long);
+        tbox.set_term_info(Rect::new(0, 0, columns, COMPOSE_BAR_MAX_HEIGHT as u16));
+
+        assert_eq!(tbox.has_lines(COMPOSE_BAR_MAX_HEIGHT), rows.len());
     }
 
     #[tokio::test]
