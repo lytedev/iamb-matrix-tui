@@ -1169,6 +1169,21 @@ impl Default for RoomInfo {
     }
 }
 
+/// The new content of the most recent edit, as the server bundles it onto the message it edits.
+///
+/// The server sends this aggregation with every copy of the message, so a message that iamb loads
+/// again keeps its edit even when the `m.replace` event is not in the same chunk.
+fn bundled_replacement(msg: &RoomMessageEvent) -> Option<RoomMessageEventContentWithoutRelation> {
+    let RoomMessageEvent::Original(ev) = msg else {
+        return None;
+    };
+
+    match &ev.unsigned.relations.replace.as_ref()?.content.relates_to {
+        Some(Relation::Replacement(repl)) => Some(repl.new_content.clone()),
+        _ => None,
+    }
+}
+
 impl RoomInfo {
     pub fn get_thread(&self, root: Option<&EventId>) -> Option<&Messages> {
         if let Some(thread_root) = root {
@@ -1587,13 +1602,25 @@ impl RoomInfo {
         let key = (msg.origin_server_ts().into(), event_id.clone());
 
         let loc = EventLocation::Message(None, key.clone());
+        let bundled = bundled_replacement(&msg);
         self.keys.insert(event_id.clone(), loc);
         self.messages.insert_message(key, msg);
-        self.apply_pending_edit(&event_id);
+        self.apply_known_edits(&event_id, bundled);
     }
 
-    /// Apply an edit that reached this room before the message that it edits.
-    fn apply_pending_edit(&mut self, event_id: &EventId) {
+    /// Apply the edits that this room knows of to a message that it just loaded.
+    ///
+    /// An insert overwrites the copy that the room held, so an edit applied earlier is lost
+    /// unless it is applied again here.
+    fn apply_known_edits(
+        &mut self,
+        event_id: &EventId,
+        bundled: Option<RoomMessageEventContentWithoutRelation>,
+    ) {
+        if let Some(new_msgtype) = bundled {
+            self.apply_edit(event_id, new_msgtype);
+        }
+
         if let Some(new_msgtype) = self.pending_edits.remove(event_id) {
             self.apply_edit(event_id, new_msgtype);
         }
@@ -1608,9 +1635,10 @@ impl RoomInfo {
             .entry(thread_root.clone())
             .or_insert_with(|| Messages::thread(thread_root.clone()));
         let loc = EventLocation::Message(Some(thread_root), key.clone());
+        let bundled = bundled_replacement(&msg);
         self.keys.insert(event_id.clone(), loc);
         replies.insert_message(key, msg);
-        self.apply_pending_edit(&event_id);
+        self.apply_known_edits(&event_id, bundled);
     }
 
     /// Insert a new message event.
@@ -3286,6 +3314,43 @@ pub mod tests {
             1,
             serde_json::json!({ "msgtype": "m.text", "body": "half of the post" }),
         ));
+
+        assert_eq!(shown_body(&room, &original_id), "the whole post");
+    }
+
+    #[test]
+    fn test_a_reloaded_message_keeps_its_edit() {
+        let mut room = RoomInfo::default();
+
+        let original_id = EventId::new_v1(server_name!("example.com"));
+        let content = serde_json::json!({ "msgtype": "m.text", "body": "half of the post" });
+
+        room.insert(mock_text_event(&original_id, 1, content.clone()));
+        edit(&mut room, &original_id, "the whole post");
+
+        // Scrollback fetches overlap, so the server sends the same message again. It carries the
+        // edit as a bundled aggregation.
+        let mut reloaded = mock_text_event(&original_id, 1, content);
+
+        if let RoomMessageEvent::Original(ref mut ev) = reloaded {
+            ev.unsigned.relations.replace = Some(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "type": "m.room.message",
+                    "event_id": EventId::new_v1(server_name!("example.com")),
+                    "sender": &*TEST_USER1,
+                    "origin_server_ts": 2u64,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": "* the whole post",
+                        "m.new_content": { "msgtype": "m.text", "body": "the whole post" },
+                        "m.relates_to": { "rel_type": "m.replace", "event_id": original_id },
+                    },
+                }))
+                .unwrap(),
+            ));
+        }
+
+        room.insert(reloaded);
 
         assert_eq!(shown_body(&room, &original_id), "the whole post");
     }
