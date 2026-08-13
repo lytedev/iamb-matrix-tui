@@ -353,16 +353,25 @@ impl MessageTimeStamp {
         Span::styled(time, BOLD_STYLE).into()
     }
 
-    fn show_time(&self) -> Option<Span<'_>> {
+    /// The time of day, spelled the one way that every layout spells it.
+    ///
+    /// A message that has not reached the server yet has no time to show. The local clock would
+    /// give one, but it would be the time the user pressed enter and not the time of the message,
+    /// and the two disagree exactly when the network is slow enough for somebody to look.
+    fn time_of_day(&self) -> Option<String> {
         match self {
             MessageTimeStamp::OriginServer(ms) => {
                 let time = millis_to_datetime(*ms).format("%T");
-                let time = format!("  [{time}]");
 
-                Span::raw(time).into()
+                Some(format!("[{time}]"))
             },
             MessageTimeStamp::LocalEcho => None,
         }
+    }
+
+    fn show_time(&self) -> Option<Span<'_>> {
+        // The two spaces hold the time off the message text in the column on the right.
+        self.time_of_day().map(|time| Span::raw(format!("  {time}")))
     }
 
     fn is_local_echo(&self) -> bool {
@@ -783,22 +792,27 @@ fn user_gutter_width(settings: &ApplicationSettings, width: usize) -> usize {
 /// A name that went through the wrapping as part of the message text comes back in the style of
 /// the message. The colour of a name is what tells one sender from another at a glance, so it has
 /// to be put back afterwards.
-fn restyle_prefix(line: &mut Line<'_>, len: usize, style: Style) {
+fn restyle_prefix(line: &mut Line<'_>, prefix: &[Span<'_>]) {
     let Some(first) = line.spans.first() else {
         return;
     };
 
-    let content = first.content.to_string();
+    let mut rest = first.content.to_string();
     let rest_style = first.style;
+    let mut spans = Vec::with_capacity(prefix.len() + 1);
 
-    // The line holds less than the whole name when the pane is narrower than the name itself.
-    let len = len.min(content.len());
-    let (prefix, rest) = content.split_at(len);
+    for piece in prefix {
+        // The line holds less than the whole prefix when the pane is narrower than the prefix
+        // itself. What did not fit on the line has no piece to take a style from.
+        let len = piece.content.len().min(rest.len());
+        let tail = rest.split_off(len);
 
-    let mut spans = vec![Span::styled(prefix.to_string(), style)];
+        spans.push(Span::styled(rest, piece.style));
+        rest = tail;
+    }
 
     if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), rest_style));
+        spans.push(Span::styled(rest, rest_style));
     }
 
     spans.extend(line.spans.drain(1..));
@@ -973,7 +987,7 @@ impl<'a> MessageFormatter<'a> {
         let width = self.width();
         let w = width.saturating_sub(2);
         // The quoted message keeps its own header line, so no name goes in front of its body.
-        let (mut replied, proto) = msg.show_msg(w, reply_style, settings, previews, None);
+        let (mut replied, proto) = msg.show_msg(w, reply_style, settings, previews, vec![]);
         let mut sender = msg.sender_span(info, self.settings);
         let sender_width = UnicodeWidthStr::width(sender.content.as_ref());
         let trailing = w.saturating_sub(sender_width + 1);
@@ -1339,21 +1353,19 @@ impl Message {
 
         // Now show the message contents, and the inlined reply if we couldn't find it above.
         //
-        // The sender name is handed to the message body when the layout puts it in front of the
-        // first line, so that the wrapping counts it. A message with an image keeps the name on
-        // its own line instead: the preview is drawn at a column worked out from the text, and a
-        // name in front of it would move the picture and not the placeholder under it.
-        let inline_sender = match fmt.cols {
+        // The time and the sender name are handed to the message body when the layout puts them
+        // in front of the first line, so that the wrapping counts them. A message with an image
+        // keeps the name on its own line instead: the preview is drawn at a column worked out
+        // from the text, and anything in front of it would move the picture and not the
+        // placeholder under it.
+        let prefix = match fmt.cols {
             MessageColumns::Inline if self.image_preview.is_none() => {
-                match std::mem::take(&mut fmt.user) {
-                    SenderSpan::Line(user) | SenderSpan::Gutter(user) => Some(user),
-                    SenderSpan::None => None,
-                }
+                self.inline_prefix(&mut fmt, style)
             },
-            _ => None,
+            _ => Vec::new(),
         };
 
-        let (msg, proto) = self.show_msg(width, style, settings, previews, inline_sender);
+        let (msg, proto) = self.show_msg(width, style, settings, previews, prefix);
 
         // Given our text so far, determine the image offset.
         let proto_main = proto.map(|p| {
@@ -1398,8 +1410,39 @@ impl Message {
 
     /// Draw the body of the message, wrapped to `width`.
     ///
-    /// `sender` is drawn in front of the first line when the layout asks for it. It goes in here
-    /// rather than in front of the finished text because the wrapping has to count it: a name
+    /// What goes in front of the first line of the message, when the layout has no columns.
+    ///
+    /// The time comes first and the name second, which is the order the user asked for. It puts
+    /// everything that is not the message on the left, and leaves the right edge of the pane to
+    /// the message alone. In the layout with columns the time sits on the right, and a message
+    /// there has to keep clear of it on every line.
+    ///
+    /// The time is drawn dim, because two pieces of metadata that both stand out are two pieces
+    /// that compete. The colour of the name is what the reader picks a speaker out by, so the
+    /// time gives way to it.
+    ///
+    /// The time is shown on every message, as it is in the layout with columns. The name is shown
+    /// only when the speaker changes, as it is everywhere else.
+    fn inline_prefix<'a>(&'a self, fmt: &mut MessageFormatter<'a>, style: Style) -> Vec<Span<'a>> {
+        let mut prefix = Vec::new();
+
+        if let Some(time) = self.timestamp.time_of_day() {
+            let dim = style.add_modifier(StyleModifier::DIM);
+
+            prefix.push(Span::styled(format!("{time} "), dim));
+        }
+
+        if let SenderSpan::Line(user) | SenderSpan::Gutter(user) = std::mem::take(&mut fmt.user) {
+            let Span { content, style } = user;
+
+            prefix.push(Span::styled(format!("{content}: "), style));
+        }
+
+        prefix
+    }
+
+    /// `prefix` is drawn in front of the first line when the layout asks for it. It goes in here
+    /// rather than in front of the finished text because the wrapping has to count it: anything
     /// added afterwards would push the first line past the edge of the pane.
     fn show_msg<'a>(
         &'a self,
@@ -1407,21 +1450,10 @@ impl Message {
         style: Style,
         settings: &'a ApplicationSettings,
         previews: &'a PreviewManager,
-        sender: Option<Span<'a>>,
+        prefix: Vec<Span<'a>>,
     ) -> (Text<'a>, Option<&'a Protocol>) {
-        let sender = sender.map(|user| {
-            let Span { content, style } = user;
-
-            (format!("{content}: "), style)
-        });
-
         if let Some(html) = &self.html {
-            let text = match sender {
-                Some((prefix, prefix_style)) => {
-                    html.to_text_after(width, style, settings, Span::styled(prefix, prefix_style))
-                },
-                None => html.to_text(width, style, settings),
-            };
+            let text = html.to_text_after(width, style, settings, prefix);
 
             (text, None)
         } else {
@@ -1455,18 +1487,21 @@ impl Message {
                 msg.to_mut().insert_str(0, &placeholder);
             }
 
-            let Some((prefix, prefix_style)) = sender else {
+            if prefix.is_empty() {
                 return (wrapped_text(msg, width, style), proto);
-            };
+            }
 
-            msg.to_mut().insert_str(0, &prefix);
+            for piece in prefix.iter().rev() {
+                msg.to_mut().insert_str(0, piece.content.as_ref());
+            }
 
             let mut text = wrapped_text(msg, width, style);
 
-            // The name went through the wrapping as ordinary text, so it now carries the style of
-            // the message. Give it back the colour that tells one sender from another.
+            // The prefix went through the wrapping as ordinary text, so it now carries the style
+            // of the message. Give each piece its own style back: the colour is what tells one
+            // sender from another, and the time has to stay quieter than both.
             if let Some(first) = text.lines.first_mut() {
-                restyle_prefix(first, prefix.len(), prefix_style);
+                restyle_prefix(first, &prefix);
             }
 
             (text, proto)
@@ -1734,19 +1769,75 @@ pub mod tests {
 
         let width = 40;
         let rows = rows(&msg, width, &settings);
+        let time = msg.timestamp.time_of_day().expect("the message has a time");
 
         assert!(rows.len() > 1, "the body should need more than one row");
-        assert!(rows[0].starts_with("User2: "), "{:?} should start with the name", rows[0]);
-        assert!(!rows[0].contains("  "), "{:?} should have no sender column", rows[0]);
+        assert_eq!(rows[0].find(&time), Some(0), "{:?} should open with the time", rows[0]);
+        assert!(rows[0].contains("User2: "), "{:?} should name the sender", rows[0]);
 
         for row in rows.iter().skip(1) {
-            assert!(!row.starts_with(' '), "{:?} should start at the left edge", row);
+            // The wrapper breaks between words and gives the next row the space between them, so
+            // one space is what a row starts with. What must not be there is a column.
+            let indent = row.len() - row.trim_start().len();
+
+            assert!(indent <= 1, "{:?} should start at the left edge", row);
+            assert!(!row.contains(&time), "{:?} should carry the time only once", row);
             assert!(
                 UnicodeWidthStr::width(row.as_str()) <= width,
                 "{:?} is wider than the pane",
                 row
             );
         }
+    }
+
+    /// The time is drawn quieter than the name, so that the two do not compete.
+    #[test]
+    fn test_full_wrap_draws_the_time_dim_and_the_name_in_its_own_colour() {
+        let mut settings = mock_settings();
+        settings.tunables.message_full_wrap = true;
+        named(&mut settings, &TEST_USER2, "User2");
+
+        let info = mock_room();
+        let previews = PreviewManager::new(None);
+        let mut vwctx = ViewportContext::<MessageCursor>::new();
+
+        vwctx.dimensions = (80, 40);
+
+        let msg = mock_message2();
+        let text = msg.show(None, false, &vwctx, &info, &settings, &previews);
+        let spans = &text.lines[1].spans;
+
+        assert!(spans[0].content.starts_with('['), "{:?} should be the time", spans[0]);
+        assert!(spans[0].style.add_modifier.contains(StyleModifier::DIM));
+        assert_eq!(spans[1].content.as_ref(), "User2: ");
+        assert!(!spans[1].style.add_modifier.contains(StyleModifier::DIM));
+    }
+
+    /// The layout with columns times every message, and so does this one.
+    #[test]
+    fn test_full_wrap_times_a_message_that_repeats_a_sender() {
+        let mut settings = mock_settings();
+        settings.tunables.message_full_wrap = true;
+        named(&mut settings, &TEST_USER2, "User2");
+
+        let info = mock_room();
+        let previews = PreviewManager::new(None);
+        let mut vwctx = ViewportContext::<MessageCursor>::new();
+
+        vwctx.dimensions = (80, 40);
+
+        let first = mock_message2();
+        let second = mock_message5();
+        let text = second.show(Some(&first), false, &vwctx, &info, &settings, &previews);
+        let row = text.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let time = second.timestamp.time_of_day().expect("the message has a time");
+
+        assert_eq!(row.find(&time), Some(0), "{:?} should open with the time", row);
+        assert!(!row.contains("User2: "), "{:?} should not name the sender twice", row);
     }
 
     /// The column layout is what the user gets until they ask for the other one.

@@ -513,20 +513,22 @@ impl StyleTree {
         printer.finish()
     }
 
-    /// The same, with `first` in front of the first line.
+    /// The same, with `prefix` in front of the first line.
     ///
-    /// The span goes into the printer before the tree does, so that the wrapping counts it and
-    /// the second line starts at the left edge rather than under it.
+    /// The spans go into the printer before the tree does, so that the wrapping counts them and
+    /// the second line starts at the left edge rather than under them.
     pub fn to_text_after<'a>(
         &'a self,
         width: usize,
         style: Style,
         settings: &'a ApplicationSettings,
-        first: Span<'a>,
+        prefix: Vec<Span<'a>>,
     ) -> Text<'a> {
         let mut printer = TextPrinter::new(width, style, settings);
 
-        printer.push_span_nobreak(first);
+        for piece in prefix {
+            printer.push_span_nobreak(piece);
+        }
 
         for child in self.children.iter() {
             child.print(&mut printer, style);
