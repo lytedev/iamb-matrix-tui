@@ -196,6 +196,11 @@ impl ScrollbackState {
         let mut cursor = MessageCursor::new(target, 0);
         std::mem::swap(&mut cursor, &mut self.cursor);
         self.jumped.push(cursor);
+
+        // The render stops as soon as it has the first row of the selected message and a full
+        // pane. A jump can land on a message whose first row is only a date or a sender, and the
+        // user then sees no part of what they asked for. A motion sets this for the same reason.
+        self.show_full_on_redraw = true;
     }
 
     /// Move the cursor onto `event_id`, if that message is loaded in this scrollback.
@@ -2322,6 +2327,91 @@ mod tests {
 
         assert_eq!(scrollback.viewctx.corner, corner);
         assert_eq!(drawn(&second), drawn(&first));
+    }
+
+    /// A jump must put the message it selects on the screen.
+    ///
+    /// The render stops when it holds the first row of the selected message and a full pane. That
+    /// row is often a date or a sender, so a jump that does not ask for the whole message can
+    /// leave the user with no part of what they selected. Every jump goes through
+    /// [ScrollbackState::goto_message], so `:context`, a clicked notification and a `:search`
+    /// result all need this.
+    #[tokio::test]
+    async fn test_a_jump_brings_the_selected_message_into_view() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let ctx = ProgramContext::default();
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        // The room draws more lines than this pane holds, so a jump has somewhere to hide.
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        // Scroll to the top, so that the newest message is below the pane.
+        for _ in 0..10 {
+            scrollback
+                .dirscroll(MoveDir2D::Up, ScrollSize::Cell, &1.into(), &ctx, &mut store)
+                .unwrap();
+        }
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(!drawn(&buffer).contains("writhe"));
+
+        // A jump down to it shows it, and not only the date above it.
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        assert!(scrollback.goto_event(&MSG1_EVID, info));
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(drawn(&buffer).contains("writhe"), "got: {}", drawn(&buffer));
+
+        // The pane must still hold still afterwards, as it does after any other render.
+        let corner = scrollback.viewctx.corner.clone();
+        let mut again = Buffer::empty(area);
+        scrollback.draw(area, &mut again, true, &mut store);
+        assert_eq!(scrollback.viewctx.corner, corner);
+        assert_eq!(drawn(&again), drawn(&buffer));
+
+        // A jump back up shows the older message as well.
+        let info = store.application.rooms.get_or_default(room_id.clone());
+        assert!(scrollback.goto_event(&MSG2_EVID, info));
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(drawn(&buffer).contains("helium"), "got: {}", drawn(&buffer));
+    }
+
+    /// The same, for a message that arrives only after the jump asked for it.
+    ///
+    /// A notification and a search result often name a message that the scrollback has not loaded.
+    #[tokio::test]
+    async fn test_a_jump_to_a_late_message_brings_it_into_view() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let mut scrollback = ScrollbackState::new(room_id.clone(), None);
+        let ctx = ProgramContext::default();
+
+        // Skip rendering typing notices.
+        store.application.settings.tunables.typing_notice_display = false;
+
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        for _ in 0..10 {
+            scrollback
+                .dirscroll(MoveDir2D::Up, ScrollSize::Cell, &1.into(), &ctx, &mut store)
+                .unwrap();
+        }
+
+        // The render takes the waiting selection, so the message shows on the same frame.
+        scrollback.select_when_loaded(MSG1_EVID.clone());
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+        assert!(scrollback.pending_selection.is_none());
+        assert!(drawn(&buffer).contains("writhe"), "got: {}", drawn(&buffer));
     }
 
     #[tokio::test]
