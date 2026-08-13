@@ -32,7 +32,6 @@ use modalkit::{
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
 use matrix_sdk::ruma::OwnedRoomId;
-use unicode_width::UnicodeWidthStr;
 
 use crate::base::{
     IambBufferId,
@@ -44,7 +43,7 @@ use crate::base::{
     ThreadSummary,
 };
 use crate::commands::IAMB_COMMANDS;
-use crate::util::{fit, ELLIPSIS};
+use crate::util::fit;
 use crate::message::mention::fuzzy_score;
 use crate::message::MessageTimeStamp;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
@@ -467,8 +466,12 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SwitchItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use unicode_width::UnicodeWidthStr;
+
     use crate::base::UnreadInfo;
     use crate::tests::mock_store;
+    use crate::util::ELLIPSIS;
     use matrix_sdk::ruma::{event_id, room_id, RoomId};
 
     /// A viewport `columns` wide, which is what the switcher is drawn into.
