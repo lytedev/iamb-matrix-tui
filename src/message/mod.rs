@@ -65,7 +65,7 @@ use crate::{
     base::RoomInfo,
     config::ApplicationSettings,
     message::html::{parse_matrix_html, StyleTree},
-    util::{replace_emojis_in_str, space, space_span, take_width, wrapped_text},
+    util::{fit, replace_emojis_in_str, space, space_span, take_width, wrapped_text},
 };
 
 pub mod compose;
@@ -742,17 +742,71 @@ enum MessageColumns {
 
     /// One column: message with sender on line before the message.
     One,
+
+    /// One column, with the sender name in front of the first line of the message.
+    ///
+    /// The message keeps the whole pane, and a line that wraps starts again at the left edge,
+    /// under the name. The user asked for this: it trades the column that makes a long
+    /// conversation easy to skim for the width that makes a stack trace readable.
+    Inline,
 }
 
 impl MessageColumns {
-    fn user_gutter_width(&self, settings: &ApplicationSettings) -> u16 {
-        if let MessageColumns::One = self {
+    fn user_gutter_width(&self, gutter: usize) -> u16 {
+        if let MessageColumns::One | MessageColumns::Inline = self {
             0
         } else {
-            settings.tunables.user_gutter_width as u16
+            gutter as u16
         }
     }
 }
+
+/// How wide the sender column is in a pane of `width` columns.
+///
+/// The configured width is a maximum and not a promise. It is measured in columns, while the
+/// pane it sits in is not, so on a narrow pane a column wide enough to be comfortable at 120
+/// columns eats the message: a name of 30 columns beside a stack trace of 20 shows neither.
+///
+/// The cap is a share of the pane, because that is what the reader sees. A pane wide enough for
+/// the configured width still gets it, so a user who never splits a window sees no change.
+fn user_gutter_width(settings: &ApplicationSettings, width: usize) -> usize {
+    let configured = settings.tunables.user_gutter_width;
+    let share = width * settings.tunables.user_gutter_max_percent / 100;
+
+    // A column of four columns of name plus its two spaces still tells one sender from another
+    // when the names differ early, and it is better than dropping the column without being asked.
+    configured.min(share.max(MIN_USER_GUTTER))
+}
+
+/// Give the first `len` bytes of a line their own style.
+///
+/// A name that went through the wrapping as part of the message text comes back in the style of
+/// the message. The colour of a name is what tells one sender from another at a glance, so it has
+/// to be put back afterwards.
+fn restyle_prefix(line: &mut Line<'_>, len: usize, style: Style) {
+    let Some(first) = line.spans.first() else {
+        return;
+    };
+
+    let content = first.content.to_string();
+    let rest_style = first.style;
+
+    // The line holds less than the whole name when the pane is narrower than the name itself.
+    let len = len.min(content.len());
+    let (prefix, rest) = content.split_at(len);
+
+    let mut spans = vec![Span::styled(prefix.to_string(), style)];
+
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), rest_style));
+    }
+
+    spans.extend(line.spans.drain(1..));
+    line.spans = spans;
+}
+
+/// The narrowest the cap may make the sender column.
+const MIN_USER_GUTTER: usize = 6;
 
 #[derive(Default, Debug)]
 enum SenderSpan<'a> {
@@ -782,6 +836,9 @@ struct MessageFormatter<'a> {
 
     /// The width that the message contents need to fill.
     fill: usize,
+
+    /// How wide the sender column is, after the cap for this pane.
+    user_gutter: usize,
 
     /// The formatted Span for the message sender.
     user: SenderSpan<'a>,
@@ -826,8 +883,7 @@ impl<'a> MessageFormatter<'a> {
             text.lines.push(Line::from(vec![leading, date, trailing]));
         }
 
-        let user_gutter_empty_span =
-            space_span(self.settings.tunables.user_gutter_width, Style::default());
+        let user_gutter_empty_span = space_span(self.user_gutter, Style::default());
 
         let user_gutter = match std::mem::take(&mut self.user) {
             SenderSpan::Line(user) => {
@@ -886,6 +942,10 @@ impl<'a> MessageFormatter<'a> {
 
                 text.lines.push(Line::from(line));
             },
+            MessageColumns::Inline => {
+                // Nothing goes in front of the message. That is the whole point of this layout.
+                text.lines.push(prev_line);
+            },
         }
     }
 
@@ -912,7 +972,8 @@ impl<'a> MessageFormatter<'a> {
 
         let width = self.width();
         let w = width.saturating_sub(2);
-        let (mut replied, proto) = msg.show_msg(w, reply_style, settings, previews);
+        // The quoted message keeps its own header line, so no name goes in front of its body.
+        let (mut replied, proto) = msg.show_msg(w, reply_style, settings, previews, None);
         let mut sender = msg.sender_span(info, self.settings);
         let sender_width = UnicodeWidthStr::width(sender.content.as_ref());
         let trailing = w.saturating_sub(sender_width + 1);
@@ -935,7 +996,7 @@ impl<'a> MessageFormatter<'a> {
         let proto = proto.map(|p| {
             let y_off = text.lines.len() as u16;
             // Adjust x_off by 2 to account for the vertical line and indent
-            let x_off = self.cols.user_gutter_width(settings) + 2;
+            let x_off = self.cols.user_gutter_width(self.user_gutter) + 2;
             (p, x_off, y_off)
         });
 
@@ -1118,14 +1179,36 @@ impl Message {
             Some(prev) if prev.timestamp.same_day(&self.timestamp) => None,
             _ => self.timestamp.show_date(),
         };
-        let user_gutter = settings.tunables.user_gutter_width;
+        let user_gutter = user_gutter_width(settings, width);
+
+        if settings.tunables.message_full_wrap {
+            let cols = MessageColumns::Inline;
+            let fill = width;
+            let user = self.show_sender(prev, false, info, settings, width, user_gutter);
+            let time = None;
+            let read = Vec::new();
+            let user_gutter = 0;
+
+            return MessageFormatter {
+                settings,
+                info,
+                cols,
+                orig,
+                fill,
+                user_gutter,
+                user,
+                date,
+                time,
+                read,
+            };
+        }
 
         if user_gutter + TIME_GUTTER + READ_GUTTER + MIN_MSG_LEN <= width &&
             settings.tunables.read_receipt_display
         {
             let cols = MessageColumns::Four;
             let fill = width - user_gutter - TIME_GUTTER - READ_GUTTER;
-            let user = self.show_sender(prev, true, info, settings, width);
+            let user = self.show_sender(prev, true, info, settings, width, user_gutter);
             let time = self.timestamp.show_time();
             let read = info
                 .event_receipts
@@ -1135,31 +1218,75 @@ impl Message {
                 .map(|user_id| user_id.to_owned())
                 .collect();
 
-            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
+            MessageFormatter {
+                settings,
+                info,
+                cols,
+                orig,
+                fill,
+                user_gutter,
+                user,
+                date,
+                time,
+                read,
+            }
         } else if user_gutter + TIME_GUTTER + MIN_MSG_LEN <= width {
             let cols = MessageColumns::Three;
             let fill = width - user_gutter - TIME_GUTTER;
-            let user = self.show_sender(prev, true, info, settings, width);
+            let user = self.show_sender(prev, true, info, settings, width, user_gutter);
             let time = self.timestamp.show_time();
             let read = Vec::new();
 
-            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
+            MessageFormatter {
+                settings,
+                info,
+                cols,
+                orig,
+                fill,
+                user_gutter,
+                user,
+                date,
+                time,
+                read,
+            }
         } else if user_gutter + MIN_MSG_LEN <= width {
             let cols = MessageColumns::Two;
             let fill = width - user_gutter;
-            let user = self.show_sender(prev, true, info, settings, width);
+            let user = self.show_sender(prev, true, info, settings, width, user_gutter);
             let time = None;
             let read = Vec::new();
 
-            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
+            MessageFormatter {
+                settings,
+                info,
+                cols,
+                orig,
+                fill,
+                user_gutter,
+                user,
+                date,
+                time,
+                read,
+            }
         } else {
             let cols = MessageColumns::One;
             let fill = width.saturating_sub(2);
-            let user = self.show_sender(prev, false, info, settings, width);
+            let user = self.show_sender(prev, false, info, settings, width, user_gutter);
             let time = None;
             let read = Vec::new();
 
-            MessageFormatter { settings, info, cols, orig, fill, user, date, time, read }
+            MessageFormatter {
+                settings,
+                info,
+                cols,
+                orig,
+                fill,
+                user_gutter,
+                user,
+                date,
+                time,
+                read,
+            }
         }
     }
 
@@ -1211,12 +1338,27 @@ impl Message {
         });
 
         // Now show the message contents, and the inlined reply if we couldn't find it above.
-        let (msg, proto) = self.show_msg(width, style, settings, previews);
+        //
+        // The sender name is handed to the message body when the layout puts it in front of the
+        // first line, so that the wrapping counts it. A message with an image keeps the name on
+        // its own line instead: the preview is drawn at a column worked out from the text, and a
+        // name in front of it would move the picture and not the placeholder under it.
+        let inline_sender = match fmt.cols {
+            MessageColumns::Inline if self.image_preview.is_none() => {
+                match std::mem::take(&mut fmt.user) {
+                    SenderSpan::Line(user) | SenderSpan::Gutter(user) => Some(user),
+                    SenderSpan::None => None,
+                }
+            },
+            _ => None,
+        };
+
+        let (msg, proto) = self.show_msg(width, style, settings, previews, inline_sender);
 
         // Given our text so far, determine the image offset.
         let proto_main = proto.map(|p| {
             let y_off = text.lines.len() as u16;
-            let x_off = fmt.cols.user_gutter_width(settings);
+            let x_off = fmt.cols.user_gutter_width(fmt.user_gutter);
 
             // Account for extra lines printed before the message;
             let y_off = y_off + fmt.message_start_line();
@@ -1254,15 +1396,34 @@ impl Message {
         self.show_with_preview(prev, selected, vwctx, info, settings, previews).0
     }
 
+    /// Draw the body of the message, wrapped to `width`.
+    ///
+    /// `sender` is drawn in front of the first line when the layout asks for it. It goes in here
+    /// rather than in front of the finished text because the wrapping has to count it: a name
+    /// added afterwards would push the first line past the edge of the pane.
     fn show_msg<'a>(
         &'a self,
         width: usize,
         style: Style,
         settings: &'a ApplicationSettings,
         previews: &'a PreviewManager,
+        sender: Option<Span<'a>>,
     ) -> (Text<'a>, Option<&'a Protocol>) {
+        let sender = sender.map(|user| {
+            let Span { content, style } = user;
+
+            (format!("{content}: "), style)
+        });
+
         if let Some(html) = &self.html {
-            (html.to_text(width, style, settings), None)
+            let text = match sender {
+                Some((prefix, prefix_style)) => {
+                    html.to_text_after(width, style, settings, Span::styled(prefix, prefix_style))
+                },
+                None => html.to_text(width, style, settings),
+            };
+
+            (text, None)
         } else {
             let mut msg = self.event.body();
             if settings.tunables.message_shortcode_display {
@@ -1294,7 +1455,21 @@ impl Message {
                 msg.to_mut().insert_str(0, &placeholder);
             }
 
-            (wrapped_text(msg, width, style), proto)
+            let Some((prefix, prefix_style)) = sender else {
+                return (wrapped_text(msg, width, style), proto);
+            };
+
+            msg.to_mut().insert_str(0, &prefix);
+
+            let mut text = wrapped_text(msg, width, style);
+
+            // The name went through the wrapping as ordinary text, so it now carries the style of
+            // the message. Give it back the colour that tells one sender from another.
+            if let Some(first) = text.lines.first_mut() {
+                restyle_prefix(first, prefix.len(), prefix_style);
+            }
+
+            (text, proto)
         }
     }
 
@@ -1313,6 +1488,7 @@ impl Message {
         info: &'a RoomInfo,
         settings: &'a ApplicationSettings,
         width: usize,
+        user_gutter: usize,
     ) -> SenderSpan<'a> {
         if let Some(prev) = prev {
             if self.sender == prev.sender &&
@@ -1324,15 +1500,18 @@ impl Message {
         }
 
         let Span { content, style } = self.sender_span(info, settings);
-        let user_gutter = settings.tunables.user_gutter_width;
 
         let show_in_gutter = gutter_enabled && user_gutter > 2;
 
         if show_in_gutter {
-            let ((truncated, width), _) = take_width(content, user_gutter - 2);
-            let padding = user_gutter - 2 - width;
+            // A name that the column cannot hold ends in an ellipsis, so that a cut name is never
+            // read as the whole name. The two trailing spaces keep the message off the name.
+            let name_width = user_gutter - 2;
+            let fitted = fit(content.as_ref(), name_width);
+            let name = fitted.trim_end();
+            let padding = name_width.saturating_sub(UnicodeWidthStr::width(name));
 
-            let sender = format!("{}{}  ", space(padding), truncated);
+            let sender = format!("{}{}  ", space(padding), name);
 
             SenderSpan::Gutter(Span::styled(sender, style))
         } else if UnicodeWidthStr::width(content.as_ref()) > width {
@@ -1439,7 +1618,148 @@ pub mod tests {
     };
 
     use super::*;
+    use crate::config::UserDisplayTunables;
     use crate::tests::*;
+    use crate::util::ELLIPSIS;
+    use matrix_sdk::ruma::UserId;
+
+    /// The rows that a message draws in a pane `width` columns wide, without the date row.
+    fn rows(msg: &Message, width: usize, settings: &ApplicationSettings) -> Vec<String> {
+        let info = mock_room();
+        let previews = PreviewManager::new(None);
+        let mut vwctx = ViewportContext::<MessageCursor>::new();
+
+        vwctx.dimensions = (width, 40);
+
+        msg.show(None, false, &vwctx, &info, settings, &previews)
+            .lines
+            .iter()
+            .skip(1)
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The sender column of the first row that a message draws.
+    fn sender_cell(msg: &Message, width: usize, settings: &ApplicationSettings) -> String {
+        let info = mock_room();
+        let previews = PreviewManager::new(None);
+        let mut vwctx = ViewportContext::<MessageCursor>::new();
+
+        vwctx.dimensions = (width, 40);
+
+        let text = msg.show(None, false, &vwctx, &info, settings, &previews);
+
+        // The first row is the date separator, which every message draws when no message came
+        // before it. The row after it is the message, and the sender column starts it.
+        text.lines[1].spans[0].content.to_string()
+    }
+
+    /// Give the sender of a message a name to be drawn with.
+    fn named(settings: &mut ApplicationSettings, user: &UserId, name: &str) {
+        settings.tunables.users.insert(user.to_owned(), UserDisplayTunables {
+            color: None,
+            name: Some(name.to_string()),
+        });
+    }
+
+    /// A wide pane keeps the configured column, so a cap that is never reached costs nothing.
+    #[test]
+    fn test_a_wide_pane_keeps_the_configured_sender_column() {
+        let settings = mock_settings();
+
+        assert_eq!(user_gutter_width(&settings, 200), 30);
+    }
+
+    /// The case this cap exists for: a name column that swallows a narrow pane.
+    #[test]
+    fn test_a_narrow_pane_cuts_the_sender_column_down() {
+        let settings = mock_settings();
+
+        assert_eq!(user_gutter_width(&settings, 60), 15);
+    }
+
+    #[test]
+    fn test_a_name_wider_than_the_column_is_cut_by_display_width() {
+        let mut settings = mock_settings();
+        named(&mut settings, &TEST_USER1, "Slack Bridge Bot");
+
+        let width = 60;
+        let gutter = user_gutter_width(&settings, width);
+        let sender = sender_cell(&mock_message1(), width, &settings);
+
+        assert_eq!(UnicodeWidthStr::width(sender.as_str()), gutter);
+        assert!(
+            sender.trim_end().ends_with(ELLIPSIS),
+            "{:?} should say that it was cut",
+            sender
+        );
+        assert!(sender.contains("Slack"), "{:?} should keep the start of the name", sender);
+    }
+
+    /// Half of an emoji is not something a terminal can draw.
+    #[test]
+    fn test_a_name_is_never_cut_inside_a_double_width_emoji() {
+        let mut settings = mock_settings();
+        // The emoji sits one column past what the cut column can hold, so a cut that counted
+        // characters instead of columns would keep half of it.
+        named(&mut settings, &TEST_USER1, "aaaaaaaa💕bbbbbbbb");
+        let width = 48;
+        let gutter = user_gutter_width(&settings, width);
+        let sender = sender_cell(&mock_message1(), width, &settings);
+
+        assert_eq!(gutter, 12);
+        assert_eq!(UnicodeWidthStr::width(sender.as_str()), gutter);
+        assert!(
+            !sender.contains('\u{1F495}'),
+            "{:?} kept an emoji it had no room for",
+            sender
+        );
+    }
+
+    /// The layout the user asked for: the name in front of the message, and the wrap flush left.
+    #[test]
+    fn test_full_wrap_puts_the_name_in_front_and_the_wrap_under_it() {
+        let mut settings = mock_settings();
+        settings.tunables.message_full_wrap = true;
+        named(&mut settings, &TEST_USER2, "User2");
+
+        let body = "says a thing that is long enough to need more than one row of a narrow pane";
+        let content = RoomMessageEventContent::text_plain(body);
+        let msg = mock_room1_message(content, TEST_USER2.clone(), MSG2_KEY.clone());
+
+        let width = 40;
+        let rows = rows(&msg, width, &settings);
+
+        assert!(rows.len() > 1, "the body should need more than one row");
+        assert!(rows[0].starts_with("User2: "), "{:?} should start with the name", rows[0]);
+        assert!(!rows[0].contains("  "), "{:?} should have no sender column", rows[0]);
+
+        for row in rows.iter().skip(1) {
+            assert!(!row.starts_with(' '), "{:?} should start at the left edge", row);
+            assert!(
+                UnicodeWidthStr::width(row.as_str()) <= width,
+                "{:?} is wider than the pane",
+                row
+            );
+        }
+    }
+
+    /// The column layout is what the user gets until they ask for the other one.
+    #[test]
+    fn test_the_sender_column_is_what_a_message_draws_by_default() {
+        let settings = mock_settings();
+        let width = 80;
+        let gutter = user_gutter_width(&settings, width);
+        let rows = rows(&mock_message2(), width, &settings);
+        let body = &rows[0][gutter..];
+
+        assert!(body.starts_with("helium"), "{:?} should start the message after the column", body);
+    }
 
     #[test]
     fn test_mc_cmp() {

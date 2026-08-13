@@ -129,6 +129,52 @@ where
     return text;
 }
 
+/// Shown in place of what a column had no room for.
+pub const ELLIPSIS: &str = "…";
+
+/// Make `s` occupy exactly `width` terminal columns: pad it out, or cut it down.
+///
+/// Rust's own width formatting counts characters, and a terminal draws columns. One emoji is one
+/// character in two columns, so a name such as "lytebot 💕" formatted that way pushes every
+/// column after it one to the right, and the list no longer lines up. Rust's own formatting also
+/// never cuts anything down, so a name longer than the column pushes the later columns right by
+/// however much it overran.
+///
+/// The cut lands on a grapheme boundary, because half of an emoji is not a character the terminal
+/// can draw. A grapheme two columns wide that straddles the boundary is dropped whole, and the
+/// column it would have half-filled becomes a space.
+pub fn fit(s: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= width {
+        return pad(s, width);
+    }
+
+    let budget = width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+    let mut kept = String::new();
+    let mut used = 0;
+
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+
+        if used + grapheme_width > budget {
+            break;
+        }
+
+        kept.push_str(grapheme);
+        used += grapheme_width;
+    }
+
+    kept.push_str(ELLIPSIS);
+
+    pad(&kept, width)
+}
+
+/// Pad `s` out to `width` terminal columns, counting columns rather than characters.
+pub fn pad(s: &str, width: usize) -> String {
+    let padding = width.saturating_sub(UnicodeWidthStr::width(s));
+
+    format!("{s}{}", " ".repeat(padding))
+}
+
 pub fn space(width: usize) -> String {
     " ".repeat(width)
 }

@@ -32,8 +32,6 @@ use modalkit::{
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
 use matrix_sdk::ruma::OwnedRoomId;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::base::{
     IambBufferId,
@@ -45,6 +43,7 @@ use crate::base::{
     ThreadSummary,
 };
 use crate::commands::IAMB_COMMANDS;
+use crate::util::fit;
 use crate::message::mention::fuzzy_score;
 use crate::message::MessageTimeStamp;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
@@ -78,9 +77,6 @@ const MARKER_WIDTH: usize = 2;
 /// What every column except the name takes up, including the space after each of them.
 const OTHER_COLUMNS_WIDTH: usize =
     MARKER_WIDTH + KIND_COLUMN_WIDTH + 1 + MIN_DETAIL_COLUMN_WIDTH + 1;
-
-/// Shown in place of what a column had no room for.
-const ELLIPSIS: &str = "…";
 
 /// Shown in front of an entry with activity the user hasn't read yet.
 const UNREAD_MARKER: &str = "● ";
@@ -375,48 +371,6 @@ fn rank(needle: &str, items: Vec<SwitchItem>) -> Vec<SwitchItem> {
     scored.into_iter().map(|(_, item)| item).collect()
 }
 
-/// Make `s` occupy exactly `width` terminal columns: pad it out, or cut it down.
-///
-/// Rust's own width formatting counts characters, and a terminal draws columns. One emoji is one
-/// character in two columns, so a name such as "lytebot 💕" formatted that way pushes every
-/// column after it one to the right, and the list no longer lines up. Rust's own formatting also
-/// never cuts anything down, so a name longer than the column pushes the later columns right by
-/// however much it overran.
-///
-/// The cut lands on a grapheme boundary, because half of an emoji is not a character the terminal
-/// can draw. A grapheme two columns wide that straddles the boundary is dropped whole, and the
-/// column it would have half-filled becomes a space.
-fn fit(s: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(s) <= width {
-        return pad(s, width);
-    }
-
-    let budget = width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
-    let mut kept = String::new();
-    let mut used = 0;
-
-    for grapheme in s.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-
-        if used + grapheme_width > budget {
-            break;
-        }
-
-        kept.push_str(grapheme);
-        used += grapheme_width;
-    }
-
-    kept.push_str(ELLIPSIS);
-
-    pad(&kept, width)
-}
-
-/// Pad `s` out to `width` terminal columns, counting columns rather than characters.
-fn pad(s: &str, width: usize) -> String {
-    let padding = width.saturating_sub(UnicodeWidthStr::width(s));
-
-    format!("{s}{}", " ".repeat(padding))
-}
 
 /// How wide the name column can be drawn in a viewport this wide.
 ///
@@ -512,8 +466,12 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SwitchItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use unicode_width::UnicodeWidthStr;
+
     use crate::base::UnreadInfo;
     use crate::tests::mock_store;
+    use crate::util::ELLIPSIS;
     use matrix_sdk::ruma::{event_id, room_id, RoomId};
 
     /// A viewport `columns` wide, which is what the switcher is drawn into.

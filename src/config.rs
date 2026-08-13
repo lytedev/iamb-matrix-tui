@@ -893,6 +893,8 @@ pub struct TunableValues {
     pub list_counts: bool,
     pub log_level: String,
     pub max_log_files: usize,
+    /// Whether a message uses the whole pane, with the sender name in front of its first line.
+    pub message_full_wrap: bool,
     pub message_shortcode_display: bool,
     pub normal_after_send: bool,
     pub reaction_display: bool,
@@ -919,6 +921,8 @@ pub struct TunableValues {
     pub terminal: TerminalValues,
     pub image_preview: Option<ImagePreviewValues>,
     pub user_gutter_width: usize,
+    /// The largest share of the pane, in percent, that the sender column may take.
+    pub user_gutter_max_percent: usize,
     pub external_edit_file_suffix: String,
     pub tabstop: usize,
     pub default_split: SplitDirection,
@@ -949,6 +953,7 @@ pub struct Tunables {
     pub list_counts: Option<bool>,
     pub log_level: Option<String>,
     pub max_log_files: Option<usize>,
+    pub message_full_wrap: Option<bool>,
     pub message_shortcode_display: Option<bool>,
     pub normal_after_send: Option<bool>,
     pub reaction_display: Option<bool>,
@@ -970,6 +975,7 @@ pub struct Tunables {
     pub notifications: Option<Notifications>,
     pub image_preview: Option<ImagePreview>,
     pub user_gutter_width: Option<usize>,
+    pub user_gutter_max_percent: Option<usize>,
     pub external_edit_file_suffix: Option<String>,
     pub tabstop: Option<usize>,
     pub default_split: Option<SplitDirection>,
@@ -988,6 +994,7 @@ impl Tunables {
             list_counts: self.list_counts.or(other.list_counts),
             log_level: self.log_level.or(other.log_level),
             max_log_files: self.max_log_files.or(other.max_log_files),
+            message_full_wrap: self.message_full_wrap.or(other.message_full_wrap),
             message_shortcode_display: self
                 .message_shortcode_display
                 .or(other.message_shortcode_display),
@@ -1013,6 +1020,9 @@ impl Tunables {
             notifications: self.notifications.or(other.notifications),
             image_preview: self.image_preview.or(other.image_preview),
             user_gutter_width: self.user_gutter_width.or(other.user_gutter_width),
+            user_gutter_max_percent: self
+                .user_gutter_max_percent
+                .or(other.user_gutter_max_percent),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .or(other.external_edit_file_suffix),
@@ -1034,6 +1044,9 @@ impl Tunables {
             list_counts: self.list_counts.unwrap_or(true),
             log_level: self.log_level.unwrap_or_else(|| "warn".to_string()),
             max_log_files: self.max_log_files.unwrap_or(7),
+            // Off, because it changes how every message looks. The sender column is what makes a
+            // long conversation easy to skim, and a reader who wants the width instead asks.
+            message_full_wrap: self.message_full_wrap.unwrap_or(false),
             message_shortcode_display: self.message_shortcode_display.unwrap_or(false),
             normal_after_send: self.normal_after_send.unwrap_or(false),
             reaction_display: self.reaction_display.unwrap_or(true),
@@ -1059,6 +1072,12 @@ impl Tunables {
             notifications: self.notifications.unwrap_or_default(),
             image_preview: self.image_preview.map(ImagePreview::values),
             user_gutter_width: self.user_gutter_width.unwrap_or(30),
+            // A quarter of the pane. A pane of 120 columns keeps the full 30 columns that the
+            // sender column had before this cap existed, so a wide window looks the same as it
+            // always did. A pane of 60 columns gives the sender 15 and the message the rest,
+            // which is the case the cap exists for: a name is worth a glance, and a stack trace
+            // squeezed into a few columns is worth nothing.
+            user_gutter_max_percent: self.user_gutter_max_percent.unwrap_or(25).min(100),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .unwrap_or_else(|| ".md".to_string()),

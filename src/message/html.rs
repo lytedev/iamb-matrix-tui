@@ -512,6 +512,28 @@ impl StyleTree {
 
         printer.finish()
     }
+
+    /// The same, with `first` in front of the first line.
+    ///
+    /// The span goes into the printer before the tree does, so that the wrapping counts it and
+    /// the second line starts at the left edge rather than under it.
+    pub fn to_text_after<'a>(
+        &'a self,
+        width: usize,
+        style: Style,
+        settings: &'a ApplicationSettings,
+        first: Span<'a>,
+    ) -> Text<'a> {
+        let mut printer = TextPrinter::new(width, style, settings);
+
+        printer.push_span_nobreak(first);
+
+        for child in self.children.iter() {
+            child.print(&mut printer, style);
+        }
+
+        printer.finish()
+    }
 }
 
 pub struct TreeGenState {

@@ -193,6 +193,17 @@ If
 Windows that mix read and unread entries, such as
 .Sy :rooms ,
 also show how many of the entries are unread.
+||||||| d598ed8
+.It Sy message_full_wrap
+If
+.Sy true ,
+draw the sender name in front of the first line of a message and give the message the whole
+width of the pane.
+A line that wraps starts again at the left edge.
+The timestamp and the read receipts are not drawn in this layout, because it keeps no column
+for them.
+Defaults to
+.Sy false .
 .It Sy log_level
 Specifies the lowest log level that should be shown.
 Possible values are:
@@ -297,6 +308,12 @@ Usernames that are too long are truncated.
 If this value is less than 3, the usernames are displayed in an extra line at the top of the message
 and this value is only used to indent the message.
 Defaults to 30.
+.It Sy user_gutter_max_percent
+Specify the largest share of the pane, in percent, that the username column may take.
+The column is the smaller of
+.Sy user_gutter_width
+and this share, so that a narrow pane keeps room for the message.
+Defaults to 25.
 .It Sy tabstop
 Number of spaces that a <Tab> counts for.
 Defaults to 4.
