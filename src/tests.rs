@@ -211,6 +211,7 @@ pub fn mock_tunables() -> TunableValues {
         },
         image_preview: None,
         user_gutter_width: 30,
+        user_gutter_max_percent: 25,
         tabstop: 4,
         default_split: Default::default(),
         ssl_verify: true,

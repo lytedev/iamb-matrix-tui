@@ -290,6 +290,12 @@ Usernames that are too long are truncated.
 If this value is less than 3, the usernames are displayed in an extra line at the top of the message
 and this value is only used to indent the message.
 Defaults to 30.
+.It Sy user_gutter_max_percent
+Specify the largest share of the pane, in percent, that the username column may take.
+The column is the smaller of
+.Sy user_gutter_width
+and this share, so that a narrow pane keeps room for the message.
+Defaults to 25.
 .It Sy tabstop
 Number of spaces that a <Tab> counts for.
 Defaults to 4.

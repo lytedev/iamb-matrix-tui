@@ -917,6 +917,8 @@ pub struct TunableValues {
     pub terminal: TerminalValues,
     pub image_preview: Option<ImagePreviewValues>,
     pub user_gutter_width: usize,
+    /// The largest share of the pane, in percent, that the sender column may take.
+    pub user_gutter_max_percent: usize,
     pub external_edit_file_suffix: String,
     pub tabstop: usize,
     pub default_split: SplitDirection,
@@ -967,6 +969,7 @@ pub struct Tunables {
     pub notifications: Option<Notifications>,
     pub image_preview: Option<ImagePreview>,
     pub user_gutter_width: Option<usize>,
+    pub user_gutter_max_percent: Option<usize>,
     pub external_edit_file_suffix: Option<String>,
     pub tabstop: Option<usize>,
     pub default_split: Option<SplitDirection>,
@@ -1009,6 +1012,9 @@ impl Tunables {
             notifications: self.notifications.or(other.notifications),
             image_preview: self.image_preview.or(other.image_preview),
             user_gutter_width: self.user_gutter_width.or(other.user_gutter_width),
+            user_gutter_max_percent: self
+                .user_gutter_max_percent
+                .or(other.user_gutter_max_percent),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .or(other.external_edit_file_suffix),
@@ -1052,6 +1058,12 @@ impl Tunables {
             notifications: self.notifications.unwrap_or_default(),
             image_preview: self.image_preview.map(ImagePreview::values),
             user_gutter_width: self.user_gutter_width.unwrap_or(30),
+            // A quarter of the pane. A pane of 120 columns keeps the full 30 columns that the
+            // sender column had before this cap existed, so a wide window looks the same as it
+            // always did. A pane of 60 columns gives the sender 15 and the message the rest,
+            // which is the case the cap exists for: a name is worth a glance, and a stack trace
+            // squeezed into a few columns is worth nothing.
+            user_gutter_max_percent: self.user_gutter_max_percent.unwrap_or(25).min(100),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .unwrap_or_else(|| ".md".to_string()),
