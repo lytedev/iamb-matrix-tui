@@ -67,6 +67,7 @@ use crate::base::{
     IambId,
     IambInfo,
     IambResult,
+    ListCounts,
     MessageAction,
     ProgramAction,
     ProgramContext,
@@ -742,6 +743,58 @@ fn render_list<T: ListItem<IambInfo>>(
         .render(area, buf, state);
 }
 
+/// Which numbers a list window reports in its title.
+#[derive(Clone, Copy)]
+enum Counted {
+    /// One number, because every entry in the list is the same kind of thing.
+    ///
+    /// The inbox windows are here: everything in them is unread, so a second number would repeat
+    /// the first one.
+    Total,
+
+    /// Both numbers, because the list mixes read and unread entries.
+    ///
+    /// The unread number is the one the user acts on, and the total is what tells them how much
+    /// of the list they are not looking at yet.
+    UnreadAndTotal,
+}
+
+/// Add what a list holds to its title.
+///
+/// The numbers go in brackets after the name, which keeps the name in the same place in every
+/// window and puts the part that changes on every sync at the end.
+fn counted_title(name: &str, counted: Counted, counts: Option<ListCounts>) -> Line<'static> {
+    let mut spans = vec![Span::styled(name.to_string(), bold_style())];
+
+    let Some(counts) = counts else {
+        return Line::from(spans);
+    };
+
+    let inner = match counted {
+        Counted::Total => counts.total.to_string(),
+        // Nothing is unread when the count is zero, and a "0 unread" that is almost always there
+        // trains the user to stop reading the brackets.
+        Counted::UnreadAndTotal if counts.unread == 0 => counts.total.to_string(),
+        Counted::UnreadAndTotal => format!("{} unread / {}", counts.unread, counts.total),
+    };
+
+    spans.push(Span::styled(format!(" [{inner}]"), bold_style()));
+
+    if counts.filtered {
+        spans.push(filtered_note());
+    }
+
+    Line::from(spans)
+}
+
+/// The mark that says a count is of a filtered list rather than of everything.
+///
+/// A number that leaves entries out has to say so, or the user reads it as the size of the whole
+/// list and believes rooms have gone missing.
+fn filtered_note() -> Span<'static> {
+    Span::styled(" (filtered)", Style::default().add_modifier(StyleModifier::DIM))
+}
+
 /// Build the entries for one of the windows that mixes rooms and DMs.
 fn chat_items(store: &mut ProgramStore) -> Vec<GenericChatItem> {
     let sync_info = &store.application.sync_info;
@@ -762,6 +815,23 @@ fn chat_items(store: &mut ProgramStore) -> Vec<GenericChatItem> {
 }
 
 impl IambWindow {
+    /// What this window's list holds, as [IambWindow::refresh] last counted it.
+    ///
+    /// Nothing is returned when the user has turned the counts off, which leaves every title
+    /// exactly as it was before the counts existed.
+    fn counts(&self, store: &ProgramStore) -> Option<ListCounts> {
+        if !store.application.settings.tunables.list_counts {
+            return None;
+        }
+
+        store.application.list_counts.get(&self.id()).copied()
+    }
+
+    /// This window's title, with what its list holds.
+    fn list_title(&self, name: &str, counted: Counted, store: &ProgramStore) -> Line<'static> {
+        counted_title(name, counted, self.counts(store))
+    }
+
     /// Put the entries into this window's list.
     ///
     /// Windows are opened empty, so something has to fill them in. This is that something, and it
@@ -778,6 +848,21 @@ impl IambWindow {
     /// the store. It keeps its own debounce, which decides on its own terms whether this actually
     /// asks for anything.
     pub fn refresh(&mut self, store: &mut ProgramStore) {
+        let id = self.id();
+
+        /// Leave the counts where [Window::get_win_title] can find them.
+        macro_rules! record {
+            ($total: expr, $unread: expr, $filtered: expr) => {{
+                let counts = ListCounts {
+                    total: $total,
+                    unread: $unread,
+                    filtered: $filtered,
+                };
+
+                store.application.list_counts.insert(id.clone(), counts);
+            }};
+        }
+
         /// Sort the entries the way the user has configured this kind of list to be sorted, and
         /// put them in the list.
         macro_rules! sorted {
@@ -787,6 +872,17 @@ impl IambWindow {
                 let collator = &mut store.application.collator;
 
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
+                record!(items.len(), items.iter().filter(|i| i.is_unread()).count(), false);
+                $state.set(items);
+            }};
+        }
+
+        /// Put the entries in a list that has no sort of its own, and count them.
+        macro_rules! unsorted {
+            ($state: expr, $items: expr) => {{
+                let items = $items;
+
+                record!(items.len(), 0, false);
                 $state.set(items);
             }};
         }
@@ -797,9 +893,18 @@ impl IambWindow {
 
             // These decide for themselves what belongs in their list, based on what has been
             // typed into their filter bar.
-            IambWindow::CommandPalette(state) => state.rebuild(store),
-            IambWindow::QuickSwitcher(state) => state.rebuild(store),
-            IambWindow::MessageSearch(state, _) => state.rebuild(store),
+            IambWindow::CommandPalette(state) => {
+                state.rebuild(store);
+                record!(state.len(), 0, state.is_filtered());
+            },
+            IambWindow::QuickSwitcher(state) => {
+                state.rebuild(store);
+                record!(state.len(), 0, state.is_filtered());
+            },
+            IambWindow::MessageSearch(state, _) => {
+                state.rebuild(store);
+                record!(state.len(), 0, state.is_filtered());
+            },
 
             IambWindow::DirectList(state) => {
                 let items = store.application.sync_info.dms.clone();
@@ -849,7 +954,7 @@ impl IambWindow {
             IambWindow::SnoozeList(state) => {
                 // Already ordered soonest first by snoozed_items, and that order is the useful
                 // one here, so the room sort is not applied.
-                state.set(snoozed_items(store));
+                unsorted!(state, snoozed_items(store));
             },
             IambWindow::UnreadThreadList(state) => {
                 let mut items = chat_items(store)
@@ -878,7 +983,7 @@ impl IambWindow {
                 // Sort the active verifications towards the top.
                 items.sort();
 
-                state.set(items);
+                unsorted!(state, items);
             },
             IambWindow::MemberList(state, room_id, last_fetch) => {
                 let need_fetch = match last_fetch {
@@ -1026,8 +1131,23 @@ impl WindowOps<IambInfo> for IambWindow {
 /// The rooms the search could not look in belong here too, and this is the only place they fit. A
 /// row is one message found, so a room that was never indexed has no row to appear on, and its
 /// absence would otherwise read as a message that nobody sent.
-fn search_title(state: &MessageSearchState, term: &str) -> Line<'static> {
+///
+/// The number of results goes here too, because a search says nothing about how much it found
+/// until the user scrolls to the end of it.
+fn search_title(
+    state: &MessageSearchState,
+    term: &str,
+    counts: Option<ListCounts>,
+) -> Line<'static> {
     let mut spans = vec![bold_span("Search: "), Span::raw(term.to_string())];
+
+    if let Some(counts) = counts {
+        spans.push(Span::styled(format!(" [{}]", counts.total), bold_style()));
+
+        if counts.filtered {
+            spans.push(filtered_note());
+        }
+    }
 
     if let Some(note) = state.context().coverage.note() {
         spans.push(Span::styled(
@@ -1151,19 +1271,25 @@ impl Window<IambInfo> for IambWindow {
 
     fn get_tab_title(&self, store: &mut ProgramStore) -> Line<'_> {
         match self {
-            IambWindow::DirectList(_) => bold_spans("Direct Messages"),
-            IambWindow::RoomList(_) => bold_spans("Rooms"),
-            IambWindow::SpaceList(_) => bold_spans("Spaces"),
-            IambWindow::VerifyList(_) => bold_spans("Verifications"),
+            IambWindow::DirectList(_) => {
+                self.list_title("Direct Messages", Counted::UnreadAndTotal, store)
+            },
+            IambWindow::RoomList(_) => self.list_title("Rooms", Counted::UnreadAndTotal, store),
+            IambWindow::SpaceList(_) => self.list_title("Spaces", Counted::Total, store),
+            IambWindow::VerifyList(_) => self.list_title("Verifications", Counted::Total, store),
             IambWindow::Welcome(_) => bold_spans("Welcome to iamb"),
-            IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
-            IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
-            IambWindow::ThreadList(_) => bold_spans("Threads"),
-            IambWindow::SnoozeList(_) => bold_spans("Snoozed"),
-            IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
-            IambWindow::CommandPalette(_) => bold_spans("Commands"),
-            IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
-            IambWindow::MessageSearch(state, term) => search_title(state, term),
+            IambWindow::ChatList(_) => {
+                self.list_title("DMs & Rooms", Counted::UnreadAndTotal, store)
+            },
+            IambWindow::UnreadList(_) => self.list_title("Unread Messages", Counted::Total, store),
+            IambWindow::ThreadList(_) => self.list_title("Threads", Counted::UnreadAndTotal, store),
+            IambWindow::SnoozeList(_) => self.list_title("Snoozed", Counted::Total, store),
+            IambWindow::UnreadThreadList(_) => {
+                self.list_title("Unread Rooms & Threads", Counted::Total, store)
+            },
+            IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
+            IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
+            IambWindow::MessageSearch(state, term) => search_title(state, term, self.counts(store)),
 
             IambWindow::Room(w) => {
                 let title = store.application.get_room_title(w.id());
@@ -1185,19 +1311,25 @@ impl Window<IambInfo> for IambWindow {
 
     fn get_win_title(&self, store: &mut ProgramStore) -> Line<'_> {
         match self {
-            IambWindow::DirectList(_) => bold_spans("Direct Messages"),
-            IambWindow::RoomList(_) => bold_spans("Rooms"),
-            IambWindow::SpaceList(_) => bold_spans("Spaces"),
-            IambWindow::VerifyList(_) => bold_spans("Verifications"),
+            IambWindow::DirectList(_) => {
+                self.list_title("Direct Messages", Counted::UnreadAndTotal, store)
+            },
+            IambWindow::RoomList(_) => self.list_title("Rooms", Counted::UnreadAndTotal, store),
+            IambWindow::SpaceList(_) => self.list_title("Spaces", Counted::Total, store),
+            IambWindow::VerifyList(_) => self.list_title("Verifications", Counted::Total, store),
             IambWindow::Welcome(_) => bold_spans("Welcome to iamb"),
-            IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
-            IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
-            IambWindow::ThreadList(_) => bold_spans("Threads"),
-            IambWindow::SnoozeList(_) => bold_spans("Snoozed"),
-            IambWindow::UnreadThreadList(_) => bold_spans("Unread Rooms & Threads"),
-            IambWindow::CommandPalette(_) => bold_spans("Commands"),
-            IambWindow::QuickSwitcher(_) => bold_spans("Jump to"),
-            IambWindow::MessageSearch(state, term) => search_title(state, term),
+            IambWindow::ChatList(_) => {
+                self.list_title("DMs & Rooms", Counted::UnreadAndTotal, store)
+            },
+            IambWindow::UnreadList(_) => self.list_title("Unread Messages", Counted::Total, store),
+            IambWindow::ThreadList(_) => self.list_title("Threads", Counted::UnreadAndTotal, store),
+            IambWindow::SnoozeList(_) => self.list_title("Snoozed", Counted::Total, store),
+            IambWindow::UnreadThreadList(_) => {
+                self.list_title("Unread Rooms & Threads", Counted::Total, store)
+            },
+            IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
+            IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
+            IambWindow::MessageSearch(state, term) => search_title(state, term, self.counts(store)),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
@@ -2449,6 +2581,86 @@ mod tests {
         };
 
         assert!(switcher.len() > 0, "the switcher should have entries before it is ever drawn");
+    }
+
+    /// Everything the title says, as one string.
+    fn title_of(win: &mut IambWindow, store: &mut ProgramStore) -> String {
+        win.get_win_title(store)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_a_list_title_reports_how_much_the_list_holds() {
+        let mut store = mock_store().await;
+        let mut win = IambWindow::open(IambId::QuickSwitcher, &mut store).unwrap();
+
+        let IambWindow::QuickSwitcher(switcher) = &win else {
+            panic!("opening iamb://switch should give back a switcher");
+        };
+        let entries = switcher.len();
+
+        assert_eq!(title_of(&mut win, &mut store), format!("Jump to [{entries}]"));
+    }
+
+    /// A count of a filtered list must not read as the size of the whole list.
+    #[tokio::test]
+    async fn test_a_filtered_list_says_that_its_count_leaves_entries_out() {
+        let mut store = mock_store().await;
+        let mut win = IambWindow::open(IambId::QuickSwitcher, &mut store).unwrap();
+
+        let IambWindow::QuickSwitcher(switcher) = &mut win else {
+            panic!("opening iamb://switch should give back a switcher");
+        };
+        switcher.set_filter("rooms");
+        win.refresh(&mut store);
+
+        let IambWindow::QuickSwitcher(switcher) = &win else {
+            unreachable!("the window does not change kind");
+        };
+        let entries = switcher.len();
+        let title = title_of(&mut win, &mut store);
+
+        assert_eq!(title, format!("Jump to [{entries}] (filtered)"));
+        assert!(entries > 0, "the filter should still match something");
+    }
+
+    #[tokio::test]
+    async fn test_the_counts_can_be_turned_off() {
+        let mut store = mock_store().await;
+        store.application.settings.tunables.list_counts = false;
+
+        let mut win = IambWindow::open(IambId::QuickSwitcher, &mut store).unwrap();
+
+        assert_eq!(title_of(&mut win, &mut store), "Jump to");
+    }
+
+    #[test]
+    fn test_a_mixed_list_reports_the_unread_entries_and_the_total() {
+        let counts = ListCounts { total: 450, unread: 12, filtered: false };
+        let title = counted_title("Rooms", Counted::UnreadAndTotal, Some(counts));
+
+        assert_eq!(title.to_string(), "Rooms [12 unread / 450]");
+    }
+
+    /// A "0 unread" that is there most of the time teaches the user to skip the brackets.
+    #[test]
+    fn test_a_mixed_list_with_nothing_unread_reports_only_the_total() {
+        let counts = ListCounts { total: 450, unread: 0, filtered: false };
+        let title = counted_title("Rooms", Counted::UnreadAndTotal, Some(counts));
+
+        assert_eq!(title.to_string(), "Rooms [450]");
+    }
+
+    /// Everything in an inbox is unread, so a second number would say the same thing twice.
+    #[test]
+    fn test_an_inbox_reports_one_number() {
+        let counts = ListCounts { total: 47, unread: 47, filtered: false };
+        let title = counted_title("Unread Rooms & Threads", Counted::Total, Some(counts));
+
+        assert_eq!(title.to_string(), "Unread Rooms & Threads [47]");
     }
 
     #[tokio::test]

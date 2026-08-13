@@ -119,9 +119,19 @@ impl<T: FilteredItem> FilteredListState<T> {
     }
 
     /// How many rows the list currently holds.
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.list.len()
+    }
+
+    /// Type `text` into the filter bar, as the user would.
+    #[cfg(test)]
+    pub fn set_filter(&mut self, text: &str) {
+        self.filter.set_text(text);
+    }
+
+    /// Whether the filter bar holds text that keeps rows out of the list.
+    pub fn is_filtered(&self) -> bool {
+        !self.filter.get().to_string().trim().is_empty()
     }
 
     /// Rebuild the list for what has been typed.

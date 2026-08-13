@@ -174,6 +174,7 @@ pub fn mock_tunables() -> TunableValues {
         default_room: None,
         encryption: Encryption::default().values(),
         local_index: LocalIndex::default().values().unwrap(),
+        list_counts: true,
         log_level: "warn".into(),
         snooze_default: "1h".into(),
         snooze_tomorrow_hour: 9,
