@@ -178,6 +178,7 @@ pub fn mock_tunables() -> TunableValues {
         snooze_default: "1h".into(),
         snooze_tomorrow_hour: 9,
         max_log_files: 7,
+        message_full_wrap: false,
         message_shortcode_display: false,
         normal_after_send: true,
         reaction_display: true,

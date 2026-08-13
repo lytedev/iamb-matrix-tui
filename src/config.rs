@@ -891,6 +891,8 @@ pub struct TunableValues {
     pub local_index: LocalIndexValues,
     pub log_level: String,
     pub max_log_files: usize,
+    /// Whether a message uses the whole pane, with the sender name in front of its first line.
+    pub message_full_wrap: bool,
     pub message_shortcode_display: bool,
     pub normal_after_send: bool,
     pub reaction_display: bool,
@@ -948,6 +950,7 @@ pub struct Tunables {
 
     pub log_level: Option<String>,
     pub max_log_files: Option<usize>,
+    pub message_full_wrap: Option<bool>,
     pub message_shortcode_display: Option<bool>,
     pub normal_after_send: Option<bool>,
     pub reaction_display: Option<bool>,
@@ -987,6 +990,7 @@ impl Tunables {
 
             log_level: self.log_level.or(other.log_level),
             max_log_files: self.max_log_files.or(other.max_log_files),
+            message_full_wrap: self.message_full_wrap.or(other.message_full_wrap),
             message_shortcode_display: self
                 .message_shortcode_display
                 .or(other.message_shortcode_display),
@@ -1033,6 +1037,9 @@ impl Tunables {
 
             log_level: self.log_level.unwrap_or_else(|| "warn".to_string()),
             max_log_files: self.max_log_files.unwrap_or(7),
+            // Off, because it changes how every message looks. The sender column is what makes a
+            // long conversation easy to skim, and a reader who wants the width instead asks.
+            message_full_wrap: self.message_full_wrap.unwrap_or(false),
             message_shortcode_display: self.message_shortcode_display.unwrap_or(false),
             normal_after_send: self.normal_after_send.unwrap_or(false),
             reaction_display: self.reaction_display.unwrap_or(true),

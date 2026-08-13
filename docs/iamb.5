@@ -186,6 +186,16 @@ and
 An optional list of two numbers representing font width and height in pixels.
 .El
 .El
+.It Sy message_full_wrap
+If
+.Sy true ,
+draw the sender name in front of the first line of a message and give the message the whole
+width of the pane.
+A line that wraps starts again at the left edge.
+The timestamp and the read receipts are not drawn in this layout, because it keeps no column
+for them.
+Defaults to
+.Sy false .
 .It Sy log_level
 Specifies the lowest log level that should be shown.
 Possible values are:
