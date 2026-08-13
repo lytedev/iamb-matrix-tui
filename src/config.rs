@@ -889,6 +889,8 @@ pub struct TerminalValues {
 pub struct TunableValues {
     pub encryption: EncryptionValues,
     pub local_index: LocalIndexValues,
+    /// Whether a list window shows how many entries it holds in its title.
+    pub list_counts: bool,
     pub log_level: String,
     pub max_log_files: usize,
     pub message_shortcode_display: bool,
@@ -944,6 +946,7 @@ pub struct Tunables {
     /// Subsection for overriding how specific Matrix users are rendered.
     pub users: Option<UserOverrides>,
 
+    pub list_counts: Option<bool>,
     pub log_level: Option<String>,
     pub max_log_files: Option<usize>,
     pub message_shortcode_display: Option<bool>,
@@ -982,6 +985,7 @@ impl Tunables {
             terminal: Terminal::merge(self.terminal, other.terminal),
             users: merge_maps(self.users, other.users),
 
+            list_counts: self.list_counts.or(other.list_counts),
             log_level: self.log_level.or(other.log_level),
             max_log_files: self.max_log_files.or(other.max_log_files),
             message_shortcode_display: self
@@ -1025,6 +1029,9 @@ impl Tunables {
             sort: self.sort.values(),
             terminal: self.terminal.values(),
 
+            // The counts answer a question the user asks of every list, so they are on until
+            // somebody says the titles are too busy.
+            list_counts: self.list_counts.unwrap_or(true),
             log_level: self.log_level.unwrap_or_else(|| "warn".to_string()),
             max_log_files: self.max_log_files.unwrap_or(7),
             message_shortcode_display: self.message_shortcode_display.unwrap_or(false),

@@ -2194,11 +2194,39 @@ pub struct ChatStore {
     /// The receiving end of [ChatStore::reports].
     reports_rx: UnboundedReceiver<BackgroundReport>,
 
+    /// How many entries each list window last put in its list.
+    ///
+    /// A window title is drawn from the window, which cannot look inside its own list, so the
+    /// counts are left here as the list is filled in and read back when the title is built. That
+    /// also keeps the title cheap: it reads three numbers instead of walking the entries again.
+    pub list_counts: HashMap<IambId, ListCounts>,
+
     /// The running backfill of the local message index, if there is one.
     ///
     /// Shared with the background task that walks the history, which is why it is behind an Arc:
     /// the commands that watch and stop the walk run on the main loop, and the walk does not.
     pub backfill: Arc<Backfill>,
+}
+
+/// What a list window holds, as its title reports it.
+///
+/// The numbers describe the entries that the list shows at this moment, and never the entries
+/// that some other view of the same data would show. A user who reads a count must be able to
+/// scroll the list and arrive at that number.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ListCounts {
+    /// How many entries the list holds.
+    pub total: usize,
+
+    /// How many of the entries are unread.
+    pub unread: usize,
+
+    /// Whether text in a filter bar keeps entries out of the list.
+    ///
+    /// The window itself decides what belongs in it, and that choice is the window's meaning: the
+    /// inbox is unread entries, and nobody expects it to count read ones. A filter is the user's
+    /// own and temporary, so a total taken under one has to say that it is partial.
+    pub filtered: bool,
 }
 
 /// Something a background task wants to show the user.
@@ -2297,6 +2325,7 @@ impl ChatStore {
             reports,
             reports_rx,
             backfill: Default::default(),
+            list_counts: Default::default(),
             worker,
             settings,
             snooze: SnoozeStore::default(),
