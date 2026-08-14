@@ -93,7 +93,7 @@ Log out of
 .It Sy ":read"
 Mark the focused room as read, or just the thread when viewing one.
 In a list window
-.Pq Sy ":rooms" , Sy ":dms" , Sy ":chats" , Sy ":unreads" , Sy ":threads" , Sy ":unreadsandthreads"
+.Pq Sy ":rooms" , Sy ":dms" , Sy ":chats" , Sy ":unreads" , Sy ":threads" , Sy ":unreadsandthreads" , Sy ":unreadmentions"
 this instead marks the currently selected entry as read.
 Only the selected entry is affected; there is no way to mark a range of entries
 read at once.
@@ -216,9 +216,10 @@ It reports an error when the message is already being read where it lives.
 Defer the focused room, the thread being viewed, or the selected list entry, so
 that it leaves
 .Sy ":unreads" ,
-.Sy ":threads"
-and
+.Sy ":threads" ,
 .Sy ":unreadsandthreads"
+and
+.Sy ":unreadmentions"
 until the time passes.
 Nothing is marked read and no read receipt moves.
 The duration is a number with
@@ -274,6 +275,16 @@ The undo history lives in memory and is not kept across restarts.
 Restoring a read marker also cannot always be made to stick on the server:
 Synapse ignores a read receipt that points at an event older than the one it
 already has for you, so after a restart the room may read as read again.
+.It Sy ":unreadmentions"
+View a list of the unread rooms that mention you, and the unread direct
+messages.
+This is the narrow inbox: it holds only what is addressed to you, where
+.Sy ":unreadsandthreads"
+holds everything you have not read.
+A room is here when the server or the client counts an unread message in it that
+highlights you, so the room does not have to be one you are otherwise reading.
+Entries are sorted the same way as in the other unread windows, and a deferred
+entry is left out until it wakes.
 .It Sy ":unreads"
 View a list of unread rooms.
 .It Sy ":unreads clear"
