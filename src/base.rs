@@ -2513,6 +2513,9 @@ pub enum IambId {
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
 
+    /// The `:unreadmentions` window.
+    MentionList,
+
     /// The `:commands` window.
     CommandPalette,
 
@@ -2548,6 +2551,7 @@ impl Display for IambId {
             IambId::ThreadList => f.write_str("iamb://threads"),
             IambId::SnoozeList => f.write_str("iamb://snoozed"),
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
+            IambId::MentionList => f.write_str("iamb://unread-mentions"),
             IambId::CommandPalette => f.write_str("iamb://commands"),
             IambId::QuickSwitcher => f.write_str("iamb://switch"),
             IambId::MessageSearch(term) => f.write_str(search_url(term).as_str()),
@@ -2725,6 +2729,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::UnreadThreadList)
             },
+            Some("unread-mentions") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://unread-mentions takes no path"));
+                }
+
+                Ok(IambId::MentionList)
+            },
             Some("commands") => {
                 if url.path() != "" {
                     return Err(E::custom("iamb://commands takes no path"));
@@ -2827,6 +2838,9 @@ pub enum IambBufferId {
     /// The `:unreads-and-threads` window.
     UnreadThreadList,
 
+    /// The `:unreadmentions` window.
+    MentionList,
+
     /// The command palette's entry list.
     CommandPaletteList,
 
@@ -2863,6 +2877,7 @@ impl IambBufferId {
             IambBufferId::ThreadList => IambId::ThreadList,
             IambBufferId::SnoozeList => IambId::SnoozeList,
             IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
+            IambBufferId::MentionList => IambId::MentionList,
             IambBufferId::CommandPaletteList => IambId::CommandPalette,
             IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
             IambBufferId::QuickSwitcherList => IambId::QuickSwitcher,
@@ -2921,6 +2936,7 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::UnreadList => vec![],
             IambBufferId::ThreadList => vec![],
             IambBufferId::UnreadThreadList => vec![],
+            IambBufferId::MentionList => vec![],
             IambBufferId::CommandPaletteList => vec![],
             IambBufferId::CommandPaletteFilter => vec![],
             IambBufferId::QuickSwitcherList => vec![],
@@ -3664,6 +3680,7 @@ pub mod tests {
         for (id, url) in [
             (IambId::ThreadList, "iamb://threads"),
             (IambId::UnreadThreadList, "iamb://unreads-and-threads"),
+            (IambId::MentionList, "iamb://unread-mentions"),
         ] {
             assert_eq!(id.to_string(), url);
 

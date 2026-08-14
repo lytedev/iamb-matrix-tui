@@ -463,6 +463,7 @@ macro_rules! delegate {
             IambWindow::ThreadList($id) => $e,
             IambWindow::SnoozeList($id) => $e,
             IambWindow::UnreadThreadList($id) => $e,
+            IambWindow::MentionList($id) => $e,
             IambWindow::CommandPalette($id) => $e,
             IambWindow::QuickSwitcher($id) => $e,
             IambWindow::MessageSearch($id, _) => $e,
@@ -483,6 +484,7 @@ pub enum IambWindow {
     ThreadList(ThreadListState),
     SnoozeList(SnoozeListState),
     UnreadThreadList(UnreadThreadListState),
+    MentionList(MentionListState),
     CommandPalette(CommandPaletteState),
     QuickSwitcher(QuickSwitcherState),
 
@@ -559,9 +561,9 @@ impl IambWindow {
             match self {
                 IambWindow::DirectList(l) => mark_selection_read(l, store)?,
                 IambWindow::RoomList(l) => mark_selection_read(l, store)?,
-                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
-                    mark_selection_read(l, store)?
-                },
+                IambWindow::ChatList(l) |
+                IambWindow::UnreadList(l) |
+                IambWindow::MentionList(l) => mark_selection_read(l, store)?,
                 IambWindow::ThreadList(l) => mark_selection_read(l, store)?,
                 IambWindow::UnreadThreadList(l) => mark_selection_read(l, store)?,
                 _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
@@ -576,9 +578,9 @@ impl IambWindow {
             match self {
                 IambWindow::DirectList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::RoomList(l) => snooze_selection(l, &act, store)?,
-                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
-                    snooze_selection(l, &act, store)?
-                },
+                IambWindow::ChatList(l) |
+                IambWindow::UnreadList(l) |
+                IambWindow::MentionList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::ThreadList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::SnoozeList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::UnreadThreadList(l) => snooze_selection(l, &act, store)?,
@@ -595,9 +597,9 @@ impl IambWindow {
             IambWindow::DirectList(state) => state.get().map(|state| state.room_id()),
             IambWindow::RoomList(state) => state.get().map(|state| state.room_id()),
             IambWindow::SpaceList(state) => state.get().map(|state| state.room_id()),
-            IambWindow::ChatList(state) | IambWindow::UnreadList(state) => {
-                state.get().map(|state| state.room_id())
-            },
+            IambWindow::ChatList(state) |
+            IambWindow::UnreadList(state) |
+            IambWindow::MentionList(state) => state.get().map(|state| state.room_id()),
 
             _ => None,
         };
@@ -631,6 +633,7 @@ pub type UnreadListState = ListState<GenericChatItem, IambInfo>;
 pub type ThreadListState = ListState<ThreadItem, IambInfo>;
 pub type SnoozeListState = ListState<SnoozeItem, IambInfo>;
 pub type UnreadThreadListState = ListState<UnreadThreadItem, IambInfo>;
+pub type MentionListState = ListState<GenericChatItem, IambInfo>;
 pub type SpaceListState = ListState<SpaceItem, IambInfo>;
 pub type VerifyListState = ListState<VerifyItem, IambInfo>;
 
@@ -793,6 +796,24 @@ fn counted_title(name: &str, counted: Counted, counts: Option<ListCounts>) -> Li
 /// list and believes rooms have gone missing.
 fn filtered_note() -> Span<'static> {
     Span::styled(" (filtered)", Style::default().add_modifier(StyleModifier::DIM))
+}
+
+/// An entry that knows whether its traffic is addressed to the user.
+trait AddressedItem {
+    /// Whether the traffic here is addressed to the user rather than to a group.
+    ///
+    /// A busy room the user is only a member of says nothing to them in particular, but a
+    /// mention names them, and a DM has nobody else it could be for.
+    fn is_addressed_to_the_user(&self) -> bool;
+}
+
+/// Whether an entry belongs in the `:unreadmentions` window.
+///
+/// The snooze is honoured here the same way the other inbox windows honour it. A mention the
+/// user deliberately postponed has to stay postponed, or the snooze would be worth nothing for
+/// exactly the traffic it matters most for.
+fn is_unread_mention<I: RoomLikeItem + AddressedItem>(item: &I) -> bool {
+    item.is_unread() && !item.is_deferred() && item.is_addressed_to_the_user()
 }
 
 /// Build the entries for one of the windows that mixes rooms and DMs.
@@ -972,6 +993,14 @@ impl IambWindow {
 
                 sorted!(state, items, chats);
             },
+            IambWindow::MentionList(state) => {
+                let items =
+                    chat_items(store).into_iter().filter(is_unread_mention).collect::<Vec<_>>();
+
+                // The same sort as the other inbox windows, so that one room does not sit in a
+                // different place here than it does there.
+                sorted!(state, items, chats);
+            },
             IambWindow::VerifyList(state) => {
                 let mut items = store
                     .application
@@ -1059,6 +1088,11 @@ impl WindowOps<IambInfo> for IambWindow {
 
                 render_list(state, empty, area, buf, focused, store)
             },
+            IambWindow::MentionList(state) => {
+                let empty = "Nothing unread mentions you";
+
+                render_list(state, empty, area, buf, focused, store)
+            },
             IambWindow::VerifyList(state) => {
                 render_list(state, "No in-progress verifications", area, buf, focused, store)
             },
@@ -1093,6 +1127,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::ThreadList(w) => IambWindow::ThreadList(w.dup(store)),
             IambWindow::SnoozeList(w) => IambWindow::SnoozeList(w.dup(store)),
             IambWindow::UnreadThreadList(w) => IambWindow::UnreadThreadList(w.dup(store)),
+            IambWindow::MentionList(w) => IambWindow::MentionList(w.dup(store)),
         }
     }
 
@@ -1245,6 +1280,11 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
 
             Ok(IambWindow::UnreadThreadList(list))
         },
+        IambId::MentionList => {
+            let list = MentionListState::new(IambBufferId::MentionList, vec![]);
+
+            Ok(IambWindow::MentionList(list))
+        },
     }
 }
 
@@ -1263,6 +1303,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::ThreadList(_) => IambId::ThreadList,
             IambWindow::SnoozeList(_) => IambId::SnoozeList,
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
+            IambWindow::MentionList(_) => IambId::MentionList,
             IambWindow::CommandPalette(_) => IambId::CommandPalette,
             IambWindow::QuickSwitcher(_) => IambId::QuickSwitcher,
             IambWindow::MessageSearch(_, term) => IambId::MessageSearch(term.clone()),
@@ -1286,6 +1327,9 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::SnoozeList(_) => self.list_title("Snoozed", Counted::Total, store),
             IambWindow::UnreadThreadList(_) => {
                 self.list_title("Unread Rooms & Threads", Counted::Total, store)
+            },
+            IambWindow::MentionList(_) => {
+                self.list_title("Unread Mentions & DMs", Counted::Total, store)
             },
             IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
             IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
@@ -1326,6 +1370,9 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::SnoozeList(_) => self.list_title("Snoozed", Counted::Total, store),
             IambWindow::UnreadThreadList(_) => {
                 self.list_title("Unread Rooms & Threads", Counted::Total, store)
+            },
+            IambWindow::MentionList(_) => {
+                self.list_title("Unread Mentions & DMs", Counted::Total, store)
             },
             IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
             IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
@@ -1780,6 +1827,24 @@ pub struct GenericChatItem {
     is_dm: bool,
     /// True while a snooze on this room, or on the room the entry belongs to, is still running.
     deferred: bool,
+    /// How many unread messages in this room mention the user.
+    ///
+    /// Matrix counts this, so iamb does not read message bodies to find it. See
+    /// [unread_mentions] for which of the two counts the server and the client keep is used.
+    mentions: u64,
+}
+
+/// How many unread messages in a room mention the user.
+///
+/// Two counts exist and neither one is correct everywhere, so the larger is taken. The server
+/// count is the only one a room that the client has not calculated receipts for yet has. The
+/// client count is the only correct one for an encrypted room, because the server cannot read
+/// the messages and therefore cannot see a mention in them.
+fn unread_mentions(room: &MatrixRoom) -> u64 {
+    let server_side = room.unread_notification_counts().highlight_count;
+    let client_side = room.num_unread_mentions();
+
+    server_side.max(client_side)
 }
 
 impl GenericChatItem {
@@ -1791,6 +1856,7 @@ impl GenericChatItem {
         let now = store.application.now_ms();
         let wake_at = store.application.snooze.wake_at(&room_id.to_owned(), None);
         let deferred = wake_at.is_some_and(|w| w > now);
+        let mentions = unread_mentions(room);
 
         let info = store.application.rooms.get_or_default(room_id.to_owned());
         let name = info.name.clone().unwrap_or_default();
@@ -1804,7 +1870,15 @@ impl GenericChatItem {
             store.application.names.insert(alias.to_string(), room_id.to_owned());
         }
 
-        GenericChatItem { room_info, name, alias, is_dm, unread, deferred }
+        GenericChatItem {
+            room_info,
+            name,
+            alias,
+            is_dm,
+            unread,
+            deferred,
+            mentions,
+        }
     }
 
     #[inline]
@@ -1815,6 +1889,12 @@ impl GenericChatItem {
     #[inline]
     fn tags(&self) -> &Option<Tags> {
         &self.room_info.deref().1
+    }
+}
+
+impl AddressedItem for GenericChatItem {
+    fn is_addressed_to_the_user(&self) -> bool {
+        self.is_dm || self.mentions > 0
     }
 }
 
@@ -2558,7 +2638,7 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for MemberItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::mock_store;
+    use crate::tests::{mock_store, TEST_ROOM1_ID};
     use matrix_sdk::ruma::{room_alias_id, server_name};
 
     /// Opening a window has to leave its list populated, not empty until the first redraw.
@@ -2672,9 +2752,114 @@ mod tests {
             IambId::RoomList,
             IambId::DirectList,
             IambId::UnreadThreadList,
+            IambId::MentionList,
         ] {
             assert!(IambWindow::open(id, &mut store).is_ok());
         }
+    }
+
+    /// An entry as the `:unreadmentions` filter sees it.
+    struct TestMentionItem {
+        unread: bool,
+        deferred: bool,
+        is_dm: bool,
+        mentions: u64,
+    }
+
+    impl TestMentionItem {
+        /// An unread room with traffic that names nobody.
+        fn unread_room() -> Self {
+            TestMentionItem {
+                unread: true,
+                deferred: false,
+                is_dm: false,
+                mentions: 0,
+            }
+        }
+    }
+
+    impl AddressedItem for TestMentionItem {
+        fn is_addressed_to_the_user(&self) -> bool {
+            self.is_dm || self.mentions > 0
+        }
+    }
+
+    impl RoomLikeItem for TestMentionItem {
+        fn is_unread(&self) -> bool {
+            self.unread
+        }
+
+        fn is_deferred(&self) -> bool {
+            self.deferred
+        }
+
+        fn room_id(&self) -> &RoomId {
+            TEST_ROOM1_ID.as_ref()
+        }
+
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn alias(&self) -> Option<&RoomAliasId> {
+            None
+        }
+
+        fn has_tag(&self, _: TagName) -> bool {
+            false
+        }
+
+        fn recent_ts(&self) -> Option<&MessageTimeStamp> {
+            None
+        }
+
+        fn is_invite(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_an_unread_room_that_mentions_the_user_is_kept() {
+        let item = TestMentionItem { mentions: 1, ..TestMentionItem::unread_room() };
+
+        assert!(is_unread_mention(&item));
+    }
+
+    #[test]
+    fn test_an_unread_dm_is_kept() {
+        let item = TestMentionItem { is_dm: true, ..TestMentionItem::unread_room() };
+
+        assert!(is_unread_mention(&item));
+    }
+
+    /// This is the whole point of the window: it is narrower than `:unreads`.
+    #[test]
+    fn test_an_unread_room_that_mentions_nobody_is_left_out() {
+        assert!(!is_unread_mention(&TestMentionItem::unread_room()));
+    }
+
+    /// A mention the user postponed has to stay postponed, or the snooze is worth nothing here.
+    #[test]
+    fn test_a_snoozed_mention_is_left_out() {
+        let item = TestMentionItem {
+            mentions: 1,
+            deferred: true,
+            ..TestMentionItem::unread_room()
+        };
+
+        assert!(!is_unread_mention(&item));
+    }
+
+    /// Nothing that is already read belongs in an inbox, however directly it named the user.
+    #[test]
+    fn test_a_read_mention_is_left_out() {
+        let item = TestMentionItem {
+            mentions: 1,
+            unread: false,
+            ..TestMentionItem::unread_room()
+        };
+
+        assert!(!is_unread_mention(&item));
     }
 
     #[derive(Debug, Eq, PartialEq)]

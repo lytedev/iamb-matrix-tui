@@ -520,6 +520,17 @@ fn iamb_unreads_and_threads(desc: CommandDescription, ctx: &mut ProgContext) -> 
     return Ok(step);
 }
 
+fn iamb_unread_mentions(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::MentionList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_unreads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
@@ -1291,6 +1302,15 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         ],
     },
     IambCommandInfo {
+        name: "unreadmentions",
+        aliases: &[],
+        f: iamb_unread_mentions,
+        forms: &[opens(
+            "List the unread rooms that mention you, and the unread DMs",
+            IambId::MentionList,
+        )],
+    },
+    IambCommandInfo {
         name: "unreadsandthreads",
         aliases: &[],
         f: iamb_unreads_and_threads,
@@ -1439,7 +1459,12 @@ mod tests {
         let res = cmds.input_cmd(":unreads threads", ctx.clone()).unwrap();
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::MentionList));
+        let res = cmds.input_cmd(":unreadmentions", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
         assert!(cmds.input_cmd(":threads foo", ctx.clone()).is_err());
+        assert!(cmds.input_cmd(":unreadmentions foo", ctx.clone()).is_err());
         assert!(cmds.input_cmd(":unreadsandthreads foo", ctx).is_err());
     }
 
