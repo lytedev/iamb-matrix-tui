@@ -146,6 +146,19 @@ pub struct ScrollbackState {
     /// pane and on how tall each message is once wrapped.
     park_target: Option<MessageKey>,
 
+    /// The selected message and how many rows it took, as of the previous render.
+    ///
+    /// A message can grow while it is selected — a reaction, an edit, a thread's first reply — and
+    /// the new rows are at its bottom, which is where the pane runs out.
+    last_selected: Option<(MessageKey, usize)>,
+
+    /// The message on the last row the previous render drew, and the height it drew into.
+    ///
+    /// Together these keep the bottom of the pane still when the message bar changes size: the
+    /// pane is anchored at its top, so it would otherwise lose a row from the bottom for every row
+    /// the message bar gains.
+    last_drawn: Option<(MessageKey, usize)>,
+
     /// Where a visual selection started.
     ///
     /// The selection covers every message between this message and the cursor. It is `None`
@@ -190,6 +203,8 @@ impl ScrollbackState {
             show_full_on_redraw,
             pending_selection: None,
             park_target: None,
+            last_selected: None,
+            last_drawn: None,
             selection_anchor: None,
         }
     }
@@ -221,6 +236,42 @@ impl ScrollbackState {
     pub fn goto_message_showing_context(&mut self, target: MessageKey) {
         self.goto_message(target.clone());
         self.park_target = Some(target);
+    }
+
+    /// Keep the bottom of the pane still when the pane changes height.
+    ///
+    /// The message bar grows as it is typed into, and it takes those rows from the scrollback. The
+    /// pane is anchored at its top, so the rows it loses are at the bottom — under the message bar
+    /// — which is where the newest messages are, including the one being replied to.
+    ///
+    /// A view sitting at the newest message does not need this: it has no fixed corner, and each
+    /// render fills the pane backwards from the end. Every other view has a corner, and keeps it
+    /// until something moves it. That is why this only bites some of the time.
+    ///
+    /// Anchoring on the message last drawn rather than on a row count means a taller message bar
+    /// hides exactly what a shorter one showed, in both directions, so typing and then deleting a
+    /// newline leaves the pane where it started.
+    fn keep_bottom_still(
+        &mut self,
+        height: usize,
+        info: &RoomInfo,
+        settings: &ApplicationSettings,
+        previews: &PreviewManager,
+    ) {
+        // No corner means the view is at the newest message and places itself.
+        if self.viewctx.corner.timestamp.is_none() {
+            return;
+        }
+
+        let Some((bottom, drawn_at)) = self.last_drawn.clone() else {
+            return;
+        };
+
+        if drawn_at == height {
+            return;
+        }
+
+        self.scrollview(bottom, MovePosition::End, info, settings, previews);
     }
 
     /// Place the pane around the message that [ScrollbackState::goto_message_showing_context] was
@@ -855,6 +906,8 @@ impl WindowOps<IambInfo> for ScrollbackState {
             show_full_on_redraw: false,
             pending_selection: self.pending_selection.clone(),
             park_target: self.park_target.clone(),
+            last_selected: self.last_selected.clone(),
+            last_drawn: self.last_drawn.clone(),
             selection_anchor: self.selection_anchor.clone(),
         }
     }
@@ -1624,8 +1677,9 @@ impl StatefulWidget for Scrollback<'_> {
             return;
         }
 
-        // A jump to something unread places the pane itself, and this is the first point at which
-        // the height it needs is known.
+        // Both of these need the height of the pane, which is only known here. The message bar
+        // takes its rows from this pane, so a height change is usually it being typed into.
+        state.keep_bottom_still(height, info, settings, &self.store.application.previews);
         state.take_pending_park(info, settings, &self.store.application.previews);
 
         let Some(thread) = state.get_thread(info) else {
@@ -1654,7 +1708,36 @@ impl StatefulWidget for Scrollback<'_> {
         };
 
         let foc = self.focused || cursor.timestamp.is_some();
-        let full = std::mem::take(&mut state.show_full_on_redraw) || cursor.timestamp.is_none();
+
+        // A reaction is drawn as another row of the message it is on, and an edit or a thread's
+        // reply count can change a message's height the same way. A selected message sitting at
+        // the bottom of the pane then grows a row that falls outside it, so the reaction the user
+        // just sent does not appear until something else scrolls the pane.
+        //
+        // Growing is what matters. A message that gets shorter is still whole.
+        let selected_height = {
+            // Bound to a local so that the closure below borrows the previews rather than all of
+            // `self`, which is also holding the room info mutably.
+            let previews = &self.store.application.previews;
+
+            thread.get(cursor_key).map(|item| {
+                item.show(prevmsg(cursor_key, &thread), foc, &state.viewctx, info, settings, previews)
+                    .lines
+                    .len()
+            })
+        };
+
+        let grew = match (&state.last_selected, selected_height) {
+            (Some((key, was)), Some(now)) => key == cursor_key && now > *was,
+            _ => false,
+        };
+
+        if let Some(height) = selected_height {
+            state.last_selected = Some((cursor_key.clone(), height));
+        }
+
+        let full =
+            std::mem::take(&mut state.show_full_on_redraw) || cursor.timestamp.is_none() || grew;
         let mut lines = vec![];
         let mut sawit = false;
         let mut prev = prevmsg(&corner_key, &thread);
@@ -1754,6 +1837,9 @@ impl StatefulWidget for Scrollback<'_> {
             state.viewctx.corner.timestamp = Some((*ts, event_id.clone()));
             state.viewctx.corner.text_row = *row;
         }
+
+        // What sits on the bottom row, so that a message bar growing over it can put it back.
+        state.last_drawn = lines.last().map(|(key, _, _, _)| ((*key).clone(), height));
 
         if hint_above {
             let _ = lines.remove(0);
@@ -2010,6 +2096,83 @@ mod tests {
 
         assert_eq!(scrollback.cursor, order[2].clone().into());
         assert_eq!(scrollback.viewctx.corner, order[1].clone().into());
+    }
+
+    /// Draw into a pane `height` rows tall, and say what ended up on its bottom row.
+    ///
+    /// The bottom row is read out of the buffer rather than from the state, because that is what
+    /// the message bar covers: the state can hold the same message while the row that message is
+    /// showing moves.
+    fn draw_and_take_bottom(
+        scrollback: &mut ScrollbackState,
+        store: &mut ProgramStore,
+        height: u16,
+    ) -> String {
+        let area = Rect::new(0, 0, 60, height);
+        let mut buffer = Buffer::empty(area);
+
+        scrollback.draw(area, &mut buffer, true, store);
+
+        // The last row is the "jump to latest message" hint, which is drawn whenever a message is
+        // selected. The last row of the conversation is the one above it.
+        let bottom = area.height - 2;
+
+        (0..area.width).map(|x| buffer[(x, bottom)].symbol()).collect::<String>().trim().into()
+    }
+
+    #[tokio::test]
+    async fn test_a_reaction_on_the_selected_message_comes_into_view() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Selected, and sitting on the bottom row of the pane, which is where a message that grows
+        // has nowhere to grow into.
+        let selected = order[1].clone();
+        scrollback.goto_message(selected.clone());
+
+        let area = Rect::new(0, 0, 60, 4);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert!(!drawn(&buffer).contains('🐮'), "the reaction has not been sent yet");
+
+        // What arrives from the server once `:react` has sent it. It is drawn as another row of
+        // the message it is on.
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        info.reactions
+            .entry(selected.1.clone())
+            .or_default()
+            .insert(EventId::new_v1(server_name!("example.com")), ("🐮".into(), TEST_USER1.clone()));
+
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert!(drawn(&buffer).contains('🐮'), "the reaction never came into view:\n{}", drawn(&buffer));
+    }
+
+    #[tokio::test]
+    async fn test_a_growing_message_bar_does_not_cover_the_bottom_message() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Anywhere but the newest message, so that the pane has a corner of its own. A view at the
+        // newest message re-fills itself from the end every render and never had this problem.
+        scrollback.goto_message(order[1].clone());
+
+        let before = draw_and_take_bottom(&mut scrollback, &mut store, 8);
+
+        // Two more rows of message bar, taken from this pane. The rows come off the bottom, where
+        // the message being replied to is.
+        let after = draw_and_take_bottom(&mut scrollback, &mut store, 6);
+
+        assert_eq!(before, after, "the message bar covered the bottom message");
+
+        // ... and giving the rows back puts the pane where it started.
+        let restored = draw_and_take_bottom(&mut scrollback, &mut store, 8);
+
+        assert_eq!(before, restored);
     }
 
     #[tokio::test]
@@ -2648,3 +2811,4 @@ mod tests {
         assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG3_KEY.clone(), 4));
     }
 }
+
