@@ -766,10 +766,6 @@ impl RoomState {
                     return Err(IambError::NoSelectedRoom.into());
                 };
 
-                // Where the message is being read, which is what the receipt is scoped to. A
-                // thread root read in the main scrollback moves the main receipt, and read in the
-                // thread view moves that thread's.
-                let thread = chat.thread().cloned();
                 let info = store.application.rooms.get_or_default(room_id.clone());
 
                 let Some(event_id) = chat.selected_event(info) else {
@@ -777,9 +773,7 @@ impl RoomState {
                 };
 
                 store.application.record_read(vec![room_id.clone()], |app| {
-                    app.rooms
-                        .get_or_default(room_id.clone())
-                        .mark_read_at(&user_id, thread, event_id);
+                    app.rooms.get_or_default(room_id.clone()).mark_read_at(&user_id, event_id);
                 });
 
                 Ok(vec![])

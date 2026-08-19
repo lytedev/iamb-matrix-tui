@@ -4,10 +4,10 @@
 use std::borrow::Cow;
 use std::collections::hash_map::{Entry, IntoIter};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ops::Bound;
 use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::hash::Hash;
+use std::ops::Bound;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1908,18 +1908,15 @@ impl RoomInfo {
     /// up to and including `event_id` and leaves what follows unread, which is what makes a
     /// message-at-a-time walk through an inbox possible.
     ///
-    /// `thread` is where the message is being *read*, not where it lives: the same event is a
-    /// thread root in the main scrollback and the first entry of the thread view, and the receipt
-    /// belongs to whichever of the two the user is looking at.
-    pub fn mark_read_at(
-        &mut self,
-        user_id: &UserId,
-        thread: Option<OwnedEventId>,
-        event_id: OwnedEventId,
-    ) {
-        let receipt = match thread {
-            Some(root) => ReceiptThread::Thread(root),
-            None => ReceiptThread::Main,
+    /// The receipt is scoped by where the message *lives*, which the caller does not get to say.
+    /// A thread view draws the message the thread is about, so the obvious "scope it to the window
+    /// the user is reading in" is wrong for that one message: it belongs to the main scrollback,
+    /// and a thread-scoped receipt naming it is rejected with `M_INVALID_PARAM: event_id is not
+    /// related to the given thread_id`, which the worker then retries every two seconds forever.
+    pub fn mark_read_at(&mut self, user_id: &UserId, event_id: OwnedEventId) {
+        let receipt = match self.keys.get(&event_id) {
+            Some(EventLocation::Message(Some(root), _)) => ReceiptThread::Thread(root.clone()),
+            _ => ReceiptThread::Main,
         };
 
         self.set_receipt(receipt, user_id.to_owned(), event_id);
@@ -3374,7 +3371,7 @@ pub mod tests {
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(room.first_unread(None, &user_id).as_ref(), Some(key));
 
-            room.mark_read_at(&user_id, None, key.1.clone());
+            room.mark_read_at(&user_id, key.1.clone());
 
             // Reading one message leaves the next one unread, rather than the whole room read.
             assert_eq!(room.first_unread(None, &user_id).as_ref(), keys.get(i + 1));
@@ -3402,7 +3399,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_mark_read_at_scopes_the_receipt_to_where_it_is_read() {
+    fn test_mark_read_at_scopes_a_reply_to_its_thread() {
         let (mut room, settings, followed_root, _) = mock_room_with_threads();
         let user_id = settings.profile.user_id.clone();
 
@@ -3413,12 +3410,31 @@ pub mod tests {
             .map(|((_, event_id), _)| event_id.clone())
             .unwrap();
 
-        room.mark_read_at(&user_id, Some(followed_root.clone()), reply.clone());
+        room.mark_read_at(&user_id, reply.clone());
 
         let thread = ReceiptThread::Thread(followed_root);
 
         assert_eq!(room.user_receipts.get(&thread).and_then(|u| u.get(&user_id)), Some(&reply));
         assert_eq!(room.user_receipts.get(&ReceiptThread::Main), None);
+    }
+
+    #[test]
+    fn test_mark_read_at_keeps_a_thread_root_on_the_main_receipt() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        // The thread view draws the message the thread is about, so it can be selected there, but
+        // the thread does not contain it. Scoping its receipt to the thread is what the homeserver
+        // rejects with M_INVALID_PARAM, so the scope comes from where the event lives instead.
+        room.mark_read_at(&user_id, followed_root.clone());
+
+        let thread = ReceiptThread::Thread(followed_root.clone());
+
+        assert_eq!(room.user_receipts.get(&thread), None);
+        assert_eq!(
+            room.user_receipts.get(&ReceiptThread::Main).and_then(|u| u.get(&user_id)),
+            Some(&followed_root)
+        );
     }
 
     #[test]
