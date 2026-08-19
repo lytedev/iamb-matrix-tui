@@ -899,7 +899,13 @@ impl ChatState {
 
     /// [ChatState::select_message], landing the message near the top of the pane with one message
     /// of context above it, which is how a jump to something unread lands.
+    ///
+    /// The scrollback takes the focus, because a room window is created focused on its message bar
+    /// and the walk exists to read rather than to write. Without this the message is selected but
+    /// `<Enter>` still goes to the message bar, so opening the thread the jump landed on sends an
+    /// empty message instead.
     pub fn select_unread_message(&mut self, event_id: OwnedEventId, store: &mut ProgramStore) {
+        self.focus = RoomFocus::Scrollback;
         self.select_message_inner(event_id, true, store)
     }
 
