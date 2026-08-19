@@ -894,13 +894,34 @@ impl ChatState {
     /// This is what clicking a notification uses, so the notified message ends up selected just as
     /// if the user had moved onto it themselves.
     pub fn select_message(&mut self, event_id: OwnedEventId, store: &mut ProgramStore) {
+        self.select_message_inner(event_id, false, store)
+    }
+
+    /// [ChatState::select_message], landing the message near the top of the pane with one message
+    /// of context above it, which is how a jump to something unread lands.
+    pub fn select_unread_message(&mut self, event_id: OwnedEventId, store: &mut ProgramStore) {
+        self.select_message_inner(event_id, true, store)
+    }
+
+    fn select_message_inner(
+        &mut self,
+        event_id: OwnedEventId,
+        show_context: bool,
+        store: &mut ProgramStore,
+    ) {
         let info = store.application.rooms.get_or_default(self.room_id.clone());
 
-        if self.scrollback.goto_event(&event_id, info) {
+        let found = if show_context {
+            self.scrollback.goto_event_showing_context(&event_id, info)
+        } else {
+            self.scrollback.goto_event(&event_id, info)
+        };
+
+        if found {
             return;
         }
 
-        self.scrollback.select_when_loaded(event_id.clone());
+        self.scrollback.select_when_loaded(event_id.clone(), show_context);
         store.application.need_load.need_message(self.room_id.clone(), event_id);
     }
 

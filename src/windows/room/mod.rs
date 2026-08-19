@@ -788,7 +788,7 @@ impl RoomState {
                     let first = info.first_unread(thread.as_deref(), &user_id);
 
                     if let Some((_, event_id)) = first {
-                        chat.select_message(event_id, store);
+                        chat.select_unread_message(event_id, store);
 
                         return Ok(vec![]);
                     }
