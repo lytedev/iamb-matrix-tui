@@ -101,6 +101,21 @@ Bound to
 .Sy <C-W>r .
 .It Sy ":read all"
 Mark every room and thread as read.
+.It Sy ":read here"
+Mark everything up to and including the selected message as read, and leave what
+comes after it unread.
+A read receipt is a high-water mark, so this reads the message under the cursor
+and everything before it.
+Paired with
+.Sy ":nextunread"
+it walks an inbox one message at a time, rather than one room at a time.
+.It Sy ":nextunread"
+Go to the oldest message that has not been read.
+That is the oldest unread message of the room or thread being viewed, and when
+there is none left there, the oldest unread message of whichever room or thread
+has gone unread the longest \(em the entry at the bottom of
+.Sy ":unreadsandthreads" .
+It reports an error when nothing is left unread anywhere.
 .It Sy ":rooms"
 View a list of joined rooms.
 .It Sy ":spaces"

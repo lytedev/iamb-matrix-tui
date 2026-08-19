@@ -67,6 +67,7 @@ use crate::base::{
     SpaceAction,
 };
 
+use super::{least_recent_unread, ReadTarget};
 use self::chat::ChatState;
 use self::space::{Space, SpaceState};
 use crate::config::EncryptionIndicatorLocation;
@@ -130,10 +131,27 @@ pub async fn room_command(
         // These need a window's own state, such as its selected message or the thread it shows.
         // [RoomState::room_command] runs them before it delegates here.
         RoomAction::MarkRead |
+        RoomAction::MarkReadHere |
+        RoomAction::GotoFirstUnread |
         RoomAction::Snooze(_) |
         RoomAction::Unsnooze |
         RoomAction::Context |
         RoomAction::SelectMessage(_) => Err(IambError::NoSelectedRoom.into()),
+
+        // The room being viewed has nothing unread left, so the walk continues in the room or
+        // thread that has gone unread the longest. Opening it does not select anything by itself,
+        // so the window is asked to position its own cursor once it is there.
+        RoomAction::NextUnread => {
+            let Some(ReadTarget { room_id, thread }) = least_recent_unread(store) else {
+                return Err(IambError::NoUnreadMessages.into());
+            };
+
+            let target = OpenTarget::Application(IambId::Room(room_id, thread));
+            let open = WindowAction::Switch(target);
+            let goto = IambAction::Room(RoomAction::GotoFirstUnread);
+
+            Ok(vec![(open.into(), ctx.clone()), (goto.into(), ctx)])
+        },
 
         RoomAction::InviteAccept => {
             if let Some(room) = store.application.worker.client.get_room(id) {
@@ -739,6 +757,55 @@ impl RoomState {
                 store.application.snooze_dirty.insert(room_id);
 
                 Ok(vec![])
+            },
+            RoomAction::MarkReadHere => {
+                let room_id = self.id().to_owned();
+                let user_id = store.application.settings.profile.user_id.clone();
+
+                let RoomState::Chat(chat) = self else {
+                    return Err(IambError::NoSelectedRoom.into());
+                };
+
+                // Where the message is being read, which is what the receipt is scoped to. A
+                // thread root read in the main scrollback moves the main receipt, and read in the
+                // thread view moves that thread's.
+                let thread = chat.thread().cloned();
+                let info = store.application.rooms.get_or_default(room_id.clone());
+
+                let Some(event_id) = chat.selected_event(info) else {
+                    return Err(IambError::NoSelectedMessage.into());
+                };
+
+                store.application.record_read(vec![room_id.clone()], |app| {
+                    app.rooms
+                        .get_or_default(room_id.clone())
+                        .mark_read_at(&user_id, thread, event_id);
+                });
+
+                Ok(vec![])
+            },
+            RoomAction::NextUnread | RoomAction::GotoFirstUnread => {
+                let room_id = self.id().to_owned();
+                let user_id = store.application.settings.profile.user_id.clone();
+
+                if let RoomState::Chat(chat) = self {
+                    let thread = chat.thread().cloned();
+                    let info = store.application.rooms.get_or_default(room_id.clone());
+                    let first = info.first_unread(thread.as_deref(), &user_id);
+
+                    if let Some((_, event_id)) = first {
+                        chat.select_message(event_id, store);
+
+                        return Ok(vec![]);
+                    }
+                }
+
+                // Nothing unread here. Only `:nextunread` goes looking elsewhere.
+                if let RoomAction::GotoFirstUnread = act {
+                    return Err(IambError::NoUnreadMessages.into());
+                }
+
+                room_command(self.id(), RoomAction::NextUnread, ctx, store).await
             },
             RoomAction::Context => {
                 // The room id is taken before the chat is borrowed, because `id()` borrows self.
