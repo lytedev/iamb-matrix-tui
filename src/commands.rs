@@ -377,9 +377,23 @@ fn iamb_read(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
         // Mark every room and thread read.
         Some("all") => IambAction::ClearUnreads,
 
+        // Mark read only as far as the selected message.
+        Some("here") => IambAction::Room(RoomAction::MarkReadHere),
+
         Some(_) => return Result::Err(CommandError::InvalidArgument),
     };
 
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_next_unread(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act = IambAction::Room(RoomAction::NextUnread);
     let step = CommandStep::Continue(act.into(), ctx.context.clone());
 
     return Ok(step);
@@ -1161,6 +1175,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         forms: &[
             bare("Mark the focused room, thread, or selected list entry as read"),
             form("all", "Mark every room and thread as read"),
+            form("here", "Mark everything up to the selected message as read"),
         ],
     },
     IambCommandInfo {
@@ -1311,6 +1326,14 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         )],
     },
     IambCommandInfo {
+        name: "nextunread",
+        aliases: &[],
+        f: iamb_next_unread,
+        forms: &[bare(
+            "Go to the oldest unread message, here or in the least-recent unread room or thread",
+        )],
+    },
+    IambCommandInfo {
         name: "unreadsandthreads",
         aliases: &[],
         f: iamb_unreads_and_threads,
@@ -1392,7 +1415,23 @@ mod tests {
         let act = IambAction::ClearUnreads;
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
+        let res = cmds.input_cmd(":read here", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::MarkReadHere);
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
         assert!(cmds.input_cmd(":read bogus", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_nextunread() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let act = IambAction::Room(RoomAction::NextUnread);
+        let res = cmds.input_cmd(":nextunread", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":nextunread here", ctx).is_err());
     }
 
     #[test]

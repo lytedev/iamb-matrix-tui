@@ -140,6 +140,12 @@ pub struct ScrollbackState {
     /// A message that should be selected as soon as it has been loaded.
     pending_selection: Option<PendingSelection>,
 
+    /// A message that the pane is to be placed around on the next render.
+    ///
+    /// The placement cannot happen when it is asked for, because it depends on the height of the
+    /// pane and on how tall each message is once wrapped.
+    park_target: Option<MessageKey>,
+
     /// Where a visual selection started.
     ///
     /// The selection covers every message between this message and the cursor. It is `None`
@@ -155,6 +161,9 @@ pub struct ScrollbackState {
 struct PendingSelection {
     /// The message to select once it is loaded.
     event_id: OwnedEventId,
+
+    /// Whether to land the way [ScrollbackState::goto_message_showing_context] lands.
+    show_context: bool,
 
     /// Where the cursor was when the selection was requested.
     ///
@@ -180,6 +189,7 @@ impl ScrollbackState {
             jumped,
             show_full_on_redraw,
             pending_selection: None,
+            park_target: None,
             selection_anchor: None,
         }
     }
@@ -203,11 +213,91 @@ impl ScrollbackState {
         self.show_full_on_redraw = true;
     }
 
+    /// Move the cursor onto `target` and fill the pane around it, favouring what comes after.
+    ///
+    /// This is how a jump to something unread lands. The placement itself waits for the next
+    /// render, because it depends on the height of the pane and on how tall each message is once
+    /// wrapped, neither of which is known here.
+    pub fn goto_message_showing_context(&mut self, target: MessageKey) {
+        self.goto_message(target.clone());
+        self.park_target = Some(target);
+    }
+
+    /// Place the pane around the message that [ScrollbackState::goto_message_showing_context] was
+    /// asked to show.
+    ///
+    /// Everything after the target is unread as well, so the pane is filled from the bottom of the
+    /// scrollback first and only backs up as far as it must. Where that leaves room, the space
+    /// goes to the messages before the target, which is what says what the conversation is about;
+    /// where it does not, the target is parked one message from the top and the unread messages
+    /// following it take the pane.
+    fn take_pending_park(
+        &mut self,
+        info: &RoomInfo,
+        settings: &ApplicationSettings,
+        previews: &PreviewManager,
+    ) {
+        let Some(target) = self.park_target.take() else {
+            return;
+        };
+
+        let Some(thread) = self.get_thread(info) else {
+            return;
+        };
+
+        let Some(last) = thread.last_key_value().map(|(key, _)| key.clone()) else {
+            return;
+        };
+
+        // One message of context, or the target itself when it is the oldest one loaded.
+        let context = thread
+            .range(..&target)
+            .next_back()
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| target.clone());
+
+        // `scrollview` walks back from the end until the pane is full and leaves the corner alone
+        // if it never fills, so the corner starts at the oldest message: "everything loaded fits"
+        // then means "show all of it" rather than "keep whatever was on screen before".
+        if let Some((first, _)) = thread.first_key_value() {
+            self.viewctx.corner = first.clone().into();
+        }
+
+        self.scrollview(last, MovePosition::End, info, settings, previews);
+
+        // Never start the pane later than the message before the target. Landing *on* that message
+        // counts as too late as well, because the corner can sit part way into it, and a context
+        // message shown from its third line is not context.
+        let too_far = match self.viewctx.corner.timestamp.as_ref() {
+            Some(corner) => corner >= &context,
+            None => true,
+        };
+
+        if too_far {
+            self.viewctx.corner = context.into();
+        }
+    }
+
     /// Move the cursor onto `event_id`, if that message is loaded in this scrollback.
     ///
     /// Returns whether the message was there to select. A message can be known to the room but
     /// absent here, because a thread's scrollback only holds that thread's replies.
     pub fn goto_event(&mut self, event_id: &EventId, info: &RoomInfo) -> bool {
+        self.goto_event_inner(event_id, info, false)
+    }
+
+    /// [ScrollbackState::goto_event], landing the way [ScrollbackState::goto_message_showing_context]
+    /// lands.
+    pub fn goto_event_showing_context(&mut self, event_id: &EventId, info: &RoomInfo) -> bool {
+        self.goto_event_inner(event_id, info, true)
+    }
+
+    fn goto_event_inner(
+        &mut self,
+        event_id: &EventId,
+        info: &RoomInfo,
+        show_context: bool,
+    ) -> bool {
         let Some(key) = info.get_message_key(event_id) else {
             return false;
         };
@@ -221,7 +311,12 @@ impl ScrollbackState {
         }
 
         let key = key.clone();
-        self.goto_message(key);
+
+        if show_context {
+            self.goto_message_showing_context(key);
+        } else {
+            self.goto_message(key);
+        }
 
         true
     }
@@ -229,8 +324,9 @@ impl ScrollbackState {
     /// Select `event_id` once it has been loaded.
     ///
     /// Loading it is the caller's job; this only watches for it to show up.
-    pub fn select_when_loaded(&mut self, event_id: OwnedEventId) {
-        self.pending_selection = Some(PendingSelection { event_id, cursor: self.cursor.clone() });
+    pub fn select_when_loaded(&mut self, event_id: OwnedEventId, show_context: bool) {
+        self.pending_selection =
+            Some(PendingSelection { event_id, cursor: self.cursor.clone(), show_context });
     }
 
     /// Select the message requested by [ScrollbackState::select_when_loaded], if it has arrived.
@@ -244,7 +340,7 @@ impl ScrollbackState {
             return;
         }
 
-        if !self.goto_event(&pending.event_id, info) {
+        if !self.goto_event_inner(&pending.event_id, info, pending.show_context) {
             self.pending_selection = Some(pending);
         }
     }
@@ -758,6 +854,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             jumped: self.jumped.clone(),
             show_full_on_redraw: false,
             pending_selection: self.pending_selection.clone(),
+            park_target: self.park_target.clone(),
             selection_anchor: self.selection_anchor.clone(),
         }
     }
@@ -1527,6 +1624,10 @@ impl StatefulWidget for Scrollback<'_> {
             return;
         }
 
+        // A jump to something unread places the pane itself, and this is the first point at which
+        // the height it needs is known.
+        state.take_pending_park(info, settings, &self.store.application.previews);
+
         let Some(thread) = state.get_thread(info) else {
             return;
         };
@@ -1859,18 +1960,96 @@ mod tests {
         let unloaded = EventId::new_v1(server_name!("example.com"));
 
         // Nothing to select yet, so the cursor stays where it is and the request is kept.
-        scrollback.select_when_loaded(unloaded);
+        scrollback.select_when_loaded(unloaded, false);
         let info = store.application.rooms.get_or_default(room_id.clone());
         scrollback.take_pending_selection(info);
         assert_eq!(scrollback.cursor, MessageCursor::latest());
         assert!(scrollback.pending_selection.is_some());
 
         // Once the message is there, it gets selected and the request is done with.
-        scrollback.select_when_loaded(MSG2_EVID.clone());
+        scrollback.select_when_loaded(MSG2_EVID.clone(), false);
         let info = store.application.rooms.get_or_default(room_id);
         scrollback.take_pending_selection(info);
         assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
         assert!(scrollback.pending_selection.is_none());
+    }
+
+    /// The message order in the mock room, oldest first.
+    ///
+    /// This comes from the scrollback rather than from the fixture names, because a local echo
+    /// sorts as the newest message: MSG1 is the last of them, not the first.
+    async fn mock_scrollback_order(store: &mut ProgramStore) -> Vec<MessageKey> {
+        let scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+
+        scrollback
+            .get_thread(info)
+            .expect("the mock room has messages")
+            .range(..)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_unread_jump_parks_the_message_below_one_line_of_context() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // A pane too short to hold what follows the target, so the space goes to the unread
+        // messages after it and only one message of context fits above.
+        //
+        // The target is the third message rather than the second, so that the expected corner is
+        // not also the oldest message: backing up to fill the pane would answer order[0] here, and
+        // this has to be able to tell the two apart.
+        scrollback.goto_message_showing_context(order[2].clone());
+
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert_eq!(scrollback.cursor, order[2].clone().into());
+        assert_eq!(scrollback.viewctx.corner, order[1].clone().into());
+    }
+
+    #[tokio::test]
+    async fn test_unread_jump_leaves_a_selection_that_opens_a_thread() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+        let ctx = ProgramContext::default();
+
+        scrollback.goto_message_showing_context(order[2].clone());
+
+        // `<Enter>` on the landed message opens the thread rooted at it. This covers the
+        // scrollback half only: whether the key reaches the scrollback at all is a question of
+        // which half of the room window has the focus, and that lives on ChatState, which cannot
+        // be built without a synced MatrixRoom.
+        let acts = scrollback.prompt(&PromptAction::Submit, &ctx, &mut store).unwrap();
+        let thread = IambId::Room(TEST_ROOM1_ID.clone(), Some(order[2].1.clone()));
+        let open = WindowAction::Switch(OpenTarget::Application(thread));
+
+        assert_eq!(acts, vec![(open.into(), ctx)]);
+    }
+
+    #[tokio::test]
+    async fn test_unread_jump_fills_the_pane_with_what_came_before() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Only one message follows the target, so a pane this tall has room to spare. It goes to
+        // the messages before the target rather than being left blank: parking one message above
+        // would put the corner at order[2].
+        let target = order[order.len() - 2].clone();
+        scrollback.goto_message_showing_context(target.clone());
+
+        let area = Rect::new(0, 0, 60, 40);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert_eq!(scrollback.cursor, target.into());
+        assert_eq!(scrollback.viewctx.corner, order[0].clone().into());
     }
 
     #[tokio::test]
@@ -1880,7 +2059,7 @@ mod tests {
         let mut scrollback = ScrollbackState::new(room_id.clone(), None);
         let unloaded = EventId::new_v1(server_name!("example.com"));
 
-        scrollback.select_when_loaded(unloaded);
+        scrollback.select_when_loaded(unloaded, false);
 
         // The user selected something themselves while the message was still loading, so the late
         // arrival must not move them.
@@ -2407,7 +2586,7 @@ mod tests {
         }
 
         // The render takes the waiting selection, so the message shows on the same frame.
-        scrollback.select_when_loaded(MSG1_EVID.clone());
+        scrollback.select_when_loaded(MSG1_EVID.clone(), false);
         let mut buffer = Buffer::empty(area);
         scrollback.draw(area, &mut buffer, true, &mut store);
         assert!(scrollback.pending_selection.is_none());

@@ -379,6 +379,30 @@ pub trait Readable {
     fn read_target(&self) -> ReadTarget;
 }
 
+/// The room or thread that has gone unread the longest.
+///
+/// This is the entry that sits at the bottom of `:unreadsandthreads`, found the same way that
+/// window finds it, so that walking the inbox with `:nextunread` and walking it by hand agree on
+/// what comes next. Deferred entries are left out for the same reason they are left out there.
+fn least_recent_unread(store: &mut ProgramStore) -> Option<ReadTarget> {
+    let chats = chat_items(store)
+        .into_iter()
+        .filter(|item| item.is_unread() && !item.is_deferred())
+        .map(|item| (item.recent_ts().copied(), item.read_target()));
+
+    let threads = followed_thread_items(store)
+        .into_iter()
+        .filter(|item| item.is_unread() && !item.is_deferred())
+        .map(|item| (item.recent_ts().copied(), item.read_target()));
+
+    // An entry whose latest message is not loaded has no timestamp to place it by. It sorts last
+    // here, which is where the inbox windows put it too.
+    chats
+        .chain(threads)
+        .min_by_key(|(ts, _)| (ts.is_none(), *ts))
+        .map(|(_, target)| target)
+}
+
 /// Mark the entry selected in a list window read.
 ///
 /// This is the list-window counterpart to [RoomState::room_command]'s handling of

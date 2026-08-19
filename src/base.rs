@@ -7,6 +7,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::hash::Hash;
+use std::ops::Bound;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -472,6 +473,23 @@ pub enum RoomAction {
     /// Mark this room, or the thread being viewed, as read.
     MarkRead,
 
+    /// Mark everything up to and including the selected message as read.
+    MarkReadHere,
+
+    /// Move to the oldest message that has not been read.
+    ///
+    /// Within the room or thread being viewed when it still holds one, and otherwise in the
+    /// least-recently-active room or thread that does, which makes one key enough to walk an
+    /// entire inbox a message at a time.
+    NextUnread,
+
+    /// Move to the oldest unread message of the room or thread being viewed, and no further.
+    ///
+    /// This is [RoomAction::NextUnread] without the hop to another room, and exists so that the
+    /// hop itself can ask the room it lands on to position its cursor without the two being able
+    /// to send each other back and forth.
+    GotoFirstUnread,
+
     /// Defer this room, or the thread being viewed, out of the inbox until a time.
     ///
     /// The [String] is the duration as the user wrote it. Parsing happens where the action runs,
@@ -879,6 +897,10 @@ pub enum IambError {
 
     #[error("This message is already being read where it lives")]
     AlreadyInContext,
+
+    /// A failure due to everything already having been read.
+    #[error("Nothing left unread")]
+    NoUnreadMessages,
 
     #[error("{0}")]
     BadSnoozeDuration(String),
@@ -1878,6 +1900,74 @@ impl RoomInfo {
         for (thread, event_id) in newest.into_iter() {
             self.set_receipt(thread, user_id.to_owned(), event_id.clone());
         }
+    }
+
+    /// Move the user's receipt to one specific message, rather than to the end of what is loaded.
+    ///
+    /// This is what `:read here` drives. A receipt is a high-water mark, so this reads everything
+    /// up to and including `event_id` and leaves what follows unread, which is what makes a
+    /// message-at-a-time walk through an inbox possible.
+    ///
+    /// The receipt is scoped by where the message *lives*, which the caller does not get to say.
+    /// A thread view draws the message the thread is about, so the obvious "scope it to the window
+    /// the user is reading in" is wrong for that one message: it belongs to the main scrollback,
+    /// and a thread-scoped receipt naming it is rejected with `M_INVALID_PARAM: event_id is not
+    /// related to the given thread_id`, which the worker then retries every two seconds forever.
+    pub fn mark_read_at(&mut self, user_id: &UserId, event_id: OwnedEventId) {
+        let receipt = match self.keys.get(&event_id) {
+            Some(EventLocation::Message(Some(root), _)) => ReceiptThread::Thread(root.clone()),
+            _ => ReceiptThread::Main,
+        };
+
+        self.set_receipt(receipt, user_id.to_owned(), event_id);
+    }
+
+    /// The oldest loaded message that the user's receipt does not cover, in `thread` or in the
+    /// main scrollback when that is `None`.
+    ///
+    /// The receipt is compared the way [RoomInfo::thread_unreads] compares it, against whichever
+    /// of the applicable receipts is newest, so a client that only advances the main receipt still
+    /// counts as having read a thread.
+    ///
+    /// A receipt older than the oldest loaded message has no position to compare against, and is
+    /// indistinguishable here from never having read the room. Both cases answer with the oldest
+    /// message that is loaded, which is the furthest back the cursor can go anyway.
+    pub fn first_unread(
+        &self,
+        thread: Option<&EventId>,
+        user_id: &UserId,
+    ) -> Option<MessageKey> {
+        let (messages, read) = match thread {
+            Some(root) => {
+                let read = [
+                    ReceiptThread::Thread(root.to_owned()),
+                    ReceiptThread::Main,
+                    ReceiptThread::Unthreaded,
+                ]
+                .iter()
+                .filter_map(|thread| self.receipt_key(thread, user_id))
+                .max();
+
+                (self.threads.get(root)?, read)
+            },
+            None => {
+                let read = [ReceiptThread::Main, ReceiptThread::Unthreaded]
+                    .iter()
+                    .filter_map(|thread| self.receipt_key(thread, user_id))
+                    .max();
+
+                (&self.messages, read)
+            },
+        };
+
+        let Some(read) = read else {
+            return messages.first_key_value().map(|(key, _)| key.clone());
+        };
+
+        messages
+            .range((Bound::Excluded(read.clone()), Bound::Unbounded))
+            .next()
+            .map(|(key, _)| key.clone())
     }
 
     pub fn receipts<'a>(
@@ -3256,6 +3346,95 @@ pub mod tests {
 
         let subscribed = followed.iter().find(|t| t.root == ignored_root).unwrap();
         assert!(!subscribed.unread.is_unread());
+    }
+
+    #[test]
+    fn test_first_unread_starts_at_the_oldest_loaded_message() {
+        let (room, settings, _, _) = mock_room_with_threads();
+        let user_id = &settings.profile.user_id;
+
+        // A room that has never been read is unread from its first loaded message, not from the
+        // latest one, which is the whole point of walking it forwards.
+        let oldest = room.messages.first_key_value().map(|(key, _)| key.clone());
+
+        assert_eq!(room.first_unread(None, user_id), oldest);
+    }
+
+    #[test]
+    fn test_first_unread_advances_one_message_at_a_time() {
+        let (mut room, settings, _, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        let keys = room.messages.keys().cloned().collect::<Vec<_>>();
+        assert!(keys.len() > 1, "the walk needs more than one message to walk over");
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(room.first_unread(None, &user_id).as_ref(), Some(key));
+
+            room.mark_read_at(&user_id, key.1.clone());
+
+            // Reading one message leaves the next one unread, rather than the whole room read.
+            assert_eq!(room.first_unread(None, &user_id).as_ref(), keys.get(i + 1));
+        }
+
+        assert_eq!(room.first_unread(None, &user_id), None);
+    }
+
+    #[test]
+    fn test_first_unread_in_a_thread_honors_the_main_receipt() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        let replies = room.threads.get(&followed_root).unwrap();
+        let first_reply = replies.first_key_value().map(|(key, _)| key.clone()).unwrap();
+        let last_reply = replies.last_key_value().map(|(key, _)| key.clone()).unwrap();
+
+        assert_eq!(room.first_unread(Some(&followed_root), &user_id), Some(first_reply));
+
+        // A client that only advances the main receipt has still read the thread, exactly as
+        // `thread_unreads` counts it.
+        room.set_receipt(ReceiptThread::Main, user_id.clone(), last_reply.1.clone());
+
+        assert_eq!(room.first_unread(Some(&followed_root), &user_id), None);
+    }
+
+    #[test]
+    fn test_mark_read_at_scopes_a_reply_to_its_thread() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        let reply = room
+            .threads
+            .get(&followed_root)
+            .and_then(|replies| replies.first_key_value())
+            .map(|((_, event_id), _)| event_id.clone())
+            .unwrap();
+
+        room.mark_read_at(&user_id, reply.clone());
+
+        let thread = ReceiptThread::Thread(followed_root);
+
+        assert_eq!(room.user_receipts.get(&thread).and_then(|u| u.get(&user_id)), Some(&reply));
+        assert_eq!(room.user_receipts.get(&ReceiptThread::Main), None);
+    }
+
+    #[test]
+    fn test_mark_read_at_keeps_a_thread_root_on_the_main_receipt() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        // The thread view draws the message the thread is about, so it can be selected there, but
+        // the thread does not contain it. Scoping its receipt to the thread is what the homeserver
+        // rejects with M_INVALID_PARAM, so the scope comes from where the event lives instead.
+        room.mark_read_at(&user_id, followed_root.clone());
+
+        let thread = ReceiptThread::Thread(followed_root.clone());
+
+        assert_eq!(room.user_receipts.get(&thread), None);
+        assert_eq!(
+            room.user_receipts.get(&ReceiptThread::Main).and_then(|u| u.get(&user_id)),
+            Some(&followed_root)
+        );
     }
 
     #[test]
