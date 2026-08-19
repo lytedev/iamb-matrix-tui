@@ -146,6 +146,12 @@ pub struct ScrollbackState {
     /// pane and on how tall each message is once wrapped.
     park_target: Option<MessageKey>,
 
+    /// The selected message and how many rows it took, as of the previous render.
+    ///
+    /// A message can grow while it is selected — a reaction, an edit, a thread's first reply — and
+    /// the new rows are at its bottom, which is where the pane runs out.
+    last_selected: Option<(MessageKey, usize)>,
+
     /// The message on the last row the previous render drew, and the height it drew into.
     ///
     /// Together these keep the bottom of the pane still when the message bar changes size: the
@@ -197,6 +203,7 @@ impl ScrollbackState {
             show_full_on_redraw,
             pending_selection: None,
             park_target: None,
+            last_selected: None,
             last_drawn: None,
             selection_anchor: None,
         }
@@ -899,6 +906,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             show_full_on_redraw: false,
             pending_selection: self.pending_selection.clone(),
             park_target: self.park_target.clone(),
+            last_selected: self.last_selected.clone(),
             last_drawn: self.last_drawn.clone(),
             selection_anchor: self.selection_anchor.clone(),
         }
@@ -1700,7 +1708,36 @@ impl StatefulWidget for Scrollback<'_> {
         };
 
         let foc = self.focused || cursor.timestamp.is_some();
-        let full = std::mem::take(&mut state.show_full_on_redraw) || cursor.timestamp.is_none();
+
+        // A reaction is drawn as another row of the message it is on, and an edit or a thread's
+        // reply count can change a message's height the same way. A selected message sitting at
+        // the bottom of the pane then grows a row that falls outside it, so the reaction the user
+        // just sent does not appear until something else scrolls the pane.
+        //
+        // Growing is what matters. A message that gets shorter is still whole.
+        let selected_height = {
+            // Bound to a local so that the closure below borrows the previews rather than all of
+            // `self`, which is also holding the room info mutably.
+            let previews = &self.store.application.previews;
+
+            thread.get(cursor_key).map(|item| {
+                item.show(prevmsg(cursor_key, &thread), foc, &state.viewctx, info, settings, previews)
+                    .lines
+                    .len()
+            })
+        };
+
+        let grew = match (&state.last_selected, selected_height) {
+            (Some((key, was)), Some(now)) => key == cursor_key && now > *was,
+            _ => false,
+        };
+
+        if let Some(height) = selected_height {
+            state.last_selected = Some((cursor_key.clone(), height));
+        }
+
+        let full =
+            std::mem::take(&mut state.show_full_on_redraw) || cursor.timestamp.is_none() || grew;
         let mut lines = vec![];
         let mut sawit = false;
         let mut prev = prevmsg(&corner_key, &thread);
@@ -2081,6 +2118,37 @@ mod tests {
         let bottom = area.height - 2;
 
         (0..area.width).map(|x| buffer[(x, bottom)].symbol()).collect::<String>().trim().into()
+    }
+
+    #[tokio::test]
+    async fn test_a_reaction_on_the_selected_message_comes_into_view() {
+        let mut store = mock_store().await;
+        let order = mock_scrollback_order(&mut store).await;
+        let mut scrollback = ScrollbackState::new(TEST_ROOM1_ID.clone(), None);
+
+        // Selected, and sitting on the bottom row of the pane, which is where a message that grows
+        // has nowhere to grow into.
+        let selected = order[1].clone();
+        scrollback.goto_message(selected.clone());
+
+        let area = Rect::new(0, 0, 60, 4);
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert!(!drawn(&buffer).contains('🐮'), "the reaction has not been sent yet");
+
+        // What arrives from the server once `:react` has sent it. It is drawn as another row of
+        // the message it is on.
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        info.reactions
+            .entry(selected.1.clone())
+            .or_default()
+            .insert(EventId::new_v1(server_name!("example.com")), ("🐮".into(), TEST_USER1.clone()));
+
+        let mut buffer = Buffer::empty(area);
+        scrollback.draw(area, &mut buffer, true, &mut store);
+
+        assert!(drawn(&buffer).contains('🐮'), "the reaction never came into view:\n{}", drawn(&buffer));
     }
 
     #[tokio::test]
