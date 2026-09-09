@@ -28,7 +28,7 @@ use modalkit_ratatui::list::{ListCursor, ListItem};
 use crate::base::{IambBufferId, IambInfo, ProgramAction, ProgramContext, ProgramStore};
 use crate::commands::{CommandForm, IAMB_COMMANDS};
 use crate::config::Keys;
-use crate::keybindings::{keys_for_command, IAMB_BINDINGS};
+use crate::keybindings::{IAMB_BINDINGS, keys_for_command};
 use crate::message::compose::SLASH_COMMANDS;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
 

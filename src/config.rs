@@ -10,19 +10,27 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
 
 use clap::Parser;
-use matrix_sdk::authentication::matrix::MatrixSession;
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, UserId};
 use matrix_sdk::EncryptionState;
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::media::MediaRetentionPolicy;
+use matrix_sdk::reqwest::header::{HeaderMap, HeaderValue};
+use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, UserId};
+use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier as StyleModifier, Style};
 use ratatui::text::Span;
+use ratatui_image::FilterType;
 use ratatui_image::picker::ProtocolType;
-use serde::{de::Error as SerdeError, de::Visitor, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as SerdeError, de::Visitor};
 use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
-use modalkit::{env::vim::VimMode, key::TerminalKey, keybindings::InputKey};
+use modalkit::env::vim::VimMode;
+use modalkit::key::TerminalKey;
+use modalkit::keybindings::InputKey;
+use modalkit::prelude::Axis;
 
 use super::base::{
     IambError,
@@ -43,8 +51,10 @@ macro_rules! usage {
     }
 }
 
-const DEFAULT_MEMBERS_SORT: [SortColumn<SortFieldUser>; 2] = [
+const DEFAULT_MEMBERS_SORT: [SortColumn<SortFieldUser>; 4] = [
     SortColumn(SortFieldUser::PowerLevel, SortOrder::Ascending),
+    SortColumn(SortFieldUser::Knock, SortOrder::Ascending),
+    SortColumn(SortFieldUser::Invite, SortOrder::Descending),
     SortColumn(SortFieldUser::UserId, SortOrder::Ascending),
 ];
 
@@ -62,6 +72,12 @@ const DEFAULT_REQ_TIMEOUT: u64 = 120;
 
 /// Rendered in the read receipt gutter when a user has no usable name.
 const EMPTY_USER_CHAR: &str = " ";
+
+const DEFAULT_LOG_LEVEL: &str = if cfg!(feature = "max_level_error") {
+    "error"
+} else {
+    "warn"
+};
 
 const COLORS: [Color; 13] = [
     Color::Blue,
@@ -128,6 +144,20 @@ fn validate_profile_names(names: &BTreeMap<String, ProfileConfig>) {
     }
 }
 
+fn deserialize_from_str_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+    T: FromStr,
+    <T as FromStr>::Err: fmt::Display,
+{
+    <Option<&'de str>>::deserialize(deserializer)?
+        .map(|s| {
+            let t = T::from_str(s);
+            t.map_err(|e| D::Error::custom(format!("failed to parse string: {e}")))
+        })
+        .transpose()
+}
+
 const VERSION: &str = match option_env!("VERGEN_GIT_SHA") {
     None => env!("CARGO_PKG_VERSION"),
     Some(_) => concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")"),
@@ -159,6 +189,26 @@ pub enum ConfigError {
     InvalidJSON(#[from] serde_json::Error),
 }
 
+macro_rules! deserialize_str_with_visitor {
+    ($t: ident, $v: ident) => {
+        impl<'de> Deserialize<'de> for $t {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_str($v)
+            }
+        }
+    };
+}
+
+deserialize_str_with_visitor!(Keys, KeysVisitor);
+deserialize_str_with_visitor!(VimModes, VimModesVisitor);
+deserialize_str_with_visitor!(UserColor, UserColorVisitor);
+deserialize_str_with_visitor!(EncryptionIndicatorLocation, EncryptionIndicatorLocationVisitor);
+deserialize_str_with_visitor!(NotifyVia, NotifyViaVisitor);
+deserialize_str_with_visitor!(ProxyUrl, ProxyUrlVisitor);
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Keys(pub Vec<TerminalKey>, pub String);
 pub struct KeysVisitor;
@@ -178,15 +228,6 @@ impl Visitor<'_> for KeysVisitor {
             Ok(keys) => Ok(Keys(keys, value.to_string())),
             Err(e) => Err(E::custom(format!("Could not parse key sequence: {e}"))),
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for Keys {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(KeysVisitor)
     }
 }
 
@@ -225,15 +266,6 @@ impl Visitor<'_> for VimModesVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for VimModes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(VimModesVisitor)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserColor(pub Color);
 pub struct UserColorVisitor;
@@ -269,15 +301,6 @@ impl Visitor<'_> for UserColorVisitor {
             "white" => Ok(UserColor(Color::White)),
             _ => Err(E::custom("Could not parse color")),
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for UserColor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(UserColorVisitor)
     }
 }
 
@@ -346,6 +369,39 @@ where
 #[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
+pub enum ReadReceiptTrigger {
+    /// Update read receipts for a room when a window for it is focused, and it is scrolled to the
+    /// last message.
+    #[default]
+    Focused,
+    /// Update read receipts for a room when a window for it is visible, and it is scrolled to the
+    /// last message.
+    Visible,
+    /// Update read receipts for a room whenever some portion of its scrollback is rendered.
+    Scrollback,
+    /// Update read receipts for a room once the user sends a message to it.
+    Message,
+}
+
+impl ReadReceiptTrigger {
+    /// Whether to update read receipts when a room is being rendered.
+    pub fn on_render(&self, last_visible: bool, room_focused: bool) -> bool {
+        match self {
+            Self::Scrollback => true,
+            Self::Focused => last_visible && room_focused,
+            Self::Visible => last_visible,
+            Self::Message => false,
+        }
+    }
+
+    pub fn on_message(&self) -> bool {
+        matches!(self, Self::Message)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
 pub enum EncryptionIndicator {
     /// Always indicate the room's encryption status.
     #[default]
@@ -388,21 +444,12 @@ impl Visitor<'_> for EncryptionIndicatorLocationVisitor {
                 "title" => location |= EncryptionIndicatorLocation::TITLE,
                 "prompt" => location |= EncryptionIndicatorLocation::PROMPT,
                 _ => {
-                    return Err(E::custom("could not parse into an encryption indicator location"))
+                    return Err(E::custom("could not parse into an encryption indicator location"));
                 },
             };
         }
 
         Ok(location)
-    }
-}
-
-impl<'de> Deserialize<'de> for EncryptionIndicatorLocation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(EncryptionIndicatorLocationVisitor)
     }
 }
 
@@ -430,6 +477,15 @@ pub enum SplitDirection {
     #[default]
     Horizontal,
     Vertical,
+}
+
+impl SplitDirection {
+    pub fn to_axis(self) -> Axis {
+        match self {
+            Self::Horizontal => Axis::Horizontal,
+            Self::Vertical => Axis::Vertical,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -480,22 +536,13 @@ impl Visitor<'_> for NotifyViaVisitor {
                 },
                 #[cfg(not(feature = "desktop"))]
                 "desktop" => {
-                    return Err(E::custom("desktop notification support was compiled out"))
+                    return Err(E::custom("desktop notification support was compiled out"));
                 },
                 _ => return Err(E::custom("could not parse into a notify destination")),
             };
         }
 
         Ok(via)
-    }
-}
-
-impl<'de> Deserialize<'de> for NotifyVia {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(NotifyViaVisitor)
     }
 }
 
@@ -745,6 +792,69 @@ impl EncryptionValues {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProxyUrl {
+    Disabled,
+    Endpoint(Url),
+    #[default]
+    System,
+}
+
+pub struct ProxyUrlVisitor;
+
+impl Visitor<'_> for ProxyUrlVisitor {
+    type Value = ProxyUrl;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a valid proxy URL (e.g. \"socks5://localhost:9050\")")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: SerdeError,
+    {
+        if value.is_empty() {
+            return Ok(ProxyUrl::Disabled);
+        }
+
+        match Url::from_str(value) {
+            Ok(uri) => Ok(ProxyUrl::Endpoint(uri)),
+            Err(e) => Err(E::custom(format!("could not parse {value:?}: {e}"))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Proxy {
+    /// How and where to proxy the client's requests to the homeserver.
+    url: Option<ProxyUrl>,
+
+    /// An optional value to include in the `Proxy-Authorization` header.
+    #[serde(default, deserialize_with = "deserialize_from_str_opt")]
+    auth: Option<HeaderValue>,
+
+    /// Optional headers to include in requests sent to the proxy.
+    #[serde(default, with = "http_serde::header_map")]
+    headers: HeaderMap,
+}
+
+impl Proxy {
+    pub fn values(self) -> ProxyValues {
+        ProxyValues {
+            url: self.url.unwrap_or_default(),
+            auth: self.auth,
+            headers: self.headers,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProxyValues {
+    pub url: ProxyUrl,
+    pub auth: Option<HeaderValue>,
+    pub headers: HeaderMap,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Mouse {
     #[serde(default)]
@@ -773,43 +883,35 @@ pub struct Notifications {
 
 #[derive(Clone)]
 pub struct ImagePreviewValues {
+    pub enabled: bool,
     pub lazy_load: bool,
-    pub size: ImagePreviewSize,
-    pub protocol: Option<ImagePreviewProtocolValues>,
+    pub size: Size,
+    pub protocol: ImagePreviewProtocolValues,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ImagePreview {
+    pub enabled: Option<bool>,
     pub lazy_load: Option<bool>,
-    pub size: Option<ImagePreviewSize>,
+    pub size: Option<Size>,
     pub protocol: Option<ImagePreviewProtocolValues>,
 }
 
 impl ImagePreview {
-    fn values(self) -> ImagePreviewValues {
+    pub fn values(self) -> ImagePreviewValues {
         ImagePreviewValues {
+            enabled: self.enabled.unwrap_or(true),
             lazy_load: self.lazy_load.unwrap_or(true),
-            size: self.size.unwrap_or_default(),
-            protocol: self.protocol,
+            size: self.size.unwrap_or(Size { width: 66, height: 10 }),
+            protocol: self.protocol.unwrap_or_default(),
         }
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Debug)]
-pub struct ImagePreviewSize {
-    pub width: usize,
-    pub height: usize,
-}
-
-impl Default for ImagePreviewSize {
-    fn default() -> Self {
-        ImagePreviewSize { width: 66, height: 10 }
-    }
-}
-
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Default)]
 pub struct ImagePreviewProtocolValues {
     pub r#type: Option<ProtocolType>,
+    pub filter: Option<FilterType>,
     pub font_size: Option<(u16, u16)>,
 }
 
@@ -822,7 +924,7 @@ pub struct SortValues {
     pub members: Vec<SortColumn<SortFieldUser>>,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct SortOverrides {
     pub chats: Option<Vec<SortColumn<SortFieldRoom>>>,
     pub dms: Option<Vec<SortColumn<SortFieldRoom>>>,
@@ -885,18 +987,23 @@ pub struct TerminalValues {
     pub enable_title: bool,
 }
 
+/// The configuration settings to run with, after merging the
+/// per-profile overrides on top of the global settings.
 #[derive(Clone)]
 pub struct TunableValues {
     pub encryption: EncryptionValues,
     pub local_index: LocalIndexValues,
     /// Whether a list window shows how many entries it holds in its title.
     pub list_counts: bool,
+    pub default_markup: MarkupFormat,
+    pub ignorecase: bool,
     pub log_level: String,
     pub max_log_files: usize,
     /// Whether a message uses the whole pane, with the sender name in front of its first line.
     pub message_full_wrap: bool,
     pub message_shortcode_display: bool,
     pub normal_after_send: bool,
+    pub proxy: ProxyValues,
     pub reaction_display: bool,
     pub reaction_shortcode_display: bool,
     pub read_receipt_send: bool,
@@ -904,6 +1011,7 @@ pub struct TunableValues {
     pub snooze_default: String,
     /// The local hour that `:snooze tomorrow` resolves to.
     pub snooze_tomorrow_hour: u32,
+    pub read_receipt_trigger: ReadReceiptTrigger,
     pub read_receipt_display: bool,
     pub read_receipt_manual: bool,
     pub request_timeout: u64,
@@ -919,17 +1027,20 @@ pub struct TunableValues {
     pub mouse: Mouse,
     pub notifications: Notifications,
     pub terminal: TerminalValues,
-    pub image_preview: Option<ImagePreviewValues>,
+    pub image_preview: ImagePreviewValues,
     pub user_gutter_width: usize,
     /// The largest share of the pane, in percent, that the sender column may take.
     pub user_gutter_max_percent: usize,
     pub external_edit_file_suffix: String,
     pub tabstop: usize,
+    pub input_prompt: Option<String>,
+    pub members_split: Option<SplitDirection>,
     pub default_split: SplitDirection,
     pub ssl_verify: bool,
+    pub cache_policy: MediaRetentionPolicy,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Tunables {
     /// Subsection for overriding encryption-related settings.
     #[serde(default)]
@@ -938,6 +1049,9 @@ pub struct Tunables {
     /// Subsection for the local message index.
     #[serde(default)]
     pub local_index: LocalIndex,
+
+    /// Subsection for configuring an HTTP(S) proxy.
+    pub proxy: Option<Proxy>,
 
     /// Subsection for overriding sort orders in UI lists.
     #[serde(default)]
@@ -951,6 +1065,8 @@ pub struct Tunables {
     pub users: Option<UserOverrides>,
 
     pub list_counts: Option<bool>,
+    pub default_markup: Option<MarkupFormat>,
+    pub ignorecase: Option<bool>,
     pub log_level: Option<String>,
     pub max_log_files: Option<usize>,
     pub message_full_wrap: Option<bool>,
@@ -961,6 +1077,7 @@ pub struct Tunables {
     pub read_receipt_send: Option<bool>,
     pub snooze_default: Option<String>,
     pub snooze_tomorrow_hour: Option<u32>,
+    pub read_receipt_trigger: Option<ReadReceiptTrigger>,
     pub read_receipt_display: Option<bool>,
     pub read_receipt_manual: Option<bool>,
     pub request_timeout: Option<u64>,
@@ -978,8 +1095,11 @@ pub struct Tunables {
     pub user_gutter_max_percent: Option<usize>,
     pub external_edit_file_suffix: Option<String>,
     pub tabstop: Option<usize>,
+    pub input_prompt: Option<String>,
+    pub members_split: Option<SplitDirection>,
     pub default_split: Option<SplitDirection>,
     pub ssl_verify: Option<bool>,
+    pub cache_policy: Option<MediaRetentionPolicy>,
 }
 
 impl Tunables {
@@ -992,6 +1112,13 @@ impl Tunables {
             users: merge_maps(self.users, other.users),
 
             list_counts: self.list_counts.or(other.list_counts),
+            // Proxy configuration sub-field do *not* get merged, so that a
+            // per-profile override won't inherit auth or headers from the
+            // global settings.
+            proxy: self.proxy.or(other.proxy),
+
+            default_markup: self.default_markup.or(other.default_markup),
+            ignorecase: self.ignorecase.or(other.ignorecase),
             log_level: self.log_level.or(other.log_level),
             max_log_files: self.max_log_files.or(other.max_log_files),
             message_full_wrap: self.message_full_wrap.or(other.message_full_wrap),
@@ -1006,6 +1133,7 @@ impl Tunables {
             read_receipt_send: self.read_receipt_send.or(other.read_receipt_send),
             snooze_default: self.snooze_default.or(other.snooze_default),
             snooze_tomorrow_hour: self.snooze_tomorrow_hour.or(other.snooze_tomorrow_hour),
+            read_receipt_trigger: self.read_receipt_trigger.or(other.read_receipt_trigger),
             read_receipt_display: self.read_receipt_display.or(other.read_receipt_display),
             read_receipt_manual: self.read_receipt_manual.or(other.read_receipt_manual),
             request_timeout: self.request_timeout.or(other.request_timeout),
@@ -1020,15 +1148,16 @@ impl Tunables {
             notifications: self.notifications.or(other.notifications),
             image_preview: self.image_preview.or(other.image_preview),
             user_gutter_width: self.user_gutter_width.or(other.user_gutter_width),
-            user_gutter_max_percent: self
-                .user_gutter_max_percent
-                .or(other.user_gutter_max_percent),
+            user_gutter_max_percent: self.user_gutter_max_percent.or(other.user_gutter_max_percent),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .or(other.external_edit_file_suffix),
             tabstop: self.tabstop.or(other.tabstop),
+            input_prompt: self.input_prompt.or(other.input_prompt),
+            members_split: self.members_split.or(other.members_split),
             default_split: self.default_split.or(other.default_split),
             ssl_verify: self.ssl_verify.or(other.ssl_verify),
+            cache_policy: self.cache_policy.or(other.cache_policy),
         }
     }
 
@@ -1036,13 +1165,17 @@ impl Tunables {
         Ok(TunableValues {
             encryption: self.encryption.values(),
             local_index: self.local_index.values()?,
+            proxy: self.proxy.unwrap_or_default().values(),
             sort: self.sort.values(),
             terminal: self.terminal.values(),
+            users: self.users.unwrap_or_default(),
 
+            default_markup: self.default_markup.unwrap_or_default(),
             // The counts answer a question the user asks of every list, so they are on until
             // somebody says the titles are too busy.
             list_counts: self.list_counts.unwrap_or(true),
-            log_level: self.log_level.unwrap_or_else(|| "warn".to_string()),
+            log_level: self.log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned()),
+            ignorecase: self.ignorecase.unwrap_or(false),
             max_log_files: self.max_log_files.unwrap_or(7),
             // Off, because it changes how every message looks. The sender column is what makes a
             // long conversation easy to skim, and a reader who wants the width instead asks.
@@ -1057,20 +1190,20 @@ impl Tunables {
             snooze_default: self.snooze_default.unwrap_or_else(|| "1h".into()),
             // The start of a working day, so that "tomorrow" means "when I next sit down".
             snooze_tomorrow_hour: self.snooze_tomorrow_hour.unwrap_or(9).min(23),
+            read_receipt_trigger: self.read_receipt_trigger.unwrap_or_default(),
             read_receipt_display: self.read_receipt_display.unwrap_or(true),
             read_receipt_manual: self.read_receipt_manual.unwrap_or(false),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQ_TIMEOUT),
             state_event_display: self.state_event_display.unwrap_or(true),
             typing_notice_send: self.typing_notice_send.unwrap_or(true),
             typing_notice_display: self.typing_notice_display.unwrap_or(true),
-            users: self.users.unwrap_or_default(),
             username_display: self.username_display.unwrap_or_default(),
             message_user_color: self.message_user_color.unwrap_or(false),
             default_room: self.default_room,
             open_command: self.open_command,
             mouse: self.mouse.unwrap_or_default(),
             notifications: self.notifications.unwrap_or_default(),
-            image_preview: self.image_preview.map(ImagePreview::values),
+            image_preview: self.image_preview.unwrap_or_default().values(),
             user_gutter_width: self.user_gutter_width.unwrap_or(30),
             // A quarter of the pane. A pane of 120 columns keeps the full 30 columns that the
             // sender column had before this cap existed, so a wide window looks the same as it
@@ -1082,8 +1215,11 @@ impl Tunables {
                 .external_edit_file_suffix
                 .unwrap_or_else(|| ".md".to_string()),
             tabstop: self.tabstop.unwrap_or(4),
+            input_prompt: self.input_prompt,
+            members_split: self.members_split,
             default_split: self.default_split.unwrap_or_default(),
             ssl_verify: self.ssl_verify.unwrap_or(true),
+            cache_policy: self.cache_policy.unwrap_or_default(),
         })
     }
 }
@@ -1108,6 +1244,16 @@ impl From<CursorShape> for modalkit::crossterm::cursor::SetCursorStyle {
             CursorShape::Underline => Self::SteadyUnderScore,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum MarkupFormat {
+    Html,
+    #[default]
+    Markdown,
+    Plaintext,
 }
 
 #[derive(Clone)]
@@ -1368,10 +1514,10 @@ impl ApplicationSettings {
                         For more information try '--help'",
                     );
                 }
-                if let Ok(i) = input.trim().parse::<usize>() {
-                    if i < profiles.len() {
-                        break profiles.into_iter().nth(i).unwrap();
-                    }
+                if let Ok(i) = input.trim().parse::<usize>() &&
+                    i < profiles.len()
+                {
+                    break profiles.into_iter().nth(i).unwrap();
                 }
                 println!("\nInvalid index.");
             }
@@ -1471,10 +1617,11 @@ impl ApplicationSettings {
 
         let name = match name {
             Some(name) => name,
-            None => info
-                .display_names
-                .get(user_id)
-                .unwrap_or_else(|| Cow::Borrowed(user_id.localpart())),
+            None => {
+                info.display_names
+                    .get(user_id)
+                    .unwrap_or_else(|| Cow::Borrowed(user_id.localpart()))
+            },
         };
 
         let c = name.graphemes(true).next().unwrap_or(EMPTY_USER_CHAR);
@@ -1604,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_user_char_span_prefers_display_name() {
-        use crate::tests::{mock_settings, TEST_USER1};
+        use crate::tests::{TEST_USER1, mock_settings};
 
         let mut settings = mock_settings();
         let mut info = RoomInfo::default();
@@ -1617,7 +1764,8 @@ mod tests {
         assert_eq!(settings.get_user_char_span(&TEST_USER1, &info).content, "A");
 
         // A multi-codepoint grapheme is not split apart.
-        info.display_names.set(TEST_USER1.clone(), Some("\u{1f469}\u{200d}\u{1f4bb} Ada".into()));
+        info.display_names
+            .set(TEST_USER1.clone(), Some("\u{1f469}\u{200d}\u{1f4bb} Ada".into()));
         assert_eq!(
             settings.get_user_char_span(&TEST_USER1, &info).content,
             "\u{1f469}\u{200d}\u{1f4bb}"
@@ -1633,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_user_char_span_matches_the_sender_column_color() {
-        use crate::tests::{mock_settings, TEST_USER1};
+        use crate::tests::{TEST_USER1, mock_settings};
 
         let mut settings = mock_settings();
         let mut info = RoomInfo::default();
@@ -1799,6 +1947,82 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tunables_proxy_invalid() {
+        let res =
+            serde_json::from_str::<Tunables>(r#"{"proxy": {"url": "localhost"}}"#).unwrap_err();
+
+        // Should result in a validation error:
+        assert_eq!(res.classify(), serde_json::error::Category::Data);
+    }
+
+    #[test]
+    fn test_parse_tunables_proxy_empty() {
+        let res: Tunables = serde_json::from_str(r#"{"proxy": {"url": ""}}"#).unwrap();
+        let proxy = res.proxy.unwrap();
+        assert_eq!(proxy.url.unwrap(), ProxyUrl::Disabled);
+    }
+
+    #[test]
+    fn test_parse_tunables_proxy_socks5() {
+        let res: Tunables =
+            serde_json::from_str(r#"{"proxy": {"url": "socks5://localhost:1080"}}"#).unwrap();
+        let proxy = res.proxy.unwrap();
+        let ProxyUrl::Endpoint(url) = proxy.url.unwrap() else {
+            panic!("should parse ProxyUrl::Endpoint")
+        };
+
+        assert_eq!(url.scheme(), "socks5");
+        assert_eq!(url.host_str().unwrap(), "localhost");
+        assert_eq!(url.port().unwrap(), 1080);
+        assert_eq!(url.authority(), "localhost:1080");
+    }
+
+    #[test]
+    fn test_parse_tunables_proxy_https() {
+        let res: Tunables = serde_json::from_str(
+            r#"{"proxy": {"url": "https://localhost:8080","auth": "Bearer abcd1234","headers":{"User-Agent": "iamb"}}}"#
+        ).unwrap();
+        let proxy = res.proxy.unwrap();
+        let ProxyUrl::Endpoint(url) = proxy.url.unwrap() else {
+            panic!("should parse ProxyUrl::Endpoint")
+        };
+
+        // Verify URL fields:
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str().unwrap(), "localhost");
+        assert_eq!(url.port().unwrap(), 8080);
+        assert_eq!(url.authority(), "localhost:8080");
+
+        // Verify our `Proxy-Authorization` value:
+        assert_eq!(proxy.auth.unwrap(), "Bearer abcd1234");
+
+        // Verify our custom header is present:
+        assert_eq!(proxy.headers.len(), 1);
+        assert_eq!(proxy.headers.get("user-agent").unwrap(), "iamb");
+    }
+
+    #[test]
+    fn test_parse_tunables_proxy_merge() {
+        let global: Tunables = serde_json::from_str(
+            r#"{"proxy": {"url": "https://localhost:8080","auth": "Bearer abcd1234","headers":{"User-Agent": "iamb"}}}"#
+        ).unwrap();
+        let profile: Tunables =
+            serde_json::from_str(r#"{"proxy": {"url": "socks5://localhost:1080"}}"#).unwrap();
+
+        // The configuration merge should select the entirety of the profile proxy config,
+        // and not merge subfields, to ensure that things like `auth` and `headers` are
+        // not ever sent to a `url` they were meant for.
+        let merged = profile.merge(global).values().unwrap();
+        let ProxyUrl::Endpoint(url) = merged.proxy.url else {
+            panic!("should parse ProxyUrl::Endpoint")
+        };
+        assert_eq!(url.scheme(), "socks5");
+        assert_eq!(url.authority(), "localhost:1080");
+        assert_eq!(merged.proxy.auth, None);
+        assert_eq!(merged.proxy.headers.is_empty(), true);
+    }
+
+    #[test]
     fn test_parse_layout() {
         let user = WindowPath::UserId(user_id!("@user:example.com").to_owned());
         let alias = WindowPath::AliasId(OwnedRoomAliasId::try_from("#room:example.com").unwrap());
@@ -1951,16 +2175,18 @@ mod tests {
 
         // Always shows in the title:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_some());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
-            .is_some());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
+                .is_some()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Unknown).is_some());
 
         // Doesn't show in the prompt:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Encrypted).is_none());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
-            .is_none());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
+                .is_none()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Unknown).is_none());
     }
 
@@ -1975,14 +2201,16 @@ mod tests {
 
         // Never shows in the title or the prompt:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_none());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
-            .is_none());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
+                .is_none()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Unknown).is_none());
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Encrypted).is_none());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
-            .is_none());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
+                .is_none()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Unknown).is_none());
     }
 
@@ -2000,15 +2228,17 @@ mod tests {
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Unknown).is_some());
 
         // But is hidden when unencrypted:
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
-            .is_none());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
+                .is_none()
+        );
 
         // Doesn't show in the title:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_none());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
-            .is_none());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
+                .is_none()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Unknown).is_none());
     }
     #[test]
@@ -2021,13 +2251,15 @@ mod tests {
         };
 
         // Shows in both the prompt and title when unencrypted or unknown:
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
-            .is_some());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::TITLE, NotEncrypted)
+                .is_some()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Unknown).is_some());
-        assert!(enc
-            .get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
-            .is_some());
+        assert!(
+            enc.get_indicator(EncryptionIndicatorLocation::PROMPT, NotEncrypted)
+                .is_some()
+        );
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Unknown).is_some());
 
         // But is hidden when encrypted:

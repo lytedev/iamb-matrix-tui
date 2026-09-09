@@ -124,10 +124,10 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<isize> {
                 score += WORD_START_BONUS;
             }
 
-            if let (Some(previous), Some(preceding)) = (previous_matched_at, index.checked_sub(1)) {
-                if previous == preceding {
-                    score += CONSECUTIVE_MATCH_BONUS;
-                }
+            if let (Some(previous), Some(preceding)) = (previous_matched_at, index.checked_sub(1)) &&
+                previous == preceding
+            {
+                score += CONSECUTIVE_MATCH_BONUS;
             }
 
             previous_matched_at = Some(index);
@@ -161,10 +161,10 @@ fn ambiguous_names(candidates: &[MentionCandidate]) -> BTreeSet<&str> {
     let mut seen = BTreeSet::new();
 
     for candidate in candidates {
-        if let Some(name) = &candidate.display_name {
-            if !seen.insert(name.as_str()) {
-                ambiguous.insert(name.as_str());
-            }
+        if let Some(name) = &candidate.display_name &&
+            !seen.insert(name.as_str())
+        {
+            ambiguous.insert(name.as_str());
         }
     }
 

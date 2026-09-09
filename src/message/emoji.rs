@@ -45,7 +45,11 @@ fn matching_shortcodes(needle: &str) -> Vec<&'static str> {
     // <C-N> take. Equal scores fall back to the shortcode so the order is at least stable.
     scored.sort_by(|(a_score, a), (b_score, b)| b_score.cmp(a_score).then_with(|| a.cmp(b)));
 
-    scored.into_iter().take(MAX_EMOJI_COMPLETIONS).map(|(_, shortcode)| shortcode).collect()
+    scored
+        .into_iter()
+        .take(MAX_EMOJI_COMPLETIONS)
+        .map(|(_, shortcode)| shortcode)
+        .collect()
 }
 
 /// Fuzzy-complete an Emoji shortcode being written in a message.

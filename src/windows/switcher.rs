@@ -43,11 +43,11 @@ use crate::base::{
     ThreadSummary,
 };
 use crate::commands::IAMB_COMMANDS;
-use crate::util::fit;
-use crate::message::mention::fuzzy_score;
 use crate::message::MessageTimeStamp;
+use crate::message::mention::fuzzy_score;
+use crate::util::fit;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
-use crate::windows::{followed_thread_items, RoomLikeItem};
+use crate::windows::{RoomLikeItem, followed_thread_items};
 
 /// The `:switch` window.
 pub type QuickSwitcherState = FilteredListState<SwitchItem>;
@@ -87,16 +87,11 @@ const READ_MARKER: &str = "  ";
 /// The recency given to an entry that has no timestamp, which sorts it last.
 const NO_RECENCY: u64 = 0;
 
-/// The recency given to a message we have sent but not yet heard back about, which is as recent as
-/// anything can be.
-const LOCAL_ECHO_RECENCY: u64 = u64::MAX;
-
 /// How recently something happened, as a number that can be sorted on.
 fn recency(ts: Option<&MessageTimeStamp>) -> u64 {
     match ts {
         None => NO_RECENCY,
-        Some(MessageTimeStamp::LocalEcho) => LOCAL_ECHO_RECENCY,
-        Some(MessageTimeStamp::OriginServer(ms)) => u64::from(*ms),
+        Some(ts) => u64::from(ts.0.0),
     }
 }
 
@@ -201,7 +196,7 @@ impl SwitchItem {
 
                 let info = store.application.rooms.get_or_default(room_id.to_owned());
                 let name = info.name.clone().unwrap_or_else(|| room_id.to_string());
-                let unread = info.unreads(room.is_marked_unread(), &store.application.settings);
+                let unread = info.unreads(room);
 
                 items.push(SwitchItem {
                     name,
@@ -371,7 +366,6 @@ fn rank(needle: &str, items: Vec<SwitchItem>) -> Vec<SwitchItem> {
     scored.into_iter().map(|(_, item)| item).collect()
 }
 
-
 /// How wide the name column can be drawn in a viewport this wide.
 ///
 /// The name column is as wide as it can be up to [NAME_COLUMN_WIDTH], because a name the user
@@ -472,7 +466,7 @@ mod tests {
     use crate::base::UnreadInfo;
     use crate::tests::mock_store;
     use crate::util::ELLIPSIS;
-    use matrix_sdk::ruma::{event_id, room_id, RoomId};
+    use matrix_sdk::ruma::{RoomId, event_id, room_id};
 
     /// A viewport `columns` wide, which is what the switcher is drawn into.
     fn viewport(columns: usize) -> ViewportContext<ListCursor> {
@@ -521,7 +515,7 @@ mod tests {
         SwitchItem::thread(room_name.to_string(), id.to_owned(), ThreadSummary {
             root: event_id!("$thread:example.com").to_owned(),
             preview: preview.to_string(),
-            unread: UnreadInfo { unread, latest: None },
+            unread: UnreadInfo::from_receipt(unread, None),
         })
     }
 

@@ -1,5 +1,5 @@
 //! Message scrollback
-use ratatui_image::Image;
+use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use regex::Regex;
 
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId};
@@ -55,7 +55,7 @@ use crate::{
     },
     config::ApplicationSettings,
     message::{Message, MessageCursor, MessageKey, Messages, ThreadRange, ThreadView},
-    preview::PreviewManager,
+    preview::{PreviewKind, PreviewManager},
 };
 
 fn no_msgs() -> EditError<IambInfo> {
@@ -124,6 +124,9 @@ pub struct ScrollbackState {
 
     /// The currently selected message in the scrollback.
     cursor: MessageCursor,
+
+    /// The cursor position relative to the terminal viewport.
+    term_cursor: (u16, u16),
 
     /// Contextual info about the viewport used during rendering.
     viewctx: ViewportContext<MessageCursor>,
@@ -206,6 +209,7 @@ impl ScrollbackState {
             last_selected: None,
             last_drawn: None,
             selection_anchor: None,
+            term_cursor: (0, 0),
         }
     }
 
@@ -376,8 +380,11 @@ impl ScrollbackState {
     ///
     /// Loading it is the caller's job; this only watches for it to show up.
     pub fn select_when_loaded(&mut self, event_id: OwnedEventId, show_context: bool) {
-        self.pending_selection =
-            Some(PendingSelection { event_id, cursor: self.cursor.clone(), show_context });
+        self.pending_selection = Some(PendingSelection {
+            event_id,
+            cursor: self.cursor.clone(),
+            show_context,
+        });
     }
 
     /// Select the message requested by [ScrollbackState::select_when_loaded], if it has arrived.
@@ -411,12 +418,12 @@ impl ScrollbackState {
     pub fn get_mut<'a>(&mut self, info: &'a mut RoomInfo) -> Option<&'a mut Message> {
         let key = self.get_key(info)?;
 
-        if let Some(root) = &self.thread {
-            if &key.1 == root {
-                // The message a thread is about belongs to the main scrollback, so a change to it
-                // goes through the room rather than through the thread's own map.
-                return info.get_event_mut(root);
-            }
+        if let Some(root) = &self.thread &&
+            key.id.as_origin() == Some(root.as_ref())
+        {
+            // The message a thread is about belongs to the main scrollback, so a change to it
+            // goes through the room rather than through the thread's own map.
+            return info.get_event_mut(root);
         }
 
         self.get_thread_mut(info).get_mut(&key)
@@ -661,9 +668,7 @@ impl ScrollbackState {
     /// The messages covered by the visual selection, or only the message under the cursor.
     fn selection_range(&self, key: MessageKey) -> EditRange<MessageCursor> {
         match &self.selection_anchor {
-            Some(anchor) => {
-                EditRange::inclusive(anchor.clone(), key.into(), TargetShape::LineWise)
-            },
+            Some(anchor) => EditRange::inclusive(anchor.clone(), key.into(), TargetShape::LineWise),
             None => self._range_to(key.into()),
         }
     }
@@ -687,8 +692,11 @@ impl ScrollbackState {
             return false;
         };
 
-        let (start, end) =
-            if anchor <= cursor_key { (anchor, cursor_key) } else { (cursor_key, anchor) };
+        let (start, end) = if anchor <= cursor_key {
+            (anchor, cursor_key)
+        } else {
+            (cursor_key, anchor)
+        };
 
         start <= key && key <= end
     }
@@ -909,6 +917,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             last_selected: self.last_selected.clone(),
             last_drawn: self.last_drawn.clone(),
             selection_anchor: self.selection_anchor.clone(),
+            term_cursor: (0, 0),
         }
     }
 
@@ -1006,7 +1015,8 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let dir = flip.resolve(&dir);
 
                         let lsearch = store.registers.get_last_search().to_string();
-                        let needle = Regex::new(lsearch.as_ref())?;
+                        let ci = store.application.settings.tunables.ignorecase;
+                        let needle = crate::util::compile_search(lsearch.as_ref(), ci)?;
 
                         let (mc, needs_load) = self.find_message(key, dir, &needle, count, info);
                         if needs_load {
@@ -1082,7 +1092,8 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let dir = flip.resolve(&dir);
 
                         let lsearch = store.registers.get_last_search().to_string();
-                        let needle = Regex::new(lsearch.as_ref())?;
+                        let ci = store.application.settings.tunables.ignorecase;
+                        let needle = crate::util::compile_search(lsearch.as_ref(), ci)?;
 
                         let (mc, needs_load) = self.find_message(key, dir, &needle, count, info);
                         if needs_load {
@@ -1378,9 +1389,13 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                     let err = EditError::Failure(msg.into());
                     Err(err)
                 } else {
-                    let root = key.1.clone();
+                    let Some(root) = key.id.as_origin() else {
+                        let msg = "Cannot create thread for local echo.";
+                        let err = EditError::Failure(msg.into());
+                        return Err(err);
+                    };
                     let room_id = self.room_id.clone();
-                    let id = IambId::Room(room_id, Some(root));
+                    let id = IambId::Room(room_id, Some(root.to_owned()));
                     let open = WindowAction::Switch(OpenTarget::Application(id));
                     Ok(vec![(open.into(), ctx.clone())])
                 }
@@ -1589,7 +1604,11 @@ impl Searchable<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
 impl TerminalCursor for ScrollbackState {
     fn get_term_cursor(&self) -> Option<(u16, u16)> {
-        None
+        self.term_cursor.into()
+    }
+
+    fn hide_term_cursor(&self) -> bool {
+        true
     }
 }
 
@@ -1659,6 +1678,8 @@ impl StatefulWidget for Scrollback<'_> {
     type State = ScrollbackState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        state.term_cursor = (area.left(), area.top());
+
         let info = self.store.application.rooms.get_or_default(state.room_id.clone());
         state.take_pending_selection(info);
 
@@ -1721,9 +1742,16 @@ impl StatefulWidget for Scrollback<'_> {
             let previews = &self.store.application.previews;
 
             thread.get(cursor_key).map(|item| {
-                item.show(prevmsg(cursor_key, &thread), foc, &state.viewctx, info, settings, previews)
-                    .lines
-                    .len()
+                item.show(
+                    prevmsg(cursor_key, &thread),
+                    foc,
+                    &state.viewctx,
+                    info,
+                    settings,
+                    previews,
+                )
+                .lines
+                .len()
             })
         };
 
@@ -1743,34 +1771,49 @@ impl StatefulWidget for Scrollback<'_> {
         let mut prev = prevmsg(&corner_key, &thread);
 
         // load image previews
-        for (_, item) in thread.range(&corner_key..).rev() {
-            if let Some(source) = &item.image_preview {
-                self.store
-                    .application
-                    .previews
-                    .load(source, &self.store.application.worker);
-            }
-            let reply = item
-                .reply_to()
-                .or_else(|| item.thread_root())
-                .and_then(|e| info.get_event(&e))
-                .and_then(|msg| msg.image_preview.as_ref());
-            if let Some(source) = reply {
-                self.store
-                    .application
-                    .previews
-                    .load(source, &self.store.application.worker);
+        if settings.tunables.image_preview.enabled {
+            for (key, item) in thread.range(&corner_key..).rev() {
+                if let Some(source) = item.image_preview() {
+                    self.store.application.previews.load(
+                        source,
+                        PreviewKind::Message,
+                        &self.store.application.worker,
+                    );
+                }
+                let reply = item
+                    .reply_to()
+                    .or_else(|| item.thread_root())
+                    .and_then(|e| info.get_event(&e))
+                    .and_then(|msg| msg.image_preview());
+                if let Some(source) = reply {
+                    self.store.application.previews.load(
+                        source,
+                        PreviewKind::Message,
+                        &self.store.application.worker,
+                    );
+                }
+                if let Some(event_id) = key.id.as_origin() {
+                    for source in info.get_reaction_images(event_id) {
+                        self.store.application.previews.load(
+                            source,
+                            PreviewKind::Reaction,
+                            &self.store.application.worker,
+                        );
+                    }
+                }
             }
         }
 
         let previews = &self.store.application.previews;
+        let mut image_previews = vec![];
+
         for (key, item) in thread.range(&corner_key..) {
             let sel = key == cursor_key;
 
             // The cursor drives the scrolling, but every message in a visual selection is drawn
             // as picked out, so that the user can see what a yank would take.
             let picked = sel || state.selection_contains(key, cursor_key);
-            let (txt, [mut msg_preview, mut reply_preview]) = item.show_with_preview(
+            let (txt, mut msg_previews) = item.show_with_preview(
                 prev,
                 foc && picked,
                 &state.viewctx,
@@ -1781,6 +1824,8 @@ impl StatefulWidget for Scrollback<'_> {
 
             let incomplete_ok = !full || !sel;
 
+            let includes_date_line = item.show_date(prev);
+
             for (row, line) in txt.lines.into_iter().enumerate() {
                 if sawit && lines.len() >= height && incomplete_ok {
                     // Check whether we've seen the first line of the
@@ -1789,23 +1834,21 @@ impl StatefulWidget for Scrollback<'_> {
                 }
 
                 if key == &corner_key && row < corner.text_row {
-                    // Skip rows above the viewport corner.
+                    // Skip rows above the viewport corner but keep image previews.
+                    let y = area.top() as i16 + row as i16 - corner.text_row as i16;
+                    let line_previews = msg_previews
+                        .extract_if(.., |(_, _, y)| *y as usize == row)
+                        .map(|(backend, msg_x, _)| (area.left() + msg_x, y, backend));
+                    image_previews.extend(line_previews);
+
                     continue;
                 }
 
-                // Only take the preview into the matching row number.
-                // `reply` and `msg` previews are on rows,
-                // so an `or` works to pick the one that matches (if any)
-                let line_preview = match msg_preview {
-                    Some((_, _, y)) if y as usize == row => msg_preview.take(),
-                    _ => None,
-                }
-                .or(match reply_preview {
-                    Some((_, _, y)) if y as usize == row => reply_preview.take(),
-                    _ => None,
-                });
+                // Only take the previews into the matching row number.
+                let line_preview: Vec<_> =
+                    msg_previews.extract_if(.., |(_, _, y)| *y as usize == row).collect();
 
-                lines.push((key, row, line, line_preview));
+                lines.push((key, row, line, line_preview, includes_date_line));
                 sawit |= sel;
             }
 
@@ -1814,7 +1857,16 @@ impl StatefulWidget for Scrollback<'_> {
 
         if lines.len() > height {
             let n = lines.len() - height;
-            let _ = lines.drain(..n);
+            let previews =
+                lines
+                    .drain(..n)
+                    .zip(-(n as i16)..)
+                    .flat_map(|((_, _, _, line_previews, _), y)| {
+                        line_previews.into_iter().map(move |(backend, msg_x, _)| {
+                            (area.left() + msg_x, area.top() as i16 + y, backend)
+                        })
+                    });
+            image_previews.extend(previews);
         }
 
         // Whether the scrollback goes on above the pane.
@@ -1822,7 +1874,7 @@ impl StatefulWidget for Scrollback<'_> {
         // The check reads the lines that the pane takes rather than the viewport corner, because
         // the corner is set from them below and is still the corner of the frame before this one.
         let more_above = match (lines.first(), thread.first_key_value()) {
-            (Some((key, row, _, _)), Some((first, _))) => *key != first || *row > 0,
+            (Some((key, row, _, _, _)), Some((first, _))) => *key != first || *row > 0,
             _ => false,
         };
 
@@ -1833,13 +1885,13 @@ impl StatefulWidget for Scrollback<'_> {
         // The corner must keep the row that the hint covers. A corner that skips that row makes the
         // next render start one row lower, and the pane then walks the messages up one row per
         // frame until it holds almost nothing.
-        if let Some(((ts, event_id), row, _, _)) = lines.first() {
-            state.viewctx.corner.timestamp = Some((*ts, event_id.clone()));
+        if let Some((key, row, _, _, _)) = lines.first() {
+            state.viewctx.corner.timestamp = Some((*key).clone());
             state.viewctx.corner.text_row = *row;
         }
 
         // What sits on the bottom row, so that a message bar growing over it can put it back.
-        state.last_drawn = lines.last().map(|(key, _, _, _)| ((*key).clone(), height));
+        state.last_drawn = lines.last().map(|(key, _, _, _, _)| ((*key).clone(), height));
 
         if hint_above {
             let _ = lines.remove(0);
@@ -1853,44 +1905,59 @@ impl StatefulWidget for Scrollback<'_> {
             y += 1;
         }
 
-        let mut image_previews = vec![];
-        for ((_, _), _, txt, line_preview) in lines.into_iter() {
+        for (key, row, txt, line_preview, includes_date_line) in lines.into_iter() {
             let _ = buf.set_line(x, y, &txt, area.width);
-            if let Some((backend, msg_x, _)) = line_preview {
-                image_previews.push((x + msg_x, y, backend));
+            image_previews.extend(
+                line_preview
+                    .into_iter()
+                    .map(|(backend, msg_x, _)| (x + msg_x, y as i16, backend)),
+            );
+
+            if key == cursor_key && row == usize::from(includes_date_line) {
+                state.term_cursor = (x, y);
             }
 
             y += 1;
         }
+
+        let msg_width = Message::message_column_width(&state.viewctx, settings);
+
         // Render image previews after all text lines have been drawn, as the render might draw below the current
         // line.
         for (x, y, backend) in image_previews {
-            let image_widget = Image::new(backend);
-            let mut rect = backend.area();
-            rect.x = x;
-            rect.y = y;
-            // Don't render outside of scrollback area
-            if rect.bottom() <= area.bottom() && rect.right() <= area.right() {
-                image_widget.render(rect, buf);
+            if backend.size().height as i16 + y >= area.y as i16 {
+                let hidden_lines = (area.y as i16 - y).max(0);
+
+                let position = SignedPosition { x: 0, y: -hidden_lines };
+                let image_widget = SlicedImage::new(backend, position);
+                let mut rect: Rect = backend.size().into();
+                rect.x = x;
+                rect.y = (y + hidden_lines) as u16;
+
+                rect.height -= hidden_lines as u16;
+                rect.width = rect.width.min(msg_width as u16);
+
+                let rect = rect.intersection(area);
+                if !rect.is_empty() {
+                    image_widget.render(rect, buf);
+                }
             }
         }
 
-        if self.room_focused &&
-            settings.tunables.read_receipt_send &&
-            !settings.tunables.read_receipt_manual &&
-            state.cursor.timestamp.is_none()
+        // Check if we should update the user's read receipt for this room after this render.
+        // `read_receipt_manual` holds every automatic trigger back, so that the marker only moves
+        // when the user runs `:read`.
+        if !settings.tunables.read_receipt_manual &&
+            settings
+                .tunables
+                .read_receipt_trigger
+                .on_render(state.cursor.timestamp.is_none(), self.room_focused)
         {
-            // If the cursor is at the last message, then update the read marker. When
-            // `read_receipt_manual` is set, viewing never does this, and the marker only moves
-            // when the user runs `:read`.
-            //
             // The replies alone carry the marker. The message a thread is about belongs to the
             // main scrollback, which counts it already, so a thread with no replies must not move
             // a receipt.
-            if let Some((replies, (k, _))) =
-                thread.replies().zip(thread.replies().and_then(|r| r.last_key_value()))
-            {
-                info.set_receipt(replies.1.clone(), settings.profile.user_id.clone(), k.1.clone());
+            if let Some(replies) = thread.replies() {
+                info.fully_read(settings.profile.user_id.clone(), replies.1.clone());
             }
         }
 
@@ -1909,10 +1976,9 @@ mod tests {
     use super::*;
     use crate::{
         base::{EventLocation, Need},
-        message::MessageTimeStamp,
         tests::*,
     };
-    use matrix_sdk::ruma::{events::room::message::RoomMessageEventContent, server_name, UInt};
+    use matrix_sdk::ruma::{UInt, events::room::message::RoomMessageEventContent, server_name};
 
     /// Give the room a thread that MSG2 started, with `replies` replies in it.
     ///
@@ -1924,7 +1990,7 @@ mod tests {
         for i in 0..replies {
             let event_id = EventId::new_v1(server_name!("example.com"));
             let ts = UInt::new(9 + i as u64).unwrap();
-            let key: MessageKey = (MessageTimeStamp::OriginServer(ts), event_id.clone());
+            let key = key_at(u64::from(ts), event_id.clone());
 
             let location = EventLocation::Message(Some(MSG2_EVID.clone()), key.clone());
             info.keys.insert(event_id, location);
@@ -2117,7 +2183,11 @@ mod tests {
         // selected. The last row of the conversation is the one above it.
         let bottom = area.height - 2;
 
-        (0..area.width).map(|x| buffer[(x, bottom)].symbol()).collect::<String>().trim().into()
+        (0..area.width)
+            .map(|x| buffer[(x, bottom)].symbol())
+            .collect::<String>()
+            .trim()
+            .into()
     }
 
     #[tokio::test]
@@ -2141,14 +2211,21 @@ mod tests {
         // the message it is on.
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.reactions
-            .entry(selected.1.clone())
+            .entry(selected.id.as_origin().unwrap().to_owned())
             .or_default()
-            .insert(EventId::new_v1(server_name!("example.com")), ("🐮".into(), TEST_USER1.clone()));
+            .insert(
+                EventId::new_v1(server_name!("example.com")),
+                ("🐮".into(), TEST_USER1.clone(), None),
+            );
 
         let mut buffer = Buffer::empty(area);
         scrollback.draw(area, &mut buffer, true, &mut store);
 
-        assert!(drawn(&buffer).contains('🐮'), "the reaction never came into view:\n{}", drawn(&buffer));
+        assert!(
+            drawn(&buffer).contains('🐮'),
+            "the reaction never came into view:\n{}",
+            drawn(&buffer)
+        );
     }
 
     #[tokio::test]
@@ -2189,7 +2266,8 @@ mod tests {
         // which half of the room window has the focus, and that lives on ChatState, which cannot
         // be built without a synced MatrixRoom.
         let acts = scrollback.prompt(&PromptAction::Submit, &ctx, &mut store).unwrap();
-        let thread = IambId::Room(TEST_ROOM1_ID.clone(), Some(order[2].1.clone()));
+        let thread =
+            IambId::Room(TEST_ROOM1_ID.clone(), order[2].id.as_origin().map(ToOwned::to_owned));
         let open = WindowAction::Switch(OpenTarget::Application(thread));
 
         assert_eq!(acts, vec![(open.into(), ctx)]);
@@ -2398,7 +2476,9 @@ mod tests {
         assert_eq!(scrollback.selection_anchor, Some(MSG5_KEY.clone().into()));
 
         // Two motions upwards grow the selection to cover MSG3, MSG4 and MSG5.
-        scrollback.edit(&EditAction::Motion, &prev(2), &visual, &mut store).unwrap();
+        scrollback
+            .edit(&EditAction::Motion, &prev(2), &visual, &mut store)
+            .unwrap();
         assert_eq!(scrollback.cursor, MSG3_KEY.clone().into());
 
         scrollback
@@ -2426,7 +2506,9 @@ mod tests {
 
         let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
 
-        scrollback.edit(&EditAction::Motion, &prev(1), &visual, &mut store).unwrap();
+        scrollback
+            .edit(&EditAction::Motion, &prev(1), &visual, &mut store)
+            .unwrap();
         assert!(scrollback.selection_anchor.is_some());
 
         // No target shape means the user is back in normal mode.
@@ -2447,7 +2529,9 @@ mod tests {
         scrollback
             .edit(&EditAction::Motion, &EditTarget::CurrentPosition, &visual, &mut store)
             .unwrap();
-        scrollback.edit(&EditAction::Motion, &prev(2), &visual, &mut store).unwrap();
+        scrollback
+            .edit(&EditAction::Motion, &prev(2), &visual, &mut store)
+            .unwrap();
 
         let swap = SelectionAction::CursorSet(SelectionCursorChange::SwapAnchor);
         scrollback.selection_command(&swap, &visual, &mut store).unwrap();
@@ -2811,4 +2895,3 @@ mod tests {
         assert_eq!(scrollback.viewctx.corner, MessageCursor::new(MSG3_KEY.clone(), 4));
     }
 }
-

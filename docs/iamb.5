@@ -126,18 +126,19 @@ These options are configured as an object under the
 key and can be overridden as described in
 .Sx PROFILES .
 .Bl -tag -width Ds
-.It Sy encryption
-Configuration subsection for specific settings related to room encryption.
-See
-.Sx ENCRYPTION
-for more details.
-.It Sy local_index
-Configuration subsection for the local message index, which makes
-.Sy :search
-able to find text in encrypted rooms.
-See
-.Sx LOCAL INDEX
-for more details.
+.It Sy cache_policy
+Configure how downloaded files and image previews are cached internally.
+Specifying this object will replace the upstream defaults and possibly lead to unconstrained cache growth.
+Possible keys and their effect are documented at:
+.br
+.Lk https://docs.rs/matrix-sdk/latest/matrix_sdk/media/struct.MediaRetentionPolicy.html#fields
+.It Sy default_markup
+Controls how text in the message bar is interpreted by default.
+Possible values are
+.Dq Sy html ,
+.Dq Sy markdown
+(the default) and
+.Dq Sy plaintext .
 .It Sy default_room
 The room to show by default instead of the
 .Sy :welcome
@@ -152,6 +153,11 @@ Possible values are
 .Dq Sy horizontal
 (the default) and
 .Dq Sy vertical .
+.It Sy encryption
+Configuration subsection for specific settings related to room encryption.
+See
+.Sx ENCRYPTION
+for more details.
 .It Sy external_edit_file_suffix
 Suffix to append to temporary file names when using the :editor command. Defaults to .md.
 .It Sy image_preview
@@ -186,6 +192,13 @@ and
 An optional list of two numbers representing font width and height in pixels.
 .El
 .El
+Subsection for configuring image previews. See
+.Sx "IMAGE PREVIEWS"
+for more details.
+.It Sy ignorecase
+Defines whether searches ignore case. Defaults to false.
+.It Sy input_prompt
+Override the default message bar prompt.
 .It Sy list_counts
 If
 .Sy true
@@ -193,16 +206,13 @@ If
 Windows that mix read and unread entries, such as
 .Sy :rooms ,
 also show how many of the entries are unread.
-.It Sy message_full_wrap
-If
-.Sy true ,
-draw the sender name in front of the first line of a message and give the message the whole
-width of the pane.
-A line that wraps starts again at the left edge.
-The timestamp is drawn in front of the name, so that no column on the right is kept for it.
-The read receipts are not drawn in this layout, because it keeps no column for them.
-Defaults to
-.Sy false .
+.It Sy local_index
+Configuration subsection for the local message index, which makes
+.Sy :search
+able to find text in encrypted rooms.
+See
+.Sx LOCAL INDEX
+for more details.
 .It Sy log_level
 Specifies the lowest log level that should be shown.
 Possible values are:
@@ -226,9 +236,28 @@ Enable mouse support
 See
 .Sx MOUSE
 for more details.
+.It Sy message_full_wrap
+If
+.Sy true ,
+draw the sender name in front of the first line of a message and give the message the whole
+width of the pane.
+A line that wraps starts again at the left edge.
+The timestamp is drawn in front of the name, so that no column on the right is kept for it.
+The read receipts are not drawn in this layout, because it keeps no column for them.
+Defaults to
+.Sy false .
 .It Sy message_shortcode_display
 Defines whether or not Emoji characters in messages should be replaced by their
 respective shortcodes.
+.It Sy members_split
+When set, this forces the
+.Sy :members
+command to open in a new window split instead of in the same window.
+Possible values are
+.Dq Sy vertical
+or
+.Dq Sy horizontal ,
+to control what kind of split is done.
 .It Sy message_user_color
 Defines whether or not the message body is colored like the username.
 .It Sy normal_after_send
@@ -242,12 +271,32 @@ for more details.
 Defines a custom  command and its arguments to run when opening downloads instead of the default.
 (For example,
 .Sy ["my-open",\ "--file"] . )
+.It Sy proxy
+When this subsection is present, you can configure how requests are proxied to the homeserver.
+See
+.Sx PROXYING
+for more details.
 .It Sy reaction_display
 Defines whether or not reactions should be shown.
 .It Sy reaction_shortcode_display
 Defines whether or not reactions should be shown as their respective shortcode.
 .It Sy read_receipt_send
-Defines whether or not read confirmations are sent.
+Defines whether or not public read confirmations are sent.
+.It Sy read_receipt_trigger
+Defines under what conditions threads and rooms are marked read.
+Possible values are:
+.Bl -tag -width Ds
+.It Sy focused
+The room or thread must be focused and scrolled to the last message.
+This is the default value.
+.It Sy visible
+The room or thread must be on screen and scrolled to the last message.
+.It Sy scrollback
+Some portion of the scrollback for the room or thread must be on screen, but
+the room does not need to be scrolled to the last message.
+.It Sy message
+A message must be sent to the room before marking it read.
+.El
 .It Sy read_receipt_display
 Defines whether or not read confirmations are displayed.
 Each reader is shown as the first character of their name in the room, using the
@@ -289,7 +338,7 @@ for more details.
 Defines whether or not the typing state is sent.
 .It Sy typing_notice_display
 Defines whether or not the typing state is displayed.
-.It Sy user
+.It Sy users
 Overrides values for the specified user.
 See
 .Sx "USER OVERRIDES"
@@ -448,6 +497,57 @@ decrypt the whole history.
 enabled = true
 passphrase_command = "cat /run/secrets/iamb-index-passphrase"
 .Ed
+.Sh IMAGE PREVIEWS
+The
+.Sy settings.image_preview
+subsection allows configuring image previews.
+.Pp
+The available fields in this subsection are:
+.Bl -tag -width Ds
+.It Sy enabled
+Defaults to
+.Sy true .
+.It Sy lazy_load
+If
+.Sy true
+(the default), download and render image previews when viewing a message with an image.
+If
+.Sy false ,
+load previews as soon as a message with an image is received.
+.It Sy size
+An optional object with
+.Sy width
+and
+.Sy height
+fields to specify the preview size in cells.
+Defaults to 66 and 10.
+.It Sy protocol
+An optional object to override settings that will normally be guessed automatically:
+.Bl -tag -width Ds
+.It Sy type
+An optional string set to one of the protocol types:
+.Dq Sy sixel ,
+.Dq Sy kitty ,
+.Dq Sy iterm2 ,
+and
+.Dq Sy halfblocks .
+.It Sy font_size
+An optional list of two numbers representing font width and height in pixels.
+.It Sy filter
+The sample filter used to scale images.
+Possible values are:
+.Dq Sy Nearest ,
+.Dq Sy Triangle
+(default) ,
+.Dq Sy CatmullRom ,
+.Dq Sy Gaussian ,
+and
+.Dq Sy Lanczos3 .
+See
+.Lk https://docs.rs/image/0.25.10/image/imageops/enum.FilterType.html
+for more information.
+.El
+.El
 .Sh MOUSE
 The
 .Sy settings.mouse
@@ -537,6 +637,34 @@ sound_hint = "IM"                  # Windows
 enabled = true
 focus_tui = "iamb"
 .Ed
+.Sh "PROXYING"
+The
+.Sy settings.proxy
+subsection allows configuring proxying for requests to the homeserver.
+.Pp
+Fields available within this subsection are:
+.Bl -tag -width Ds
+.It Sy url
+Either a
+.Sy socks5://IP:PORT
+URL for a SOCKS server to proxy request through,
+or a
+.Sy http[s]://[USER:PASS@]HOST[:PORT]/
+URL to do HTTP(S) proxying through.
+Setting this to the empty string will explicitly disable proxying, and any environment variables will be ignored.
+.It Sy auth
+A value to send in a
+.Sy Proxy-Authorization
+header if your HTTP(S) proxy requires it,
+such as for doing Bearer authentication with a token.
+.It Sy headers
+A subsection for specifying additional headers and values to include in requests sent to the proxy.
+For example, custom HTTPS proxy server software may require specifying a
+.Sy User-Agent
+or a custom header like
+.Sy X-Proxy-Token
+in order to be allowed to send request through it.
+.El
 .Sh "SORTING LISTS"
 The
 .Sy settings.sort
@@ -576,10 +704,10 @@ How to sort the
 .Sy :members
 window.
 Defaults to
-.Sy ["power",\ "id"] .
+.Sy ["power",\ "knock",\ "~invite",\ "id"] .
 .El
 .Pp
-The available values are:
+The available values for sorting rooms are:
 .Bl -tag -width Ds
 .It Sy favorite
 Put favorite rooms before other rooms.
@@ -591,12 +719,32 @@ Sort rooms by alphabetically ascending room name.
 Sort rooms by alphabetically ascending canonical room alias.
 .It Sy id
 Sort rooms by alphabetically ascending Matrix room identifier.
+.It Sy server
+Sort rooms by alphabetically ascending server name from the room alias.
+This will fall back to the server from the room identifier if there is
+no canonical alias for the room.
 .It Sy unread
 Put unread rooms before other rooms.
 .It Sy recent
 Sort rooms by most recent message timestamp.
 .It Sy invite
 Put invites before other rooms.
+.El
+.Pp
+The available values for sorting users are:
+.Bl -tag -width Ds
+.It Sy power
+Put users with higher power level before other users.
+.It Sy id
+Sort users by alphabetically ascending Matrix user identifier.
+.It Sy localpart
+Sort users by alphabetically ascending local part of the user identifier.
+.It Sy server
+Sort users by alphabetically ascending server name from the user identifier.
+.It Sy invite
+Put invited users before other members.
+.It Sy knock
+Put knocking users before other members.
 .El
 .Pp
 Add a

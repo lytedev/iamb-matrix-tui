@@ -17,15 +17,7 @@
 use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::StatefulWidget};
 
 use modalkit::{
-    actions::{
-        EditAction,
-        Editable,
-        EditorAction,
-        Jumpable,
-        PromptAction,
-        Promptable,
-        Scrollable,
-    },
+    actions::{EditAction, Editable, EditorAction, Jumpable, PromptAction, Promptable, Scrollable},
     editing::completion::CompletionList,
     editing::context::Resolve,
     errors::EditResult,
@@ -33,11 +25,11 @@ use modalkit::{
 };
 
 use modalkit_ratatui::{
-    list::{List, ListItem, ListState},
-    textbox::{TextBox, TextBoxState},
     TermOffset,
     TerminalCursor,
     WindowOps,
+    list::{List, ListItem, ListState},
+    textbox::{TextBox, TextBoxState},
 };
 
 use crate::base::{
@@ -219,6 +211,10 @@ impl<T: FilteredItem> TerminalCursor for FilteredListState<T> {
     fn get_term_cursor(&self) -> Option<TermOffset> {
         self.filter.get_term_cursor()
     }
+
+    fn hide_term_cursor(&self) -> bool {
+        self.filter.hide_term_cursor()
+    }
 }
 
 impl<T: FilteredItem> WindowOps<IambInfo> for FilteredListState<T> {
@@ -241,10 +237,11 @@ impl<T: FilteredItem> WindowOps<IambInfo> for FilteredListState<T> {
         buf.set_string(bar.x, bar.y, FILTER_BAR_PROMPT, Style::default());
         TextBox::new().render(text, buf, &mut self.filter);
 
-        List::new(store)
-            .empty_message(T::empty_message())
-            .focus(focused)
-            .render(below, buf, &mut self.list);
+        List::new(store).empty_message(T::empty_message()).focus(focused).render(
+            below,
+            buf,
+            &mut self.list,
+        );
     }
 
     fn dup(&self, store: &mut ProgramStore) -> Self {
@@ -283,8 +280,6 @@ impl<T: FilteredItem> WindowOps<IambInfo> for FilteredListState<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use crate::tests::mock_store;
     use crate::windows::palette::CommandPaletteState;
     use crate::windows::switcher::QuickSwitcherState;

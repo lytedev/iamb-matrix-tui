@@ -35,15 +35,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use matrix_sdk::Client;
 use matrix_sdk::encryption::backups::BackupState;
 use matrix_sdk::event_cache::EventCacheError;
 use matrix_sdk::room::Room;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
-use matrix_sdk::Client;
 use modalkit::prelude::EditInfo;
 use serde::{Deserialize, Serialize};
 

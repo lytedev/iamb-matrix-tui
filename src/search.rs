@@ -23,6 +23,12 @@
 //! [spec]: https://spec.matrix.org/v1.18/client-server-api/#post_matrixclientv3search
 use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk::ruma::{
+    MilliSecondsSinceUnixEpoch,
+    OwnedEventId,
+    OwnedRoomId,
+    OwnedUserId,
+    RoomId,
+    UInt,
     api::client::{
         filter::RoomEventFilter,
         search::search_events::v3::{
@@ -36,20 +42,14 @@ use matrix_sdk::ruma::{
         },
     },
     events::{
-        room::message::Relation,
         AnyMessageLikeEvent,
         AnySyncMessageLikeEvent,
         AnySyncTimelineEvent,
         AnyTimelineEvent,
         MessageLikeEvent,
         SyncMessageLikeEvent,
+        room::message::Relation,
     },
-    MilliSecondsSinceUnixEpoch,
-    OwnedEventId,
-    OwnedRoomId,
-    OwnedUserId,
-    RoomId,
-    UInt,
 };
 
 /// How many hits one request asks the homeserver for.
@@ -252,7 +252,7 @@ fn one_line(body: &str) -> String {
 mod tests {
     use super::*;
     use matrix_sdk::ruma::{event_id, room_id, serde::Raw, user_id};
-    use serde_json::{from_value, json, Value};
+    use serde_json::{Value, from_value, json};
 
     /// The `room_events` out of a response body, as the worker gets it.
     fn results(results: Value) -> ResultRoomEvents {

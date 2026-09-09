@@ -19,21 +19,22 @@
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt::Display;
-use std::fs::{create_dir_all, File};
-use std::io::{stdout, BufWriter, Stdout, Write};
+use std::fs::{File, create_dir_all};
+use std::io::{BufWriter, Stdout, Write, stdout};
 use std::ops::DerefMut;
 use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser};
+use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::error::ErrorKind;
-use matrix_sdk::ruma::OwnedUserId;
+use matrix_sdk::ruma::profile::{ProfileFieldName, ProfileFieldValue};
 use matrix_sdk_crypto::encrypt_room_key_export;
 use modalkit::keybindings::InputBindings;
-use rand::distr::Alphanumeric;
 use rand::RngExt as _;
+use rand::distr::Alphanumeric;
 use temp_dir::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::Level;
@@ -43,8 +44,6 @@ use modalkit::crossterm::{
     self,
     cursor::{SetCursorStyle, Show as CursorShow},
     event::{
-        poll,
-        read,
         DisableBracketedPaste,
         DisableFocusChange,
         DisableMouseCapture,
@@ -57,23 +56,26 @@ use modalkit::crossterm::{
         MouseEventKind,
         PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
+        poll,
+        read,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
     widgets::Paragraph,
-    Terminal,
 };
 
 mod backfill;
 mod base;
 mod commands;
+mod completions;
 mod config;
 mod keybindings;
 mod message;
@@ -88,6 +90,7 @@ mod worker;
 
 #[cfg(test)]
 mod tests;
+mod verifications;
 
 use crate::{
     backfill::start_backfill,
@@ -97,8 +100,6 @@ use crate::{
         ChatStore,
         HomeserverAction,
         IambAction,
-        RoomAction,
-        IambCompleter,
         IambError,
         IambId,
         IambInfo,
@@ -108,10 +109,12 @@ use crate::{
         ProgramContext,
         ProgramStore,
         ReindexAction,
+        RoomAction,
     },
+    completions::IambCompleter,
     config::{ApplicationSettings, Iamb},
     windows::IambWindow,
-    worker::{create_room, ClientWorker, LoginStyle, Requester},
+    worker::{ClientWorker, LoginStyle, Requester, create_room},
 };
 
 use modalkit::{
@@ -134,20 +137,20 @@ use modalkit::{
     errors::{EditError, UIError},
     key::TerminalKey,
     keybindings::{
-        dialog::{Pager, PromptYesNo},
         BindingMachine,
+        dialog::{Pager, PromptYesNo},
     },
     prelude::*,
     ui::FocusList,
 };
 
 use modalkit_ratatui::{
-    cmdbar::CommandBarState,
-    screen::{Screen, ScreenState, TabbedLayoutDescription},
-    windows::{WindowLayoutDescription, WindowLayoutState},
     TerminalCursor,
     TerminalExtOps,
     Window,
+    cmdbar::CommandBarState,
+    screen::{Screen, ScreenState, TabbedLayoutDescription},
+    windows::{WindowLayoutDescription, WindowLayoutState},
 };
 
 fn config_tab_to_desc(
@@ -336,7 +339,7 @@ impl Application {
             let area = f.area();
 
             let modestr = bindings.show_mode();
-            let cursor = bindings.get_cursor_indicator();
+            let cursor = bindings.get_cursor_hint();
             let dialogstr = bindings.show_dialog(area.height as usize, area.width as usize);
 
             // Don't show terminal cursor when we show a dialog.
@@ -358,7 +361,7 @@ impl Application {
             }
 
             if let Some((cx, cy)) = sstate.get_term_cursor() {
-                if let Some(c) = cursor {
+                if let Some(c) = cursor.get_indicator() {
                     let style = Style::default().fg(Color::Green);
                     let span = Span::styled(c.to_string(), style);
                     let para = Paragraph::new(span);
@@ -368,6 +371,9 @@ impl Application {
                 f.set_cursor_position((cx, cy));
             }
         })?;
+        if sstate.hide_term_cursor() {
+            term.hide_cursor()?;
+        }
 
         Ok(())
     }
@@ -397,10 +403,7 @@ impl Application {
                 let select = IambAction::Room(RoomAction::SelectMessage(jump.event_id));
                 let ctx = ProgramContext::default();
 
-                return Ok(Step::Actions(vec![
-                    (switch.into(), ctx.clone()),
-                    (select.into(), ctx),
-                ]));
+                return Ok(Step::Actions(vec![(switch.into(), ctx.clone()), (select.into(), ctx)]));
             }
 
             if !poll(Duration::from_secs(1))? {
@@ -662,7 +665,7 @@ impl Application {
 
                     for room_id in chats.iter() {
                         if let Some(room) = app.rooms.get_mut(room_id) {
-                            room.fully_read(user_id);
+                            room.fully_read_all(user_id);
                         }
                     }
                 });
@@ -721,19 +724,15 @@ impl Application {
                 None
             },
 
-            IambAction::Verify(act, user_dev) => {
-                if let Some(sas) = store.application.verifications.get(&user_dev) {
-                    self.worker.verify(act, sas.clone())?
-                } else {
-                    return Err(IambError::InvalidVerificationId(user_dev).into());
-                }
+            IambAction::Verify(act, flow_id) => {
+                return verifications::iamb_verify(act, flow_id, store).await;
             },
             IambAction::VerifyRequest(user_id) => {
-                if let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) {
-                    self.worker.verify_request(user_id)?
-                } else {
+                let Ok(user_id) = <&UserId>::try_from(user_id.as_str()) else {
                     return Err(IambError::InvalidUserId(user_id).into());
-                }
+                };
+
+                return verifications::iamb_verify_request(user_id, store).await;
             },
         };
 
@@ -756,6 +755,15 @@ impl Application {
 
                 Ok(vec![(action.into(), ctx)])
             },
+            HomeserverAction::KnockSend(alias, reason) => {
+                let _ = self
+                    .worker
+                    .client
+                    .knock(alias, reason, vec![])
+                    .await
+                    .map_err(IambError::from)?;
+                Ok(vec![])
+            },
             HomeserverAction::Logout(user, true) => {
                 self.worker.logout(user)?;
                 let flags = CloseFlags::QUIT | CloseFlags::FORCE;
@@ -777,6 +785,56 @@ impl Application {
                     room.forget().await.map_err(IambError::from)?;
                 }
                 Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldSet(value) => {
+                let client = &store.application.worker.client;
+                let account = client.account();
+                account.set_profile_field(value).await.map_err(IambError::from)?;
+                Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldUnset(field) => {
+                let client = &store.application.worker.client;
+                let account = client.account();
+                account.delete_profile_field(field).await.map_err(IambError::from)?;
+                Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldShow(field) => {
+                let client = &store.application.worker.client;
+                let user_id = store.application.settings.profile.user_id.clone();
+                let account = client.account();
+                let value = account
+                    .fetch_profile_field_of(user_id, field.clone())
+                    .await
+                    .map_err(IambError::from)?;
+
+                let msg = match (field, value) {
+                    (_, Some(ProfileFieldValue::DisplayName(s))) => {
+                        format!("Your profile's display name is set to: {s}")
+                    },
+                    (_, Some(ProfileFieldValue::TimeZone(s))) => {
+                        format!("Your profile's timezone is set to: {s}")
+                    },
+                    (_, Some(ProfileFieldValue::AvatarUrl(s))) => {
+                        format!("Your profile's avatar URL is set to: {s}")
+                    },
+                    (ProfileFieldName::DisplayName, None) => {
+                        "Your profile's display name is currently unset".into()
+                    },
+                    (ProfileFieldName::TimeZone, None) => {
+                        "Your profile's timezone is currently unset".into()
+                    },
+                    (ProfileFieldName::AvatarUrl, None) => {
+                        "Your profile's avatar URL is currently unset".into()
+                    },
+                    (f, None) => {
+                        format!("Your profile's {f:?} is currently unset")
+                    },
+                    (f, Some(s)) => {
+                        format!("Your profile's {f:?} is set to {s:?}")
+                    },
+                };
+
+                Ok(vec![(Action::ShowInfoMessage(msg.into()), ctx)])
             },
         }
     }
@@ -1237,7 +1295,10 @@ async fn run(settings: ApplicationSettings) -> IambResult<()> {
     match res {
         Err(UIError::Application(IambError::Matrix(e))) => {
             if let Some(ErrorKind::UnknownToken { .. }) = e.client_api_error_kind() {
-                print_exit(format!("Server did not recognize our API token; did you log out from this session elsewhere?\nTry deleting `{}` to force a clean login.", settings.session_json.display()))
+                print_exit(format!(
+                    "Server did not recognize our API token; did you log out from this session elsewhere?\nTry deleting `{}` to force a clean login.",
+                    settings.session_json.display()
+                ))
             } else {
                 print_exit(e)
             }

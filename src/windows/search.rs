@@ -47,7 +47,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::base::{
     IambBufferId,
-    IambId,
     IambInfo,
     MessageJump,
     ProgramAction,
@@ -340,8 +339,10 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SearchItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::base::IambId;
     use crate::tests::mock_store;
-    use matrix_sdk::ruma::{event_id, room_id, user_id, MilliSecondsSinceUnixEpoch, UInt};
+    use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, UInt, event_id, room_id, user_id};
 
     /// A viewport `columns` wide, which is what the window is drawn into.
     fn viewport(columns: usize) -> ViewportContext<ListCursor> {

@@ -78,7 +78,11 @@ impl SnoozeStore {
     /// The alternative was to keep the two independent. That was rejected because the missing
     /// capability has no workaround, while an over-broad snooze expires by itself and one
     /// `:unsnooze` undoes it.
-    pub fn wake_at(&self, room_id: &OwnedRoomId, thread: Option<&OwnedEventId>) -> Option<WakeTime> {
+    pub fn wake_at(
+        &self,
+        room_id: &OwnedRoomId,
+        thread: Option<&OwnedEventId>,
+    ) -> Option<WakeTime> {
         match thread {
             None => self.wake_times.get(&SnoozeKey::room(room_id.clone())).copied(),
             Some(thread) => {
@@ -216,11 +220,7 @@ impl std::fmt::Display for BadDuration {
 ///
 /// Absolute timestamps are deliberately absent. They need a date parser, they are rarely what the
 /// user means at the moment of deferral, and adding them later breaks nothing.
-pub fn parse_when(
-    input: &str,
-    now: WakeTime,
-    tomorrow_hour: u32,
-) -> Result<WakeTime, BadDuration> {
+pub fn parse_when(input: &str, now: WakeTime, tomorrow_hour: u32) -> Result<WakeTime, BadDuration> {
     let input = input.trim();
 
     if input.eq_ignore_ascii_case("tomorrow") {
@@ -289,7 +289,7 @@ pub fn describe(wake_at: WakeTime) -> String {
 mod tests {
     use super::*;
     use chrono::Timelike;
-    use matrix_sdk::ruma::UInt;
+    use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, UInt};
 
     use crate::base::UnreadInfo;
     use crate::message::MessageTimeStamp;
@@ -399,22 +399,23 @@ mod tests {
 
     #[test]
     fn test_a_wake_time_replaces_an_older_message_time() {
-        let old = MessageTimeStamp::OriginServer(UInt::new(1_000).unwrap());
-        let unread = UnreadInfo { unread: true, latest: Some(old) };
+        let old = MessageTimeStamp(MilliSecondsSinceUnixEpoch(UInt::new(1_000).unwrap()));
+        let unread = UnreadInfo::from_receipt(true, Some(old));
 
         let woken = unread.with_wake_time(Some(NOW));
 
         // The entry now claims to be as recent as its wake time, which is what lifts it to the top
         // of the inbox when it comes back.
-        assert_eq!(woken.latest(), Some(&MessageTimeStamp::OriginServer(
-            UInt::new(NOW).unwrap()
-        )));
+        assert_eq!(
+            woken.latest(),
+            Some(&MessageTimeStamp(MilliSecondsSinceUnixEpoch(UInt::new(NOW).unwrap())))
+        );
     }
 
     #[test]
     fn test_a_newer_message_beats_the_wake_time() {
-        let newer = MessageTimeStamp::OriginServer(UInt::new(NOW + HOUR).unwrap());
-        let unread = UnreadInfo { unread: true, latest: Some(newer) };
+        let newer = MessageTimeStamp(MilliSecondsSinceUnixEpoch(UInt::new(NOW + HOUR).unwrap()));
+        let unread = UnreadInfo::from_receipt(true, Some(newer));
 
         let woken = unread.with_wake_time(Some(NOW));
 
@@ -423,8 +424,8 @@ mod tests {
 
     #[test]
     fn test_no_wake_time_leaves_the_entry_alone() {
-        let old = MessageTimeStamp::OriginServer(UInt::new(1_000).unwrap());
-        let unread = UnreadInfo { unread: true, latest: Some(old) };
+        let old = MessageTimeStamp(MilliSecondsSinceUnixEpoch(UInt::new(1_000).unwrap()));
+        let unread = UnreadInfo::from_receipt(true, Some(old));
 
         assert_eq!(unread.with_wake_time(None).latest(), Some(&old));
     }
@@ -459,8 +460,7 @@ mod tests {
     #[test]
     fn test_an_expired_entry_is_not_read_back_in() {
         let room = room_id!("!a:example.com").to_owned();
-        let mut content = SnoozeContent::default();
-        content.room = Some(NOW - HOUR);
+        let content = SnoozeContent { room: Some(NOW - HOUR), ..Default::default() };
 
         let mut s = store();
         s.load_room(&room, content, NOW);

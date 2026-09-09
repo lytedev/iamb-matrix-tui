@@ -32,18 +32,14 @@ const MESSAGE_SEPARATOR: &str = "\n\n";
 
 /// Format the timestamp for the header of a yanked message.
 fn show_time(timestamp: &MessageTimeStamp) -> String {
-    match timestamp {
-        MessageTimeStamp::OriginServer(ms) => {
-            let seconds = i64::from(*ms) / 1000;
-            match chrono::DateTime::from_timestamp(seconds, 0) {
-                Some(time) => {
-                    let time: chrono::DateTime<LocalTz> = time.into();
-                    time.format(TIME_FORMAT).to_string()
-                },
-                None => TIME_UNSENT.to_string(),
-            }
+    let seconds = i64::from(timestamp.0.0) / 1000;
+
+    match chrono::DateTime::from_timestamp(seconds, 0) {
+        Some(time) => {
+            let time: chrono::DateTime<LocalTz> = time.into();
+            time.format(TIME_FORMAT).to_string()
         },
-        MessageTimeStamp::LocalEcho => TIME_UNSENT.to_string(),
+        None => TIME_UNSENT.to_string(),
     }
 }
 
@@ -55,7 +51,7 @@ fn show_time(timestamp: &MessageTimeStamp) -> String {
 ///
 /// Returns the body untouched when there is nothing to mark, so the common case allocates nothing.
 fn mark_mentions<'a>(body: &'a str, msg: &Message, info: &RoomInfo) -> Cow<'a, str> {
-    let MessageEvent::Original(ev) = &msg.event else {
+    let MessageEvent::Original(ev, _) = &msg.event else {
         return Cow::Borrowed(body);
     };
 
@@ -102,7 +98,11 @@ pub fn show_message(msg: &Message, info: &RoomInfo, settings: &ApplicationSettin
         .display_names
         .get(&msg.sender)
         .unwrap_or_else(|| settings.get_user_name(&msg.sender, info));
-    let thread = if msg.thread_root().is_some() { THREAD_MARK } else { "" };
+    let thread = if msg.thread_root().is_some() {
+        THREAD_MARK
+    } else {
+        ""
+    };
     let body = msg.event.body();
     let body = mark_mentions(body.trim_end_matches('\n'), msg, info);
     let body = body.as_ref();
@@ -139,8 +139,8 @@ mod tests {
     use crate::message::MessageEvent;
     use crate::tests::*;
 
-    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
     use matrix_sdk::ruma::events::Mentions;
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 
     /// Format the time the same way the yanked text does, but from `chrono` directly, so that the
     /// test does not depend on the timezone of the machine that runs it.
@@ -166,10 +166,8 @@ mod tests {
         let settings = mock_settings();
         let msg = mock_message3();
 
-        let expected = format!(
-            "[{}] @user2:example.com:\nthis\nis\na\nmultiline\nmessage",
-            expected_time(2)
-        );
+        let expected =
+            format!("[{}] @user2:example.com:\nthis\nis\na\nmultiline\nmessage", expected_time(2));
         assert_eq!(show_message(&msg, &info, &settings), expected);
     }
 
@@ -190,7 +188,7 @@ mod tests {
         let info = mock_room();
         let settings = mock_settings();
         let event = MessageEvent::Redacted(MSG2_EVID.clone(), Some("spam".into()));
-        let msg = Message::new(event, TEST_USER1.clone(), MSG2_KEY.0);
+        let msg = Message::new(event, TEST_USER1.clone(), MSG2_KEY.ts);
 
         let text = show_message(&msg, &info, &settings);
         let expected = format!("[{}] @user1:example.com: [Redacted: \"spam\"]", expected_time(1));
@@ -227,12 +225,10 @@ mod tests {
         let content = RoomMessageEventContent::text_plain("Ada Lovelace let me know what you need");
         let mut msg = mock_room1_message(content, TEST_USER2.clone(), MSG2_KEY.clone());
 
-        if mention {
-            if let MessageEvent::Original(ev) = &mut msg.event {
-                let mut mentions = Mentions::new();
-                mentions.user_ids.insert(TEST_USER1.clone());
-                ev.content.mentions = Some(mentions);
-            }
+        if mention && let MessageEvent::Original(ev, _) = &mut msg.event {
+            let mut mentions = Mentions::new();
+            mentions.user_ids.insert(TEST_USER1.clone());
+            ev.content.mentions = Some(mentions);
         }
 
         msg

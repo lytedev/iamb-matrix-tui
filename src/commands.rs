@@ -4,12 +4,19 @@
 //! [modalkit::env::vim::command] for additional Vim commands we pull in.
 use std::{convert::TryFrom, str::FromStr as _};
 
-use matrix_sdk::ruma::{events::tag::TagName, OwnedRoomId, OwnedUserId};
+use matrix_sdk::ruma::{
+    OwnedMxcUri,
+    OwnedRoomOrAliasId,
+    OwnedUserId,
+    RoomVersionId,
+    events::tag::TagName,
+    profile::{ProfileFieldName, ProfileFieldValue},
+};
 
 use modalkit::{
     commands::{CommandError, CommandResult, CommandStep},
     env::vim::command::{CommandContext, CommandDescription, CommandFunc, OptionType},
-    prelude::OpenTarget,
+    prelude::{MoveDir1D, OpenTarget},
 };
 
 use crate::base::{
@@ -20,12 +27,13 @@ use crate::base::{
     IambAction,
     IambId,
     IambInfo,
+    IambJoinRule,
     KeysAction,
-    ReindexAction,
     MemberUpdateAction,
     MessageAction,
     ProgramCommand,
     ProgramCommands,
+    ReindexAction,
     RoomAction,
     RoomField,
     SendAction,
@@ -146,6 +154,63 @@ fn iamb_keys(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     return Ok(step);
 }
 
+fn iamb_knock(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut args = desc.arg.strings()?;
+
+    if args.len() < 2 || args.len() > 3 {
+        return Err(CommandError::InvalidArgument);
+    }
+
+    let cmd = args.remove(0);
+    let arg = args.remove(0);
+    let reason = args.pop();
+
+    let act: IambAction = match (cmd.as_str(), arg, reason) {
+        // :knock send #room:example.org "reason"
+        ("send", alias, reason) => {
+            let alias = OwnedRoomOrAliasId::from_str(&alias).map_err(|e| {
+                CommandError::Error(format!(
+                    "{alias:?} is not a valid alias or room identifier: {e}"
+                ))
+            })?;
+            HomeserverAction::KnockSend(alias, reason).into()
+        },
+
+        // :knock accept @user:example.org
+        ("accept", user, None) => {
+            let user = OwnedUserId::from_str(&user).map_err(|e| {
+                CommandError::Error(format!("{user:?} is not a valid user identifier: {e}"))
+            })?;
+            RoomAction::KnockAccept(user).into()
+        },
+        ("accept", _, Some(_)) => return Err(CommandError::InvalidArgument),
+
+        // :knock reject @user:example.org "reason"
+        ("reject", user, reason) => {
+            let user = OwnedUserId::from_str(&user).map_err(|e| {
+                CommandError::Error(format!("{user:?} is not a valid user identifier: {e}"))
+            })?;
+            RoomAction::KnockReject(user, reason).into()
+        },
+
+        // :knock ban @user:example.org "reason"
+        ("ban", user, reason) => {
+            let user = OwnedUserId::from_str(&user).map_err(|e| {
+                CommandError::Error(format!("{user:?} is not a valid user identifier: {e}"))
+            })?;
+            RoomAction::KnockBan(user, reason).into()
+        },
+
+        (cmd, _, _) => {
+            return Err(CommandError::Error(format!("unrecognized `knock` subcommand: {cmd:?}")));
+        },
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_verify(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let mut args = desc.arg.strings()?;
 
@@ -165,6 +230,7 @@ fn iamb_verify(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
                 "cancel" => VerifyAction::Cancel,
                 "confirm" => VerifyAction::Confirm,
                 "mismatch" => VerifyAction::Mismatch,
+                "emoji" => VerifyAction::Emoji,
                 "request" => {
                     let iact = IambAction::VerifyRequest(args.remove(1));
                     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
@@ -214,6 +280,27 @@ fn iamb_leave(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 
     let leave = IambAction::Room(RoomAction::Leave(desc.bang));
     let step = CommandStep::Continue(leave.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_follow(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut args = desc.arg.strings()?;
+
+    if args.len() > 1 {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let dir = match args.pop().as_deref() {
+        None | Some("next") => MoveDir1D::Next,
+        Some("prev") | Some("previous") => MoveDir1D::Previous,
+        Some(_) => return Result::Err(CommandError::InvalidArgument),
+    };
+
+    let context = Box::new(ctx.clone());
+    let follow = RoomAction::Follow(context, dir);
+    let follow = IambAction::Room(follow);
+    let step = CommandStep::Continue(follow.into(), ctx.context.clone());
 
     return Ok(step);
 }
@@ -575,6 +662,101 @@ fn iamb_unreads(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     }
 }
 
+fn iamb_mentions(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::MentionList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_self(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut iter = desc.arg.strings()?.into_iter();
+    let field = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let action = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let arg = iter.next();
+    let trailing = iter.collect::<Vec<_>>();
+
+    if !trailing.is_empty() {
+        // Reject if we have any trailing arguments:
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act: IambAction = match (field.as_str(), action.as_str(), arg) {
+        // :self avatar show
+        ("avatar", "show", None) => {
+            HomeserverAction::ProfileFieldShow(ProfileFieldName::AvatarUrl).into()
+        },
+        ("avatar", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self avatar set
+        ("avatar", "set", Some(s)) => {
+            let url = OwnedMxcUri::from(s.as_str());
+            if let Err(e) = url.validate() {
+                return Err(CommandError::Error(format!(
+                    "{s:?} is not a valid Matrix content URI: {e}"
+                )));
+            }
+            HomeserverAction::ProfileFieldSet(ProfileFieldValue::AvatarUrl(url)).into()
+        },
+        ("avatar", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self avatar unset
+        ("avatar", "unset", None) => {
+            HomeserverAction::ProfileFieldUnset(ProfileFieldName::AvatarUrl).into()
+        },
+        ("avatar", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self name show
+        ("name" | "nick", "show", None) => {
+            HomeserverAction::ProfileFieldShow(ProfileFieldName::DisplayName).into()
+        },
+        ("name" | "nick", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self name set
+        ("name" | "nick", "set", Some(s)) => {
+            HomeserverAction::ProfileFieldSet(ProfileFieldValue::DisplayName(s)).into()
+        },
+        ("name" | "nick", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self name unset
+        ("name" | "nick", "unset", None) => {
+            HomeserverAction::ProfileFieldUnset(ProfileFieldName::DisplayName).into()
+        },
+        ("name" | "nick", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self timezone show
+        ("timezone" | "tz", "show", None) => {
+            HomeserverAction::ProfileFieldShow(ProfileFieldName::TimeZone).into()
+        },
+        ("timezone" | "tz", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self timezone set
+        ("timezone" | "tz", "set", Some(s)) => {
+            HomeserverAction::ProfileFieldSet(ProfileFieldValue::TimeZone(s)).into()
+        },
+        ("timezone" | "tz", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self timezone set
+        ("timezone" | "tz", "unset", None) => {
+            HomeserverAction::ProfileFieldUnset(ProfileFieldName::TimeZone).into()
+        },
+        ("timezone" | "tz", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // Reject anything we don't recognize:
+        (f, a, _) => {
+            return Result::Err(CommandError::Error(format!("unrecognized command: {f} {a}")));
+        },
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_spaces(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -658,20 +840,72 @@ fn iamb_create(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 }
 
 fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
-    let mut args = desc.arg.strings()?;
+    let mut iter = desc.arg.strings()?.into_iter();
+    let field = iter.next().ok_or(CommandError::InvalidArgument)?;
 
-    if args.len() < 2 {
-        return Result::Err(CommandError::InvalidArgument);
+    if field == "user" {
+        return iamb_room_user(iter.collect(), ctx);
     }
 
-    let field = args.remove(0);
-    let action = args.remove(0);
+    let action = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let arg = iter.next();
+    let trailing = iter.collect::<Vec<_>>();
 
-    if args.len() > 1 {
-        return Result::Err(CommandError::InvalidArgument);
+    match (field.as_str(), action.as_str(), arg.as_deref()) {
+        // Skip check for commands that takes a variable number of arguments:
+        ("access", "set", Some("restricted" | "knock-restricted")) => (),
+        ("version", "upgrade", _) => (),
+
+        // Reject if we have any trailing arguments:
+        (_, _, _) if !trailing.is_empty() => return Result::Err(CommandError::InvalidArgument),
+        (_, _, _) => (),
     }
 
-    let act: IambAction = match (field.as_str(), action.as_str(), args.pop()) {
+    let act: IambAction = match (field.as_str(), action.as_str(), arg) {
+        // :room access set
+        ("access", "set", Some(rule)) => {
+            let rooms = trailing
+                .iter()
+                .map(|a| {
+                    let (flag, v) = match OptionType::from_str(a)? {
+                        OptionType::Positional(_) => return Err(CommandError::InvalidArgument),
+                        OptionType::Flag(_, None) => return Err(CommandError::InvalidArgument),
+                        OptionType::Flag(f, Some(v)) => (f, v),
+                    };
+
+                    match flag.as_str() {
+                        "members" => {
+                            OwnedRoomOrAliasId::from_str(&v).map_err(|e| {
+                                CommandError::Error(format!(
+                                    "{v:?} is not a valid room identifier: {e}"
+                                ))
+                            })
+                        },
+                        _ => Err(CommandError::Error(format!("unknown flag {flag:?}"))),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let rule = match rule.as_str() {
+                "invite" => IambJoinRule::Invite,
+                "knock" => IambJoinRule::Knock,
+                "knock-restricted" => IambJoinRule::KnockRestricted(rooms),
+                "public" => IambJoinRule::Public,
+                "restricted" => IambJoinRule::Restricted(rooms),
+                _ => return Err(CommandError::InvalidArgument),
+            };
+            RoomAction::SetAccess(rule).into()
+        },
+        ("access", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room access unset
+        ("access", "unset", None) => RoomAction::SetAccess(IambJoinRule::Invite).into(),
+        ("access", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room access unset
+        ("access", "show", None) => RoomAction::Show(RoomField::Access).into(),
+        ("access", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
         // :room dm set
         ("dm", "set", None) => RoomAction::SetDirect(true).into(),
         ("dm", "set", Some(_)) => return Result::Err(CommandError::InvalidArgument),
@@ -743,15 +977,37 @@ fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
         ("notify", "show", None) => RoomAction::Show(RoomField::NotificationMode).into(),
         ("notify", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
 
-        // :room aliases show
+        // :room version show
+        ("version", "show", None) => RoomAction::Show(RoomField::Version).into(),
+        ("version", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room version upgrade
+        ("version", "upgrade", Some(s)) => {
+            let version = RoomVersionId::from_str(&s).map_err(|e| {
+                CommandError::Error(format!("{s:?} is not a valid room version: {e}"))
+            })?;
+            let additional_creators = trailing
+                .iter()
+                .map(|u| {
+                    OwnedUserId::from_str(u).map_err(|e| {
+                        let msg = format!("{u:?} is not a valid user identifier: {e}");
+                        CommandError::Error(msg)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            RoomAction::Upgrade(version, additional_creators, desc.bang).into()
+        },
+        ("version", "upgrade", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room alias show
         ("alias", "show", None) => RoomAction::Show(RoomField::Aliases).into(),
         ("alias", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
 
-        // :room aliases unset <alias>
+        // :room alias unset <alias>
         ("alias", "unset", Some(s)) => RoomAction::Unset(RoomField::Alias(s)).into(),
         ("alias", "unset", None) => return Result::Err(CommandError::InvalidArgument),
 
-        // :room aliases set <alias>
+        // :room alias set <alias>
         ("alias", "set", Some(s)) => RoomAction::Set(RoomField::Alias(s), "".into()).into(),
         ("alias", "set", None) => return Result::Err(CommandError::InvalidArgument),
 
@@ -760,7 +1016,7 @@ fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
             RoomAction::Show(RoomField::CanonicalAlias).into()
         },
         ("canonicalalias" | "canon", "show", Some(_)) => {
-            return Result::Err(CommandError::InvalidArgument)
+            return Result::Err(CommandError::InvalidArgument);
         },
 
         // :room canonicalalias set
@@ -768,7 +1024,7 @@ fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
             RoomAction::Set(RoomField::CanonicalAlias, s).into()
         },
         ("canonicalalias" | "canon", "set", None) => {
-            return Result::Err(CommandError::InvalidArgument)
+            return Result::Err(CommandError::InvalidArgument);
         },
 
         // :room canonicalalias unset
@@ -776,7 +1032,7 @@ fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
             RoomAction::Unset(RoomField::CanonicalAlias).into()
         },
         ("canonicalalias" | "canon", "unset", Some(_)) => {
-            return Result::Err(CommandError::InvalidArgument)
+            return Result::Err(CommandError::InvalidArgument);
         },
 
         // :room id show
@@ -788,6 +1044,39 @@ fn iamb_room(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 
         // :room unread [unset|clear]
         ("unread", "unset" | "clear", None) => RoomAction::SetUnread(false).into(),
+
+        _ => return Result::Err(CommandError::InvalidArgument),
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
+fn iamb_room_user(args: Vec<String>, ctx: &mut ProgContext) -> ProgResult {
+    let mut iter = args.into_iter();
+    let field = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let action = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let arg = iter.next();
+    let trailing = iter.collect::<Vec<_>>();
+
+    // Reject if we have any trailing arguments:
+    if !trailing.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let act: IambAction = match (field.as_str(), action.as_str(), arg) {
+        // :room user name set <name>
+        ("name" | "nick", "set", Some(s)) => RoomAction::Set(RoomField::UserName, s).into(),
+        ("name" | "nick", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room user name unset
+        ("name" | "nick", "unset", None) => RoomAction::Unset(RoomField::UserName).into(),
+        ("name" | "nick", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :room user name show
+        ("name" | "nick", "show", None) => RoomAction::Show(RoomField::UserName).into(),
+        ("name" | "nick", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
 
         _ => return Result::Err(CommandError::InvalidArgument),
     };
@@ -860,15 +1149,12 @@ fn iamb_space(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
                 }
             }
 
-            let child = if let Some(child) = raw_child {
-                OwnedRoomId::from_str(&child)
-                    .map_err(|_| CommandError::Error("Invalid room id specified".into()))?
-            } else {
+            let Some(child) = raw_child else {
                 let msg = "Must specify a room to add";
                 return Err(CommandError::Error(msg.into()));
             };
 
-            SpaceAction::SetChild(child, order, suggested).into()
+            SpaceAction::SetChild { child, order, suggested }.into()
         },
         _ => return Result::Err(CommandError::InvalidArgument),
     };
@@ -884,10 +1170,9 @@ fn iamb_upload(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     // Without a path, we upload whatever image the system clipboard is holding.
     let sact = match args.len() {
         0 => SendAction::UploadClipboard,
-        1 => SendAction::Upload(args.remove(0)),
+        1 => SendAction::Upload(args.remove(0), None),
         _ => return Result::Err(CommandError::InvalidArgument),
     };
-
     let iact = IambAction::from(sact);
     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
 
@@ -982,12 +1267,12 @@ const fn opens(description: &'static str, window: IambId) -> CommandForm {
 }
 
 /// A form that takes something after the command name, and opens a window.
-const fn form_opens(
-    args: &'static str,
-    description: &'static str,
-    window: IambId,
-) -> CommandForm {
-    CommandForm { args: Some(args), description, window: Some(window) }
+const fn form_opens(args: &'static str, description: &'static str, window: IambId) -> CommandForm {
+    CommandForm {
+        args: Some(args),
+        description,
+        window: Some(window),
+    }
 }
 
 /// One of iamb's own commands: how it gets registered, and every form the palette should list.
@@ -1022,13 +1307,19 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "chats",
         aliases: &[],
         f: iamb_chats,
-        forms: &[opens("List joined rooms and direct messages together", IambId::ChatList)],
+        forms: &[opens(
+            "List joined rooms and direct messages together",
+            IambId::ChatList,
+        )],
     },
     IambCommandInfo {
         name: "commands",
         aliases: &["palette"],
         f: iamb_commands,
-        forms: &[opens("List iamb's commands and the keys bound to them", IambId::CommandPalette)],
+        forms: &[opens(
+            "List iamb's commands and the keys bound to them",
+            IambId::CommandPalette,
+        )],
     },
     IambCommandInfo {
         name: "create",
@@ -1076,6 +1367,16 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         forms: &[bare("Remove all left rooms from the internal database")],
     },
     IambCommandInfo {
+        name: "follow",
+        aliases: &[],
+        f: iamb_follow,
+        forms: &[
+            bare("Follow the tombstone information to the upgraded room"),
+            form("next", "Follow the tombstone information to the upgraded room"),
+            form("previous", "Follow the room creation information to the pre-upgraded room"),
+        ],
+    },
+    IambCommandInfo {
         name: "invite",
         aliases: &[],
         f: iamb_invite,
@@ -1106,6 +1407,17 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         ],
     },
     IambCommandInfo {
+        name: "knock",
+        aliases: &[],
+        f: iamb_knock,
+        forms: &[
+            form("send <room> [reason]", "Ask to join a room, with an optional reason"),
+            form("accept <user>", "Accept a knock on the focused room"),
+            form("reject <user> [reason]", "Reject a knock on the focused room"),
+            form("ban <user> [reason]", "Reject a knock on the focused room, and ban the user"),
+        ],
+    },
+    IambCommandInfo {
         name: "leave",
         aliases: &[],
         f: iamb_leave,
@@ -1116,6 +1428,15 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         aliases: &[],
         f: iamb_logout,
         forms: &[form("<user id>", "Log out of the current profile")],
+    },
+    IambCommandInfo {
+        name: "mentions",
+        aliases: &[],
+        f: iamb_mentions,
+        forms: &[opens(
+            "List the rooms that mention you",
+            IambId::MentionList,
+        )],
     },
     IambCommandInfo {
         name: "members",
@@ -1136,13 +1457,18 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "react",
         aliases: &[],
         f: iamb_react,
-        forms: &[form("<shortcode>", "React to the selected message with an emoji")],
+        forms: &[form(
+            "<shortcode>",
+            "React to the selected message with an emoji",
+        )],
     },
     IambCommandInfo {
         name: "context",
         aliases: &[],
         f: iamb_context,
-        forms: &[bare("Open the selected message where it lives, and select it there")],
+        forms: &[bare(
+            "Open the selected message where it lives, and select it there",
+        )],
     },
     IambCommandInfo {
         name: "snooze",
@@ -1166,7 +1492,9 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "unsnooze",
         aliases: &[],
         f: iamb_unsnooze,
-        forms: &[bare("Cancel the snooze on the focused room, thread, or selected list entry")],
+        forms: &[bare(
+            "Cancel the snooze on the focused room, thread, or selected list entry",
+        )],
     },
     IambCommandInfo {
         name: "read",
@@ -1217,6 +1545,19 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
             form("name unset", "Unset the name of the focused room"),
             form("dm set", "Mark the focused room as a direct message"),
             form("dm unset", "Mark the focused room as a normal room"),
+            form("unread set", "Mark the focused room as unread"),
+            form("unread unset", "Mark the focused room as read"),
+            form(
+                "access set <rule>",
+                "Set who can join: invite, knock, knock-restricted, public, restricted",
+            ),
+            form("access unset", "Make the room invite-only"),
+            form("access show", "Show who can join the room"),
+            form("history set <mode>", "Set who can read history: invited, joined, shared, world"),
+            form("history unset", "Reset history visibility to joined"),
+            form("history show", "Show who can read the room's history"),
+            form("version show", "Show the Matrix version of the room"),
+            form("version upgrade <version>", "Upgrade the room to a newer Matrix version"),
             form("notify set <level>", "Set the notification level: mute, mentions, keywords, all"),
             form("notify unset", "Clear the room's notification setting"),
             form("notify show", "Show the room's notification setting"),
@@ -1273,19 +1614,44 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "search",
         aliases: &[],
         f: iamb_search,
-        forms: &[form("<term>", "Search every readable room for messages matching a term")],
+        forms: &[form(
+            "<term>",
+            "Search every readable room for messages matching a term",
+        )],
     },
     IambCommandInfo {
         name: "switch",
         aliases: &["switcher"],
         f: iamb_switch,
-        forms: &[opens("Jump to a room, DM, space, or window", IambId::QuickSwitcher)],
+        forms: &[opens(
+            "Jump to a room, DM, space, or window",
+            IambId::QuickSwitcher,
+        )],
     },
     IambCommandInfo {
         name: "threads",
         aliases: &[],
         f: iamb_threads,
-        forms: &[opens("List the threads you follow across all rooms", IambId::ThreadList)],
+        forms: &[opens(
+            "List the threads you follow across all rooms",
+            IambId::ThreadList,
+        )],
+    },
+    IambCommandInfo {
+        name: "self",
+        aliases: &[],
+        f: iamb_self,
+        forms: &[
+            form("avatar show", "Show the avatar URL for your profile"),
+            form("avatar set <mxc://...>", "Set the avatar URL for your profile"),
+            form("avatar unset", "Unset the avatar for your profile"),
+            form("name show", "Show the display name for your profile"),
+            form("name set <nickname>", "Set the display name for your profile"),
+            form("name unset", "Unset the display name for your profile"),
+            form("timezone show", "Show the timezone for your profile"),
+            form("timezone set <tz>", "Set the timezone for your profile"),
+            form("timezone unset", "Unset the timezone for your profile"),
+        ],
     },
     IambCommandInfo {
         name: "unreact",
@@ -1300,7 +1666,9 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         name: "undoread",
         aliases: &[],
         f: iamb_undoread,
-        forms: &[bare("Undo the most recent read, restoring the previous read markers")],
+        forms: &[bare(
+            "Undo the most recent read, restoring the previous read markers",
+        )],
     },
     IambCommandInfo {
         name: "unreads",
@@ -1348,10 +1716,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         f: iamb_upload,
         forms: &[
             form("<path>", "Upload a file to the focused room"),
-            form(
-                "",
-                "Upload the system clipboard's image, captioned with the message bar's text",
-            ),
+            form("", "Upload the system clipboard's image, captioned with the message bar's text"),
         ],
     },
     IambCommandInfo {
@@ -1375,7 +1740,7 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
     },
 ];
 
-fn add_iamb_commands(cmds: &mut ProgramCommands) {
+pub fn add_iamb_commands(cmds: &mut ProgramCommands) {
     for cmd in IAMB_COMMANDS {
         cmds.add_command(ProgramCommand {
             name: cmd.name.into(),
@@ -1397,7 +1762,7 @@ pub fn setup_commands() -> ProgramCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{room_id, user_id};
+    use matrix_sdk::ruma::{owned_room_id, user_id};
     use modalkit::actions::WindowAction;
     use modalkit::editing::context::EditContext;
 
@@ -1452,7 +1817,7 @@ mod tests {
         let ctx = EditContext::default();
 
         let res = cmds.input_cmd(":upload /tmp/pic.png", ctx.clone()).unwrap();
-        let act = IambAction::from(SendAction::Upload("/tmp/pic.png".into()));
+        let act = IambAction::from(SendAction::Upload("/tmp/pic.png".into(), None));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         // No path means the image sitting in the system clipboard.
@@ -1933,16 +2298,20 @@ mod tests {
 
         let cmd = "space child set !roomid:example.org";
         let res = cmds.input_cmd(cmd, ctx.clone()).unwrap();
-        let act = SpaceAction::SetChild(room_id!("!roomid:example.org").to_owned(), None, false);
+        let act = SpaceAction::SetChild {
+            child: "!roomid:example.org".to_owned(),
+            order: None,
+            suggested: false,
+        };
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         let cmd = "space child set ++order=abcd ++suggested !roomid:example.org";
         let res = cmds.input_cmd(cmd, ctx.clone()).unwrap();
-        let act = SpaceAction::SetChild(
-            room_id!("!roomid:example.org").to_owned(),
-            Some("abcd".into()),
-            true,
-        );
+        let act = SpaceAction::SetChild {
+            child: "!roomid:example.org".to_owned(),
+            order: Some("abcd".into()),
+            suggested: true,
+        };
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         let cmd = "space child set ++order=abcd ++order=1234 !roomid:example.org";
@@ -1967,10 +2336,6 @@ mod tests {
         let cmd = "space child ++order=abcd ++suggested set !roomid:example.org";
         let res = cmds.input_cmd(cmd, ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
-
-        let cmd = "space child set foo";
-        let res = cmds.input_cmd(cmd, ctx.clone());
-        assert_eq!(res, Err(CommandError::Error("Invalid room id specified".into())));
 
         let cmd = "space child set";
         let res = cmds.input_cmd(cmd, ctx.clone());
@@ -2173,7 +2538,7 @@ mod tests {
 
         // A real recovery key is base58 in space-separated groups, so the whole line is the key.
         let key = "EsTc 3Zqf 8VkG 9mNb Xq7R 2wYs 5tLp 1dHj 4KvA 6nCe 7fUx 0BgM";
-        let res = cmds.input_cmd(&format!("keys recover {key}"), ctx.clone()).unwrap();
+        let res = cmds.input_cmd(format!("keys recover {key}"), ctx.clone()).unwrap();
         let act = IambAction::Keys(KeysAction::Recover(key.into()));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
@@ -2197,5 +2562,71 @@ mod tests {
 
         let res = cmds.input_cmd("keys import foo bar baz", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_cmd_multiple_trailing() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        // Trailing arguments disallowed on commands that don't take any:
+        let res = cmds.input_cmd("room version show foo", ctx.clone()).unwrap_err();
+        let err = CommandError::InvalidArgument;
+        assert_eq!(res, err);
+
+        // Trailing arguments allowed on commands that take them:
+        let res = cmds.input_cmd("room version upgrade 12", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::Upgrade(RoomVersionId::V12, vec![], false));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds
+            .input_cmd("room version upgrade 12 @foo:example.com", ctx.clone())
+            .unwrap();
+        let act = IambAction::Room(RoomAction::Upgrade(
+            RoomVersionId::V12,
+            vec![user_id!("@foo:example.com").to_owned()],
+            false,
+        ));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds
+            .input_cmd("room version upgrade 12 @foo:example.com @bar:example.com", ctx.clone())
+            .unwrap();
+        let act = IambAction::Room(RoomAction::Upgrade(
+            RoomVersionId::V12,
+            vec![
+                user_id!("@foo:example.com").to_owned(),
+                user_id!("@bar:example.com").to_owned(),
+            ],
+            false,
+        ));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        // But the command must take *some* arguments:
+        let res = cmds.input_cmd("room version upgrade", ctx.clone()).unwrap_err();
+        let err = CommandError::InvalidArgument;
+        assert_eq!(res, err);
+    }
+
+    #[test]
+    fn test_cmd_room_access() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let res = cmds.input_cmd("room access set knock", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::SetAccess(IambJoinRule::Knock));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds
+            .input_cmd("room access set knock-restricted ++members=!abcde:example.org", ctx.clone())
+            .unwrap();
+        let restrictions = vec![owned_room_id!("!abcde:example.org").into()];
+        let act =
+            IambAction::Room(RoomAction::SetAccess(IambJoinRule::KnockRestricted(restrictions)));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd("room access unset", ctx.clone()).unwrap();
+        let act = IambAction::Room(RoomAction::SetAccess(IambJoinRule::Invite));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
     }
 }

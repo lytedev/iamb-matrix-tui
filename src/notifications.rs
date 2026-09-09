@@ -2,23 +2,23 @@ use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use matrix_sdk::{
+    Client,
+    EncryptionState,
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
     notification_settings::{IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode},
     room::Room as MatrixRoom,
     ruma::{
-        events::{
-            room::message::{MessageType, Relation},
-            AnyMessageLikeEventContent,
-            AnySyncTimelineEvent,
-        },
-        serde::Raw,
         MilliSecondsSinceUnixEpoch,
         OwnedEventId,
         OwnedRoomId,
         RoomId,
+        events::{
+            AnyMessageLikeEventContent,
+            AnySyncTimelineEvent,
+            room::message::{MessageType, Relation},
+        },
+        serde::Raw,
     },
-    Client,
-    EncryptionState,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -314,10 +314,9 @@ async fn jump_to_notification(
     store: &AsyncProgramStore,
 ) {
     if let Some(name) = focus_tui {
-        let raised = tokio::task::spawn_blocking(move || {
-            run_focus_tui_helper(FOCUS_TUI_COMMAND, &name)
-        })
-        .await;
+        let raised =
+            tokio::task::spawn_blocking(move || run_focus_tui_helper(FOCUS_TUI_COMMAND, &name))
+                .await;
 
         match raised {
             Ok(Ok(status)) if status.success() => (),
@@ -352,14 +351,14 @@ async fn global_or_room_mode(
 }
 
 fn is_missing_mention(body: &Option<String>, mode: RoomNotificationMode, client: &Client) -> bool {
-    if let Some(body) = body {
-        if mode == RoomNotificationMode::MentionsAndKeywordsOnly {
-            let mentioned = match client.user_id() {
-                Some(user_id) => body.contains(user_id.localpart()),
-                _ => false,
-            };
-            return !mentioned;
-        }
+    if let Some(body) = body &&
+        mode == RoomNotificationMode::MentionsAndKeywordsOnly
+    {
+        let mentioned = match client.user_id() {
+            Some(user_id) => body.contains(user_id.localpart()),
+            _ => false,
+        };
+        return !mentioned;
     }
     false
 }

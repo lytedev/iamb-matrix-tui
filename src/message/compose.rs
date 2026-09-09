@@ -1,25 +1,27 @@
 //! Code for converting composed messages into content to send to the homeserver.
 use comrak::{markdown_to_html, options::Options};
 use nom::{
+    IResult,
+    Parser as _,
     branch::alt,
     bytes::complete::tag,
     character::complete::space0,
     combinator::value,
-    IResult,
-    Parser as _,
 };
 
 use matrix_sdk::ruma::events::{
+    Mentions,
     room::message::{
         EmoteMessageEventContent,
         MessageType,
         RoomMessageEventContent,
         TextMessageEventContent,
     },
-    Mentions,
 };
 
 use super::mention::parse_mentions;
+
+use crate::config::MarkupFormat;
 
 #[derive(Clone, Debug, Default)]
 enum SlashCommand {
@@ -189,6 +191,16 @@ pub const SLASH_COMMANDS: &[SlashCommandDoc] = &[
     },
 ];
 
+impl From<MarkupFormat> for SlashCommand {
+    fn from(markup: MarkupFormat) -> Self {
+        match markup {
+            MarkupFormat::Html => Self::Html,
+            MarkupFormat::Markdown => Self::Markdown,
+            MarkupFormat::Plaintext => Self::Plaintext,
+        }
+    }
+}
+
 fn parse_slash_command_inner(input: &str) -> IResult<&str, SlashCommand> {
     let (input, _) = space0(input)?;
     let (input, slash) = alt((
@@ -262,14 +274,15 @@ pub fn text_to_message_content(input: String) -> TextMessageEventContent {
     }
 }
 
-pub fn text_to_message(input: String) -> RoomMessageEventContent {
-    let (msg, mentions) = parse_slash_command(input.as_str())
-        .and_then(|(input, slash)| slash.to_message(input))
-        .unwrap_or_else(|_| {
-            let mentions = Mentions::with_user_ids(parse_mentions(input.as_str()).user_ids);
+pub fn text_to_message(input: String, default_markup: MarkupFormat) -> RoomMessageEventContent {
+    let (rest, slash) = parse_slash_command(input.as_str())
+        .unwrap_or_else(|_| (&input, SlashCommand::from(default_markup)));
 
-            (MessageType::Text(text_to_message_content(input)), mentions)
-        });
+    let (msg, mentions) = slash.to_message(rest).unwrap_or_else(|_| {
+        let mentions = Mentions::with_user_ids(parse_mentions(input.as_str()).user_ids);
+
+        (MessageType::Text(text_to_message_content(input)), mentions)
+    });
 
     let mut content = RoomMessageEventContent::new(msg);
 
@@ -278,6 +291,30 @@ pub fn text_to_message(input: String) -> RoomMessageEventContent {
     }
 
     content
+}
+
+/// Returns `None` if `input` contains a non-text slash command.
+pub fn text_to_text_message_event_content(
+    input: String,
+    default_markup: MarkupFormat,
+) -> Option<TextMessageEventContent> {
+    let (body, cmd) = parse_slash_command(&input)
+        .unwrap_or_else(|_| (&input, SlashCommand::from(default_markup)));
+
+    let content = match cmd {
+        SlashCommand::Html => TextMessageEventContent::html(body, body),
+        SlashCommand::Plaintext => TextMessageEventContent::plain(body),
+        SlashCommand::Markdown => {
+            if let Some(html) = text_to_html(body) {
+                TextMessageEventContent::html(body, html)
+            } else {
+                TextMessageEventContent::plain(body)
+            }
+        },
+        _ => return None,
+    };
+
+    Some(content)
 }
 
 #[cfg(test)]
@@ -420,58 +457,67 @@ pub mod tests {
 
     #[test]
     fn text_to_message_slash_commands() {
-        let MessageType::Text(content) = text_to_message("/html <b>bold</b>".into()).msgtype else {
+        let MessageType::Text(content) =
+            text_to_message("/html <b>bold</b>".into(), Default::default()).msgtype
+        else {
             panic!("Expected MessageType::Text");
         };
         assert_eq!(content.body, "<b>bold</b>");
         assert_eq!(content.formatted.unwrap().body, "<b>bold</b>");
 
-        let MessageType::Text(content) = text_to_message("/h <b>bold</b>".into()).msgtype else {
+        let MessageType::Text(content) =
+            text_to_message("/h <b>bold</b>".into(), Default::default()).msgtype
+        else {
             panic!("Expected MessageType::Text");
         };
         assert_eq!(content.body, "<b>bold</b>");
         assert_eq!(content.formatted.unwrap().body, "<b>bold</b>");
 
-        let MessageType::Text(content) = text_to_message("/plain <b>bold</b>".into()).msgtype
+        let MessageType::Text(content) =
+            text_to_message("/plain <b>bold</b>".into(), Default::default()).msgtype
         else {
             panic!("Expected MessageType::Text");
         };
         assert_eq!(content.body, "<b>bold</b>");
         assert!(content.formatted.is_none(), "{:?}", content.formatted);
 
-        let MessageType::Text(content) = text_to_message("/p <b>bold</b>".into()).msgtype else {
+        let MessageType::Text(content) =
+            text_to_message("/p <b>bold</b>".into(), Default::default()).msgtype
+        else {
             panic!("Expected MessageType::Text");
         };
         assert_eq!(content.body, "<b>bold</b>");
         assert!(content.formatted.is_none(), "{:?}", content.formatted);
 
-        let MessageType::Emote(content) = text_to_message("/me *bold*".into()).msgtype else {
+        let MessageType::Emote(content) =
+            text_to_message("/me *bold*".into(), Default::default()).msgtype
+        else {
             panic!("Expected MessageType::Emote");
         };
         assert_eq!(content.body, "*bold*");
         assert_eq!(content.formatted.unwrap().body, "<p><em>bold</em></p>\n");
 
-        let content = text_to_message("/confetti hello".into()).msgtype;
+        let content = text_to_message("/confetti hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "nic.custom.confetti");
         assert_eq!(content.body(), "hello");
 
-        let content = text_to_message("/fireworks hello".into()).msgtype;
+        let content = text_to_message("/fireworks hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "nic.custom.fireworks");
         assert_eq!(content.body(), "hello");
 
-        let content = text_to_message("/hearts hello".into()).msgtype;
+        let content = text_to_message("/hearts hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effect.hearts");
         assert_eq!(content.body(), "hello");
 
-        let content = text_to_message("/rainfall hello".into()).msgtype;
+        let content = text_to_message("/rainfall hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effect.rainfall");
         assert_eq!(content.body(), "hello");
 
-        let content = text_to_message("/snowfall hello".into()).msgtype;
+        let content = text_to_message("/snowfall hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effect.snowfall");
         assert_eq!(content.body(), "hello");
 
-        let content = text_to_message("/spaceinvaders hello".into()).msgtype;
+        let content = text_to_message("/spaceinvaders hello".into(), Default::default()).msgtype;
         assert_eq!(content.msgtype(), "io.element.effects.space_invaders");
         assert_eq!(content.body(), "hello");
     }
@@ -479,7 +525,7 @@ pub mod tests {
     #[test]
     fn test_mention_becomes_a_pill() {
         let input = "hi [Ada](https://matrix.to/#/@ada:example.com), how goes it?";
-        let content = text_to_message(input.into());
+        let content = text_to_message(input.into(), Default::default());
 
         let MessageType::Text(msg) = &content.msgtype else {
             panic!("Expected MessageType::Text");
@@ -504,7 +550,7 @@ pub mod tests {
     #[test]
     fn test_mention_in_an_emote() {
         let input = "/me waves at [Ada](https://matrix.to/#/@ada:example.com)";
-        let content = text_to_message(input.into());
+        let content = text_to_message(input.into(), Default::default());
 
         let MessageType::Emote(msg) = &content.msgtype else {
             panic!("Expected MessageType::Emote");
@@ -520,10 +566,17 @@ pub mod tests {
 
     #[test]
     fn test_no_mentions_field_without_mentions() {
-        assert!(text_to_message("just talking".into()).mentions.is_none());
+        assert!(
+            text_to_message("just talking".into(), Default::default())
+                .mentions
+                .is_none()
+        );
 
         // Sending text verbatim means sending it verbatim, mention syntax included.
-        let content = text_to_message("/p [Ada](https://matrix.to/#/@ada:example.com)".into());
+        let content = text_to_message(
+            "/p [Ada](https://matrix.to/#/@ada:example.com)".into(),
+            Default::default(),
+        );
         assert_eq!(content.msgtype.body(), "[Ada](https://matrix.to/#/@ada:example.com)");
         assert!(content.mentions.is_none());
     }
@@ -541,5 +594,40 @@ pub mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn text_to_message_slash_default() {
+        let MessageType::Text(content) =
+            text_to_message("*hello*".into(), MarkupFormat::Html).msgtype
+        else {
+            panic!("Expected MessageType::Text");
+        };
+        assert_eq!(content.body, "*hello*");
+        assert_eq!(content.formatted.unwrap().body, "*hello*");
+
+        let MessageType::Text(content) =
+            text_to_message("/markdown *hello*".into(), MarkupFormat::Html).msgtype
+        else {
+            panic!("Expected MessageType::Text");
+        };
+        assert_eq!(content.body, "*hello*");
+        assert_eq!(content.formatted.unwrap().body, "<p><em>hello</em></p>\n");
+
+        let MessageType::Text(content) =
+            text_to_message("<b>hello</b>".into(), MarkupFormat::Plaintext).msgtype
+        else {
+            panic!("Expected MessageType::Text");
+        };
+        assert_eq!(content.body, "<b>hello</b>");
+        assert!(content.formatted.is_none(), "{:?}", content.formatted);
+
+        let MessageType::Text(content) =
+            text_to_message("/html <b>hello</b>".into(), MarkupFormat::Plaintext).msgtype
+        else {
+            panic!("Expected MessageType::Text");
+        };
+        assert_eq!(content.body, "<b>hello</b>");
+        assert_eq!(content.formatted.unwrap().body, "<b>hello</b>");
     }
 }

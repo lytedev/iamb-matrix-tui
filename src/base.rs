@@ -3,47 +3,61 @@
 //! The types defined here get used throughout iamb.
 use std::borrow::Cow;
 use std::collections::hash_map::{Entry, IntoIter};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::hash::Hash;
 use std::ops::Bound;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use matrix_sdk::ruma::events::receipt::ReceiptThread;
-use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::events::sticker::StickerEvent;
+use matrix_sdk::Client;
+use matrix_sdk::encryption::verification::VerificationRequest;
+use matrix_sdk::ruma::room::{AllowRule, Restricted};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use ratatui_image::picker::{Picker, ProtocolType};
 use serde::{
-    de::Error as SerdeError,
-    de::Visitor,
     Deserialize,
     Deserializer,
     Serialize,
     Serializer,
+    de::Error as SerdeError,
+    de::Visitor,
 };
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use url::Url;
 
 use matrix_sdk::{
-    encryption::verification::SasVerification,
+    RoomState as MatrixRoomState,
     room::Room as MatrixRoom,
     ruma::{
+        EventId,
+        OwnedEventId,
+        OwnedMxcUri,
+        OwnedRoomAliasId,
+        OwnedRoomId,
+        OwnedRoomOrAliasId,
+        OwnedTransactionId,
+        OwnedUserId,
+        RoomId,
+        RoomVersionId,
+        UserId,
         events::{
+            AnySyncStateEvent,
+            MessageLikeEvent,
+            OriginalMessageLikeEvent,
             reaction::ReactionEvent,
+            receipt::ReceiptThread,
             relation::{Replacement, Thread},
+            room::MediaSource,
             room::encrypted::RoomEncryptedEvent,
-            room::member::MembershipState,
             room::message::{
+                MessageType,
                 OriginalRoomMessageEvent,
                 Relation,
                 RoomMessageEvent,
@@ -51,19 +65,13 @@ use matrix_sdk::{
                 RoomMessageEventContentWithoutRelation,
             },
             room::redaction::{OriginalSyncRoomRedactionEvent, SyncRoomRedactionEvent},
+            sticker::{StickerEvent, StickerEventContent},
             tag::{TagName, Tags},
-            AnySyncStateEvent,
-            MessageLikeEvent,
         },
         presence::PresenceState,
-        EventId,
-        OwnedEventId,
-        OwnedRoomId,
-        OwnedUserId,
-        RoomId,
-        UserId,
+        profile::{ProfileFieldName, ProfileFieldValue},
+        room::JoinRule,
     },
-    RoomState as MatrixRoomState,
 };
 
 use modalkit::{
@@ -77,35 +85,30 @@ use modalkit::{
             ApplicationStore,
             ApplicationWindowId,
         },
-        completion::{complete_path, Completer, CompletionMap},
+        completion::CompletionMap,
         context::EditContext,
-        cursor::Cursor,
-        rope::EditRope,
         store::Store,
     },
     env::vim::{
-        command::{CommandContext, CommandDescription, VimCommand, VimCommandMachine},
+        command::{CommandContext, VimCommand, VimCommandMachine},
         keybindings::VimMachine,
     },
     errors::{UIError, UIResult},
     key::TerminalKey,
     keybindings::SequenceStatus,
-    prelude::{CommandType, WordStyle},
+    prelude::{CommandType, MoveDir1D, WordStyle},
 };
 
-use crate::config::ImagePreviewProtocolValues;
-use crate::message::emoji::{complete_emoji_names, complete_emojis, EMOJI_SIGIL};
-use crate::message::mention::{complete_mentions, MentionCandidate, MENTION_SIGIL};
-use crate::notifications::NotificationHandle;
-use matrix_sdk::ruma::UInt;
+use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, UInt};
 
 use crate::backfill::Backfill;
-use crate::snooze::{parse_when, SnoozeKey, SnoozeStore, WakeTime};
-use crate::preview::{source_from_event, PreviewManager};
+use crate::snooze::{SnoozeStore, WakeTime, parse_when};
 use crate::{
+    config::ApplicationSettings,
     message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages},
+    notifications::NotificationHandle,
+    preview::{PreviewKind, PreviewManager},
     worker::Requester,
-    ApplicationSettings,
 };
 
 /// The set of characters used in different Matrix IDs.
@@ -143,6 +146,9 @@ pub enum VerifyAction {
 
     /// Reject an in-progress verification due to mismatched Emoji.
     Mismatch,
+
+    /// Start an interactive (SAS) emoji verification
+    Emoji,
 }
 
 /// An action taken against the currently selected message.
@@ -200,10 +206,14 @@ pub enum MessageAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SpaceAction {
     /// Add a room or update metadata.
-    ///
-    /// The [`Option<String>`] argument is the order parameter.
-    /// The [`bool`] argument indicates whether the room is suggested.
-    SetChild(OwnedRoomId, Option<String>, bool),
+    SetChild {
+        /// The room ID, alias, or a user whose DM room should be added to the space.
+        child: String,
+        /// The order parameter to use when sorting children in the space.
+        order: Option<String>,
+        /// Whether the room is suggested.
+        suggested: bool,
+    },
 
     /// Remove the selected room.
     RemoveChild,
@@ -267,6 +277,13 @@ pub enum SortFieldRoom {
     /// Sort rooms by their Matrix room identifier.
     RoomId,
 
+    /// Sort rooms by the server portion of their canonical room alias.
+    ///
+    /// If the room has no canonical alias, and the room identifier uses the version 1 syntax
+    /// for formatting the MXID, then this will fall back to using the server portion of the
+    /// identifier (aka, the "namespace").
+    Server,
+
     /// Sort rooms by whether they have unread messages.
     Unread,
 
@@ -284,6 +301,8 @@ pub enum SortFieldUser {
     UserId,
     LocalPart,
     Server,
+    Knock,
+    Invite,
 }
 
 /// Whether to use the default sort direction for a field, or to reverse it.
@@ -339,6 +358,7 @@ impl Visitor<'_> for SortRoomVisitor {
             "name" => SortFieldRoom::Name,
             "alias" => SortFieldRoom::Alias,
             "id" => SortFieldRoom::RoomId,
+            "server" => SortFieldRoom::Server,
             "invite" => SortFieldRoom::Invite,
             _ => {
                 let msg = format!("Unknown sort field: {value:?}");
@@ -389,6 +409,8 @@ impl Visitor<'_> for SortUserVisitor {
             "localpart" => SortFieldUser::LocalPart,
             "server" => SortFieldUser::Server,
             "power" => SortFieldUser::PowerLevel,
+            "knock" => SortFieldUser::Knock,
+            "invite" => SortFieldUser::Invite,
             _ => {
                 let msg = format!("Unknown sort field: {value:?}");
                 return Err(E::custom(msg));
@@ -402,11 +424,17 @@ impl Visitor<'_> for SortUserVisitor {
 /// A room property.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoomField {
+    /// The room's join rules, aka who can access this room.
+    Access,
+
     /// The room's history visibility.
     History,
 
     /// The room name.
     Name,
+
+    /// The room version.
+    Version,
 
     /// The room id.
     Id,
@@ -428,6 +456,9 @@ pub enum RoomField {
 
     /// The room's canonical alias.
     CanonicalAlias,
+
+    /// The users own display name.
+    UserName,
 }
 
 /// An action that operates on a room member.
@@ -448,9 +479,58 @@ impl Display for MemberUpdateAction {
     }
 }
 
+/// An internal version of [`JoinRule`]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IambJoinRule {
+    Public,
+    Restricted(Vec<OwnedRoomOrAliasId>),
+    Knock,
+    KnockRestricted(Vec<OwnedRoomOrAliasId>),
+    Invite,
+}
+
+impl IambJoinRule {
+    pub async fn into_join_rule(self, client: &Client) -> Result<JoinRule, IambError> {
+        async fn resolve_aliases(
+            rooms: Vec<OwnedRoomOrAliasId>,
+            client: &Client,
+        ) -> Result<Restricted, IambError> {
+            let mut allow = vec![];
+            for room in rooms {
+                let alias = match OwnedRoomId::try_from(room) {
+                    Ok(room_id) => {
+                        allow.push(AllowRule::room_membership(room_id));
+                        continue;
+                    },
+                    Err(alias) => alias,
+                };
+
+                let resp = client.resolve_room_alias(&alias).await?;
+
+                allow.push(AllowRule::room_membership(resp.room_id));
+            }
+
+            Ok(Restricted::new(allow))
+        }
+
+        Ok(match self {
+            Self::Public => JoinRule::Public,
+            Self::Invite => JoinRule::Invite,
+            Self::Knock => JoinRule::Knock,
+            Self::Restricted(rooms) => JoinRule::Restricted(resolve_aliases(rooms, client).await?),
+            Self::KnockRestricted(rooms) => {
+                JoinRule::KnockRestricted(resolve_aliases(rooms, client).await?)
+            },
+        })
+    }
+}
+
 /// An action that operates on a focused room.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoomAction {
+    /// Follow the room upgrade information.
+    Follow(Box<CommandContext>, MoveDir1D),
+
     /// Accept an invitation to join this room.
     InviteAccept,
 
@@ -466,6 +546,16 @@ pub enum RoomAction {
 
     /// Invite a user to this room.
     InviteSend(OwnedUserId),
+
+    /// Accept a knock from someone who wants to join this room.
+    KnockAccept(OwnedUserId),
+
+    /// Reject a knock from someone who wants to join this room.
+    KnockReject(OwnedUserId, Option<String>),
+
+    /// Reject a knock from someone who wants to join this room and ban them
+    /// to prevent them from being able to try knocking again.
+    KnockBan(OwnedUserId, Option<String>),
 
     /// Leave this room.
     Leave(bool),
@@ -518,11 +608,17 @@ pub enum RoomAction {
     /// Set whether a room is a direct message.
     SetDirect(bool),
 
+    /// Set the join rules for a room to control who can access it and how.
+    SetAccess(IambJoinRule),
+
     /// Set a room property.
     Set(RoomField, String),
 
     /// Unset a room property.
     Unset(RoomField),
+
+    /// Upgrade the version of a room.
+    Upgrade(RoomVersionId, Vec<OwnedUserId>, bool),
 
     /// List the values in a list room property.
     Show(RoomField),
@@ -541,10 +637,16 @@ pub enum SendAction {
     SubmitFromEditor,
 
     /// Upload a file.
-    Upload(String),
+    ///
+    /// The second argument indicates whether to use the messagebar as a caption, don't use it or
+    /// ask the user.
+    Upload(String, Option<bool>),
 
     /// Upload the image data.
-    UploadImage(usize, usize, Cow<'static, [u8]>),
+    /// Upload the image data.
+    ///
+    /// The [`bool`] arguments indicates whether to use the messagebar as a caption.
+    UploadImage(usize, usize, Cow<'static, [u8]>, bool),
 
     /// Upload the image currently held in the system clipboard.
     UploadClipboard,
@@ -555,9 +657,24 @@ pub enum SendAction {
 pub enum HomeserverAction {
     /// Create a new room with an optional localpart.
     CreateRoom(Option<String>, CreateRoomType, CreateRoomFlags),
+
+    /// "Knock" on a room, aka "request to join".
+    KnockSend(OwnedRoomOrAliasId, Option<String>),
+
+    /// Logout the current iamb session on the homeserver.
     Logout(String, bool),
+
     /// Forget all left rooms
     Forget,
+
+    /// Set a profile field.
+    ProfileFieldSet(ProfileFieldValue),
+
+    /// Set a profile field.
+    ProfileFieldUnset(ProfileFieldName),
+
+    /// Set a profile field.
+    ProfileFieldShow(ProfileFieldName),
 }
 
 /// What `:reindex` was asked to do.
@@ -792,7 +909,9 @@ pub type IambResult<T> = UIResult<T, IambInfo>;
 ///
 /// The event identifier used as a key here is the ID for the reaction, and not for the message
 /// it's reacting to.
-pub type MessageReactions = HashMap<OwnedEventId, (String, OwnedUserId)>;
+pub type MessageReactions = HashMap<OwnedEventId, (String, OwnedUserId, Option<MediaSource>)>;
+
+pub type MessageEdits = BTreeMap<MessageKey, RoomMessageEventContentWithoutRelation>;
 
 /// Errors encountered during application use.
 #[derive(thiserror::Error, Debug)]
@@ -855,6 +974,10 @@ pub enum IambError {
     /// A failure from the Matrix client.
     #[error("Matrix client error: {0}")]
     Matrix(#[from] matrix_sdk::Error),
+
+    /// A failure when sending a message.
+    #[error("Send queue error: {0}")]
+    SendQueue(#[from] matrix_sdk::send_queue::RoomSendQueueError),
 
     /// A failure in the sled storage.
     #[error("Matrix client storage error: {0}")]
@@ -959,6 +1082,10 @@ pub enum IambError {
     /// A failure while trying to show an image preview.
     #[error("Preview error: {0}")]
     Preview(String),
+
+    /// A generic error that doesn't need a specific error type.
+    #[error("{0}")]
+    Custom(String),
 }
 
 impl From<IambError> for UIError<IambInfo> {
@@ -984,6 +1111,7 @@ pub enum RoomFetchStatus {
 }
 
 /// Indicates where an [EventId] lives in the [ChatStore].
+#[derive(Clone)]
 pub enum EventLocation {
     /// The [EventId] belongs to a message.
     ///
@@ -997,33 +1125,73 @@ pub enum EventLocation {
     /// The [EventId] belongs to a state event in the main timeline of the room.
     State(MessageKey),
 
-    /// The [EventId] belongs to a sticker event in the main scrollback
-    Sticker(MessageKey),
+    /// The [EventId] belongs to an edit for the given event and has key [MessageKey].
+    Edit(OwnedEventId, MessageKey),
 }
 
 impl EventLocation {
     fn to_message_key(&self) -> Option<&MessageKey> {
         match self {
             EventLocation::Message(_, key) => Some(key),
-            EventLocation::Sticker(key) => Some(key),
+            _ => None,
+        }
+    }
+    fn to_thread_root(&self) -> Option<&EventId> {
+        match self {
+            EventLocation::Message(root, _) => root.as_deref(),
             _ => None,
         }
     }
 }
 
+/// Indicates where a local echo lives in the [`ChatStore`].
+#[derive(Debug, Clone)]
+pub enum EchoLocation {
+    /// The [`OwnedTransactionId`] belongs to a message.
+    ///
+    /// If the first argument is [`None`], then it's part of the main scrollback. When [`Some`], it
+    /// specifies which thread it's in reply to.
+    Message(Option<OwnedEventId>, MessageKey),
+
+    /// The local echo has been replaced by an event with this event id.
+    Replaced(OwnedEventId),
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnreadInfo {
-    pub(crate) unread: bool,
+    pub(crate) unread_mark: bool,
+    pub(crate) unread_messages: u64,
+    pub(crate) unread_notifications: u64,
+    pub(crate) unread_mentions: u64,
     pub(crate) latest: Option<MessageTimeStamp>,
 }
 
 impl UnreadInfo {
     pub fn is_unread(&self) -> bool {
-        self.unread
+        self.unread_mark || self.unread_notifications > 0 || self.unread_mentions > 0
+    }
+
+    pub fn has_mention(&self) -> bool {
+        self.unread_mentions > 0
     }
 
     pub fn latest(&self) -> Option<&MessageTimeStamp> {
         self.latest.as_ref()
+    }
+
+    /// An entry whose unread state is worked out from read receipts rather than from the counts
+    /// that the server keeps.
+    ///
+    /// A thread has no server-side counts of its own, so a threaded receipt compared against the
+    /// newest reply is the only thing that can answer for one.
+    pub(crate) fn from_receipt(unread: bool, latest: Option<MessageTimeStamp>) -> Self {
+        UnreadInfo {
+            unread_mark: unread,
+            unread_messages: u64::from(unread),
+            unread_notifications: 0,
+            unread_mentions: 0,
+            latest,
+        }
     }
 
     /// Give this entry a wake time in place of its newest message time.
@@ -1043,7 +1211,7 @@ impl UnreadInfo {
             return self;
         };
 
-        let wake = MessageTimeStamp::OriginServer(wake_at);
+        let wake = MessageTimeStamp(MilliSecondsSinceUnixEpoch(wake_at));
 
         self.latest = match self.latest {
             Some(latest) if latest > wake => Some(latest),
@@ -1171,6 +1339,7 @@ pub struct RoomInfo {
 
     /// A map of event IDs to where they are stored in this struct.
     pub keys: HashMap<OwnedEventId, EventLocation>,
+    pub echo_keys: HashMap<OwnedTransactionId, EchoLocation>,
 
     /// The messages loaded for this room.
     messages: Messages,
@@ -1185,16 +1354,11 @@ pub struct RoomInfo {
     pub user_receipts: HashMap<ReceiptThread, HashMap<OwnedUserId, OwnedEventId>>,
     /// A map of message identifiers to a map of reaction events.
     pub reactions: HashMap<OwnedEventId, MessageReactions>,
+    /// A map of message identifiers to a list of edit events for message that are not yet cached.
+    pub unloaded_edits: HashMap<OwnedEventId, MessageEdits>,
 
     /// A map of message identifiers to thread replies.
     threads: HashMap<OwnedEventId, Messages>,
-
-    /// Edits whose target message is not loaded yet, kept by the identifier of that target.
-    ///
-    /// Backwards pagination gives the newest event first, so an edit usually arrives before the
-    /// message that it edits. Without this map the edit has nothing to apply to, and the room
-    /// keeps the message as the sender first wrote it.
-    pending_edits: HashMap<OwnedEventId, RoomMessageEventContentWithoutRelation>,
 
     /// Whether the scrollback for this room is currently being fetched.
     pub fetching: bool,
@@ -1223,34 +1387,46 @@ impl Default for RoomInfo {
             name: Default::default(),
             tags: Default::default(),
             keys: Default::default(),
+            echo_keys: Default::default(),
             event_receipts: Default::default(),
             user_receipts: Default::default(),
             reactions: Default::default(),
             threads: Default::default(),
-            pending_edits: Default::default(),
             fetching: Default::default(),
             fetch_id: Default::default(),
             fetch_last: Default::default(),
             users_typing: Default::default(),
             display_names: Default::default(),
             draw_last: Default::default(),
+            unloaded_edits: Default::default(),
         }
     }
 }
 
-/// The new content of the most recent edit, as the server bundles it onto the message it edits.
+/// The most recent edit, as the server bundles it onto the message it edits.
 ///
 /// The server sends this aggregation with every copy of the message, so a message that iamb loads
-/// again keeps its edit even when the `m.replace` event is not in the same chunk.
-fn bundled_replacement(msg: &RoomMessageEvent) -> Option<RoomMessageEventContentWithoutRelation> {
+/// again keeps its edit even when the `m.replace` event is not in the same chunk, and even when
+/// the edit arrived in an earlier session that [RoomInfo::unloaded_edits] no longer remembers.
+fn bundled_replacement(
+    msg: &RoomMessageEvent,
+) -> Option<(MessageKey, RoomMessageEventContentWithoutRelation)> {
     let RoomMessageEvent::Original(ev) = msg else {
         return None;
     };
 
-    match &ev.unsigned.relations.replace.as_ref()?.content.relates_to {
-        Some(Relation::Replacement(repl)) => Some(repl.new_content.clone()),
-        _ => None,
-    }
+    let replace = ev.unsigned.relations.replace.as_ref()?;
+
+    let Some(Relation::Replacement(repl)) = &replace.content.relates_to else {
+        return None;
+    };
+
+    let key = MessageKey {
+        ts: replace.origin_server_ts.into(),
+        id: replace.event_id.clone().into(),
+    };
+
+    Some((key, repl.new_content.clone()))
 }
 
 impl RoomInfo {
@@ -1364,10 +1540,8 @@ impl RoomInfo {
         .max();
 
         match (last_message, last_receipt) {
-            (Some((ts, _)), Some((read_ts, _))) => {
-                UnreadInfo { unread: ts > read_ts, latest: Some(*ts) }
-            },
-            (Some((ts, _)), None) => UnreadInfo { unread: true, latest: Some(*ts) },
+            (Some(key), Some(read)) => UnreadInfo::from_receipt(key > read, Some(key.ts)),
+            (Some(key), None) => UnreadInfo::from_receipt(true, Some(key.ts)),
             (None, _) => UnreadInfo::default(),
         }
     }
@@ -1380,15 +1554,15 @@ impl RoomInfo {
         let event_id = self.user_receipts.get(thread)?.get(user_id)?;
 
         match self.keys.get(event_id)? {
-            EventLocation::Message(_, key) |
-            EventLocation::State(key) |
-            EventLocation::Sticker(key) => Some(key),
-            EventLocation::Reaction(_) => None,
+            EventLocation::Message(_, key) | EventLocation::State(key) => Some(key),
+            EventLocation::Reaction(_) | EventLocation::Edit(..) => None,
         }
     }
 
     /// Get the event for the last message in a thread (or the thread root if there are no
     /// in-thread replies yet).
+    ///
+    /// This does not apply edits to the returned event.
     ///
     /// This returns `None` if the event identifier isn't in the room.
     pub fn get_thread_last<'a>(
@@ -1406,7 +1580,7 @@ impl RoomInfo {
             return None;
         };
 
-        if let MessageEvent::Original(ev) = &msg {
+        if let MessageEvent::Original(ev, _) = &msg {
             Some(ev)
         } else {
             None
@@ -1414,27 +1588,38 @@ impl RoomInfo {
     }
 
     /// Get the reactions and their counts for a message.
-    pub fn get_reactions(&self, event_id: &EventId) -> Vec<(&str, usize)> {
+    pub fn get_reactions(&self, event_id: &EventId) -> Vec<(&str, usize, &Option<MediaSource>)> {
         if let Some(reacts) = self.reactions.get(event_id) {
             let mut counts = HashMap::new();
 
             let mut seen_user_reactions = BTreeSet::new();
 
-            for (key, user) in reacts.values() {
+            for (key, user, source) in reacts.values() {
                 if !seen_user_reactions.contains(&(key, user)) {
                     seen_user_reactions.insert((key, user));
-                    let count = counts.entry(key.as_str()).or_default();
-                    *count += 1;
+                    let count = counts.entry(key.as_str()).or_insert((0, source));
+                    count.0 += 1;
                 }
             }
 
-            let mut reactions = counts.into_iter().collect::<Vec<_>>();
-            reactions.sort();
+            let mut reactions = counts
+                .into_iter()
+                .map(|(key, (count, source))| (key, count, source))
+                .collect::<Vec<_>>();
+            reactions.sort_by_key(|item| (item.0, item.1));
 
             reactions
         } else {
             vec![]
         }
+    }
+
+    pub fn get_reaction_images(&self, event_id: &EventId) -> impl Iterator<Item = &MediaSource> {
+        self.reactions
+            .get(event_id)
+            .map(HashMap::iter)
+            .unwrap_or_default()
+            .filter_map(|(_, (_, _, source))| source.as_ref())
     }
 
     /// Map an event identifier to its [MessageKey].
@@ -1448,26 +1633,24 @@ impl RoomInfo {
     /// main scrollback alone does not find it. Edits and redactions are applied to the copy in
     /// the thread, and a lookup that misses it gives the caller stale or missing content.
     pub fn get_event(&self, event_id: &EventId) -> Option<&Message> {
-        match self.keys.get(event_id)? {
-            EventLocation::Message(Some(thread), key) => self.threads.get(thread)?.get(key),
-            loc => self.messages.get(loc.to_message_key()?),
-        }
+        let loc = self.keys.get(event_id)?;
+
+        let key = loc.to_message_key()?;
+        let root = loc.to_thread_root();
+
+        self.get_thread(root)?.get(key)
     }
 
     /// Get an event for an identifier as mutable.
     ///
     /// This searches the threads as well, for the reason given on [RoomInfo::get_event].
     pub fn get_event_mut(&mut self, event_id: &EventId) -> Option<&mut Message> {
-        match self.keys.get(event_id)? {
-            EventLocation::Message(Some(thread), key) => {
-                let (thread, key) = (thread.clone(), key.clone());
-                self.threads.get_mut(&thread)?.get_mut(&key)
-            },
-            loc => {
-                let key = loc.to_message_key()?.clone();
-                self.messages.get_mut(&key)
-            },
-        }
+        let loc = self.keys.get(event_id)?.clone();
+
+        let key = loc.to_message_key()?;
+        let root = loc.to_thread_root();
+
+        self.get_thread_mut(root.map(ToOwned::to_owned)).get_mut(key)
     }
 
     pub fn redact(&mut self, ev: OriginalSyncRoomRedactionEvent) {
@@ -1477,6 +1660,24 @@ impl RoomInfo {
 
         match self.keys.get(redacts) {
             None => return,
+            Some(EventLocation::Edit(msg_event_id, edit_key)) => {
+                let edit_key = edit_key.clone();
+                let msg_loc = self.keys.get(msg_event_id).cloned();
+                if let Some(EventLocation::Message(thread, msg_key)) = msg_loc {
+                    if let Some(msg) = self.get_thread_mut(thread).get_mut(&msg_key) {
+                        msg.remove_edit(&edit_key);
+                    }
+                } else {
+                    self.unloaded_edits
+                        .get_mut(msg_event_id)
+                        .and_then(|edits| edits.remove(&edit_key));
+                }
+
+                if let Some(msg) = self.messages.get_mut(&edit_key) {
+                    let ev = SyncRoomRedactionEvent::Original(ev);
+                    msg.redact(ev);
+                }
+            },
             Some(EventLocation::State(key)) => {
                 if let Some(msg) = self.messages.get_mut(key) {
                     let ev = SyncRoomRedactionEvent::Original(ev);
@@ -1490,11 +1691,11 @@ impl RoomInfo {
                 }
             },
             Some(EventLocation::Message(Some(root), key)) => {
-                if let Some(thread) = self.threads.get_mut(root) {
-                    if let Some(msg) = thread.get_mut(key) {
-                        let ev = SyncRoomRedactionEvent::Original(ev);
-                        msg.redact(ev);
-                    }
+                if let Some(thread) = self.threads.get_mut(root) &&
+                    let Some(msg) = thread.get_mut(key)
+                {
+                    let ev = SyncRoomRedactionEvent::Original(ev);
+                    msg.redact(ev);
                 }
             },
             Some(EventLocation::Reaction(event_id)) => {
@@ -1504,119 +1705,134 @@ impl RoomInfo {
 
                 self.keys.remove(redacts);
             },
-            Some(EventLocation::Sticker(key)) => {
-                if let Some(msg) = self.messages.get_mut(key) {
-                    let ev = SyncRoomRedactionEvent::Original(ev);
-                    msg.redact(ev);
-                }
-            },
         }
     }
 
     /// Insert a reaction to a message.
-    pub fn insert_reaction(&mut self, react: ReactionEvent) {
-        match react {
-            MessageLikeEvent::Original(react) => {
-                let rel_id = react.content.relates_to.event_id;
-                let key = react.content.relates_to.key;
+    fn insert_reaction(&mut self, react: ReactionEvent, source: Option<MediaSource>) {
+        let MessageLikeEvent::Original(react) = react else {
+            return;
+        };
+        let rel_id = react.content.relates_to.event_id;
+        let key = react.content.relates_to.key;
 
-                let message = self.reactions.entry(rel_id.clone()).or_default();
-                let event_id = react.event_id;
-                let user_id = react.sender;
+        let message = self.reactions.entry(rel_id.clone()).or_default();
+        let event_id = react.event_id;
+        let user_id = react.sender;
 
-                message.insert(event_id.clone(), (key, user_id));
+        message.insert(event_id.clone(), (key, user_id, source));
 
-                let loc = EventLocation::Reaction(rel_id);
-                self.keys.insert(event_id, loc);
-            },
-            MessageLikeEvent::Redacted(_) => {
-                return;
-            },
-        }
+        let loc = EventLocation::Reaction(rel_id);
+        self.keys.insert(event_id, loc);
     }
 
     /// Insert a sticker
-    pub fn insert_sticker(
+    pub fn insert_sticker_with_preview(
         &mut self,
         sticker: StickerEvent,
         settings: &ApplicationSettings,
         previews: &mut PreviewManager,
         worker: &Requester,
     ) {
-        match sticker {
-            MessageLikeEvent::Original(ref sticker_content) => {
-                let key =
-                    (sticker_content.origin_server_ts.into(), sticker_content.event_id.clone());
+        let event_id = sticker.event_id().to_owned();
+        let key = MessageKey {
+            ts: sticker.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
-                let loc = EventLocation::Sticker(key.clone());
+        let thread_root = match &sticker {
+            MessageLikeEvent::Original(OriginalMessageLikeEvent {
+                content:
+                    StickerEventContent {
+                        relates_to: Some(Relation::Thread(Thread { event_id, .. })),
+                        ..
+                    },
+                ..
+            }) => Some(event_id.to_owned()),
+            _ => None,
+        };
 
-                self.keys.insert(sticker_content.event_id.clone(), loc);
-                self.messages.insert_message(key.clone(), sticker.clone());
-
-                if let (Some(msg), Some(image_preview)) = (
-                    self.get_event_mut(&sticker_content.event_id),
-                    &settings.tunables.image_preview,
-                ) {
-                    let source: MediaSource = sticker_content.content.source.clone().into();
-                    msg.image_preview = Some(source.clone());
-                    previews.register_preview(settings, source, image_preview.size, worker);
-                }
-            },
-            MessageLikeEvent::Redacted(ref redaction) => {
-                let key = (redaction.origin_server_ts.into(), redaction.event_id.clone());
-                self.messages.insert_message(key.clone(), sticker.clone());
-            },
+        if let MessageLikeEvent::Original(OriginalMessageLikeEvent {
+            content: StickerEventContent { source, .. },
+            ..
+        }) = &sticker &&
+            settings.tunables.image_preview.enabled
+        {
+            let source = source.clone().into();
+            previews.register_preview(settings, &source, PreviewKind::Message, worker);
         }
+
+        let loc = EventLocation::Message(thread_root.clone(), key.clone());
+        self.keys.insert(event_id, loc);
+
+        let thread = self.get_thread_mut(thread_root);
+        thread.insert_message(key, sticker);
+    }
+
+    /// Insert a reaction to a message.
+    pub fn insert_reaction_with_preview(
+        &mut self,
+        react: ReactionEvent,
+        settings: &ApplicationSettings,
+        previews: &mut PreviewManager,
+        worker: &Requester,
+    ) {
+        let MessageLikeEvent::Original(ref orig_react) = react else {
+            return;
+        };
+        let image_uri = OwnedMxcUri::from(orig_react.content.relates_to.key.as_str());
+        let source = if image_uri.is_valid() && settings.tunables.image_preview.enabled {
+            Some(MediaSource::Plain(image_uri))
+        } else {
+            None
+        };
+
+        if settings.tunables.image_preview.enabled &&
+            let Some(source) = source.as_ref()
+        {
+            previews.register_preview(settings, source, PreviewKind::Reaction, worker);
+        }
+
+        self.insert_reaction(react, source);
     }
 
     /// Insert an edit.
-    pub fn insert_edit(&mut self, msg: Replacement<RoomMessageEventContentWithoutRelation>) {
-        let event_id = msg.event_id;
-        let new_msgtype = msg.new_content;
-
-        if !self.apply_edit(&event_id, new_msgtype.clone()) {
-            self.pending_edits.insert(event_id, new_msgtype);
-        }
-    }
-
-    /// Apply the new content of an edit to the message that it edits.
-    ///
-    /// This returns `false` when the room does not hold that message.
-    fn apply_edit(
+    fn insert_edit(
         &mut self,
-        event_id: &EventId,
-        new_msgtype: RoomMessageEventContentWithoutRelation,
-    ) -> bool {
-        let Some(msg) = self.get_event_mut(event_id) else {
-            return false;
+        edit_msg: RoomMessageEvent,
+        replacement: Replacement<RoomMessageEventContentWithoutRelation>,
+    ) {
+        let RoomMessageEvent::Original(edit_msg) = edit_msg else {
+            return;
         };
+        let edit_key = MessageKey {
+            ts: edit_msg.origin_server_ts.into(),
+            id: edit_msg.event_id.clone().into(),
+        };
+        let msg_loc = self.keys.get(&replacement.event_id).cloned();
 
-        match &mut msg.event {
-            MessageEvent::Original(orig) => {
-                orig.content.apply_replacement(new_msgtype);
-            },
-            MessageEvent::Local(_, content) => {
-                content.apply_replacement(new_msgtype);
-            },
-            MessageEvent::Redacted(_, _) |
-            MessageEvent::State(_) |
-            MessageEvent::Sticker(_) |
-            MessageEvent::EncryptedOriginal(_) |
-            MessageEvent::EncryptedRedacted(_) => {
-                // The message is here, but an edit cannot change it.
-                return true;
-            },
+        if let Some(EventLocation::Message(thread, key)) = msg_loc {
+            // The edited message is already loaded in cache
+            let Some(msg) = self.get_thread_mut(thread).get_mut(&key) else {
+                return;
+            };
+            msg.insert_edit(edit_key.clone(), replacement.new_content);
+        } else {
+            // The edited message is not yet loaded
+            let entry = self.unloaded_edits.entry(replacement.event_id.clone());
+            entry.or_default().insert(edit_key.clone(), replacement.new_content);
         }
 
-        msg.html = msg.event.html();
-        msg.event.strip_reply_fallback();
-
-        true
+        let loc = EventLocation::Edit(replacement.event_id.clone(), edit_key.clone());
+        self.keys.insert(edit_msg.event_id.clone(), loc);
     }
 
     pub fn insert_any_state(&mut self, msg: AnySyncStateEvent) {
         let event_id = msg.event_id().to_owned();
-        let key = (msg.origin_server_ts().into(), event_id.clone());
+        let key = MessageKey {
+            ts: msg.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
         let loc = EventLocation::State(key.clone());
         self.keys.insert(event_id, loc);
@@ -1624,38 +1840,29 @@ impl RoomInfo {
     }
 
     /// Indicates whether this room has unread messages.
-    ///
-    /// `marked_unread` is the room's manual unread flag, which the server holds and this type
-    /// does not, so the caller reads it with [MatrixRoom::is_marked_unread].
-    pub fn unreads(&self, marked_unread: bool, settings: &ApplicationSettings) -> UnreadInfo {
-        let last_message = self.messages.last_key_value();
+    pub fn unreads(&self, room: &matrix_sdk::Room) -> UnreadInfo {
+        let last_message = self
+            .messages
+            .iter()
+            .rev()
+            .find(|(_, msg)| !matches!(&msg.event, MessageEvent::State(..)));
 
-        let user_id = &settings.profile.user_id;
-        let last_receipt = self.receipt_key(&ReceiptThread::Main, user_id);
-        let last_unthreaded = self.receipt_key(&ReceiptThread::Unthreaded, user_id);
-
-        let last_receipt = std::cmp::max(last_receipt, last_unthreaded);
-
-        match (last_message, last_receipt) {
-            (Some(((ts, _), _)), Some((read_ts, _))) => {
-                UnreadInfo {
-                    unread: marked_unread | (ts > read_ts),
-                    latest: Some(*ts),
-                }
-            },
-            (Some(((ts, _), _)), None) => {
-                // If we've never loaded/generated a room's receipt (example,
-                // a newly joined but never viewed room), show it as unread.
-                UnreadInfo { unread: true, latest: Some(*ts) }
-            },
-            (None, _) => UnreadInfo { unread: marked_unread, latest: None },
+        UnreadInfo {
+            unread_mark: room.is_marked_unread(),
+            unread_messages: room.num_unread_messages(),
+            unread_notifications: room.num_unread_notifications(),
+            unread_mentions: room.num_unread_mentions(),
+            latest: last_message.map(|(key, _)| key.ts.to_owned()),
         }
     }
 
     /// Inserts events that couldn't be decrypted into the scrollback.
     pub fn insert_encrypted(&mut self, msg: RoomEncryptedEvent) {
         let event_id = msg.event_id().to_owned();
-        let key = (msg.origin_server_ts().into(), event_id.clone());
+        let key = MessageKey {
+            ts: msg.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
         self.keys.insert(event_id, EventLocation::Message(None, key.clone()));
         self.messages.insert(key, msg.into());
@@ -1664,36 +1871,33 @@ impl RoomInfo {
     /// Insert a new message.
     pub fn insert_message(&mut self, msg: RoomMessageEvent) {
         let event_id = msg.event_id().to_owned();
-        let key = (msg.origin_server_ts().into(), event_id.clone());
+        let key = MessageKey {
+            ts: msg.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
         let loc = EventLocation::Message(None, key.clone());
         let bundled = bundled_replacement(&msg);
-        self.keys.insert(event_id.clone(), loc);
-        self.messages.insert_message(key, msg);
-        self.apply_known_edits(&event_id, bundled);
-    }
+        let mut message: Message = msg.into();
 
-    /// Apply the edits that this room knows of to a message that it just loaded.
-    ///
-    /// An insert overwrites the copy that the room held, so an edit applied earlier is lost
-    /// unless it is applied again here.
-    fn apply_known_edits(
-        &mut self,
-        event_id: &EventId,
-        bundled: Option<RoomMessageEventContentWithoutRelation>,
-    ) {
-        if let Some(new_msgtype) = bundled {
-            self.apply_edit(event_id, new_msgtype);
+        if let Some(edits) = self.unloaded_edits.remove(&event_id) {
+            message.set_edits(edits);
         }
 
-        if let Some(new_msgtype) = self.pending_edits.remove(event_id) {
-            self.apply_edit(event_id, new_msgtype);
+        if let Some((edit_key, new_content)) = bundled {
+            message.insert_edit(edit_key, new_content);
         }
+
+        self.keys.insert(event_id, loc);
+        self.messages.insert_message(key, message);
     }
 
     fn insert_thread(&mut self, msg: RoomMessageEvent, thread_root: OwnedEventId) {
         let event_id = msg.event_id().to_owned();
-        let key = (msg.origin_server_ts().into(), event_id.clone());
+        let key = MessageKey {
+            ts: msg.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
         let replies = self
             .threads
@@ -1701,9 +1905,18 @@ impl RoomInfo {
             .or_insert_with(|| Messages::thread(thread_root.clone()));
         let loc = EventLocation::Message(Some(thread_root), key.clone());
         let bundled = bundled_replacement(&msg);
-        self.keys.insert(event_id.clone(), loc);
-        replies.insert_message(key, msg);
-        self.apply_known_edits(&event_id, bundled);
+        let mut message: Message = msg.into();
+
+        if let Some(edits) = self.unloaded_edits.remove(&event_id) {
+            message.set_edits(edits);
+        }
+
+        if let Some((edit_key, new_content)) = bundled {
+            message.insert_edit(edit_key, new_content);
+        }
+
+        self.keys.insert(event_id, loc);
+        replies.insert_message(key, message);
     }
 
     /// Insert a new message event.
@@ -1714,7 +1927,10 @@ impl RoomInfo {
                 ..
             }) => {
                 match relates_to {
-                    Relation::Replacement(repl) => self.insert_edit(repl.clone()),
+                    Relation::Replacement(repl) => {
+                        let repl = repl.clone();
+                        self.insert_edit(msg, repl)
+                    },
                     Relation::Thread(Thread { event_id, .. }) => {
                         let event_id = event_id.clone();
                         self.insert_thread(msg, event_id);
@@ -1735,17 +1951,16 @@ impl RoomInfo {
         previews: &mut PreviewManager,
         worker: &Requester,
     ) {
-        let source = source_from_event(&ev);
-        self.insert(ev);
-
-        if let Some((event_id, source)) = source {
-            if let (Some(msg), Some(image_preview)) =
-                (self.get_event_mut(&event_id), &settings.tunables.image_preview)
-            {
-                msg.image_preview = Some(source.clone());
-                previews.register_preview(settings, source, image_preview.size, worker)
-            }
+        if let MessageLikeEvent::Original(OriginalMessageLikeEvent {
+            content: RoomMessageEventContent { msgtype: MessageType::Image(c), .. },
+            ..
+        }) = &ev &&
+            settings.tunables.image_preview.enabled
+        {
+            previews.register_preview(settings, &c.source, PreviewKind::Message, worker)
         }
+
+        self.insert(ev);
     }
 
     /// Indicates whether we've recently fetched scrollback for this room.
@@ -1861,45 +2076,82 @@ impl RoomInfo {
     ///
     /// This is what `:read` drives, and it is the only thing that advances the read marker when
     /// `read_receipt_manual` is set.
+    ///
+    /// Unlike [RoomInfo::fully_read], which follows what a render has actually put on screen and
+    /// so skips the user's own messages, this puts the receipt on the newest message whoever sent
+    /// it. An entry whose last message is the user's own has still been dealt with, and leaving
+    /// it unread would keep it in the inbox with nothing left in it to read.
     pub fn mark_read(&mut self, user_id: &UserId, thread: Option<OwnedEventId>) {
         let Some(root) = thread else {
-            self.fully_read(user_id);
+            // Reading a room reads the threads in it. A thread is part of the room the user just
+            // said they were done with, and leaving them behind would put the room straight back
+            // in the inbox on the next reply.
+            let roots: Vec<_> = self.threads.keys().map(ToOwned::to_owned).collect();
+
+            for root in roots {
+                self.mark_read(user_id, Some(root));
+            }
+
+            let last = self
+                .messages
+                .last_key_value()
+                .and_then(|(key, _)| key.id.as_origin().map(ToOwned::to_owned));
+
+            if let Some(last) = last {
+                self.set_receipt(ReceiptThread::Main, user_id.to_owned(), last);
+            }
+
             return;
         };
 
         // Fall back to the root itself for a thread whose replies aren't loaded.
         let last = self
-            .threads
-            .get(&root)
+            .get_thread(Some(&root))
             .and_then(|replies| replies.last_key_value())
-            .map(|((_, event_id), _)| event_id.clone())
+            .and_then(|(key, _)| key.id.as_origin().map(ToOwned::to_owned))
             .unwrap_or_else(|| root.clone());
 
         self.set_receipt(ReceiptThread::Thread(root), user_id.to_owned(), last);
     }
 
-    pub fn fully_read(&mut self, user_id: &UserId) {
-        let Some(((_, event_id), _)) = self.messages.last_key_value() else {
+    pub fn fully_read(&mut self, user_id: OwnedUserId, thread: ReceiptThread) {
+        let messages = match &thread {
+            ReceiptThread::Main => self.get_thread(None),
+            ReceiptThread::Thread(root) => self.get_thread(Some(root)),
+            _ => None,
+        };
+
+        let Some(messages) = messages else {
             return;
         };
 
-        self.set_receipt(ReceiptThread::Main, user_id.to_owned(), event_id.clone());
-
-        let newest = self
-            .threads
+        let event_id = messages
             .iter()
-            .filter_map(|(thread_id, messages)| {
-                let thread = ReceiptThread::Thread(thread_id.to_owned());
-
-                messages
-                    .last_key_value()
-                    .map(|((_, event_id), _)| (thread, event_id.to_owned()))
+            .filter(|(_, msg)| msg.sender != user_id)
+            .filter(|(_, msg)| {
+                matches!(
+                    msg.event,
+                    MessageEvent::EncryptedOriginal(..) |
+                        MessageEvent::EncryptedRedacted(..) |
+                        MessageEvent::Original(..) |
+                        MessageEvent::Redacted(..)
+                )
             })
-            .collect::<Vec<_>>();
+            .flat_map(|(_, msg)| msg.event.event_id())
+            .next_back();
 
-        for (thread, event_id) in newest.into_iter() {
-            self.set_receipt(thread, user_id.to_owned(), event_id.clone());
+        if let Some(event_id) = event_id {
+            self.set_receipt(thread, user_id, event_id.to_owned());
         }
+    }
+
+    /// Mark the room and every thread in it as read.
+    ///
+    /// This goes through [RoomInfo::mark_read] rather than [RoomInfo::fully_read] because it is
+    /// what `:read all` drives: the user is saying they are done with all of it, not reporting
+    /// what a render has shown them.
+    pub fn fully_read_all(&mut self, user_id: &UserId) {
+        self.mark_read(user_id, None);
     }
 
     /// Move the user's receipt to one specific message, rather than to the end of what is loaded.
@@ -1932,11 +2184,7 @@ impl RoomInfo {
     /// A receipt older than the oldest loaded message has no position to compare against, and is
     /// indistinguishable here from never having read the room. Both cases answer with the oldest
     /// message that is loaded, which is the furthest back the cursor can go anyway.
-    pub fn first_unread(
-        &self,
-        thread: Option<&EventId>,
-        user_id: &UserId,
-    ) -> Option<MessageKey> {
+    pub fn first_unread(&self, thread: Option<&EventId>, user_id: &UserId) -> Option<MessageKey> {
         let (messages, read) = match thread {
             Some(root) => {
                 let read = [
@@ -2060,53 +2308,10 @@ impl RoomInfo {
         if let Some(reactions) = self.reactions.get(event_id) {
             reactions
                 .values()
-                .any(|(annotation, user)| annotation == emoji && user == user_id)
+                .any(|(annotation, user, _)| annotation == emoji && user == user_id)
         } else {
             false
         }
-    }
-}
-
-#[cfg(unix)]
-fn picker_from_termios(protocol_type: Option<ProtocolType>) -> Option<Picker> {
-    let mut picker = match Picker::from_query_stdio() {
-        Ok(picker) => picker,
-        Err(e) => {
-            tracing::error!("Failed to setup image previews: {e}");
-            return None;
-        },
-    };
-
-    if let Some(protocol_type) = protocol_type {
-        picker.set_protocol_type(protocol_type);
-    }
-
-    Some(picker)
-}
-
-/// Windows cannot guess the right protocol, and always needs type and font_size.
-#[cfg(windows)]
-fn picker_from_termios(_: Option<ProtocolType>) -> Option<Picker> {
-    tracing::error!("\"image_preview\" requires \"protocol\" with \"type\" and \"font_size\" options on Windows.");
-    None
-}
-
-fn picker_from_settings(settings: &ApplicationSettings) -> Option<Picker> {
-    let image_preview = settings.tunables.image_preview.as_ref()?;
-    let image_preview_protocol = image_preview.protocol.as_ref();
-
-    if let Some(&ImagePreviewProtocolValues {
-        r#type: Some(protocol_type),
-        font_size: Some(font_size),
-    }) = image_preview_protocol
-    {
-        // User forced type and font_size: use that.
-        let mut picker = Picker::from_fontsize(font_size);
-        picker.set_protocol_type(protocol_type);
-        Some(picker)
-    } else {
-        // Guess, but use type if forced.
-        picker_from_termios(image_preview_protocol.and_then(|p| p.r#type))
     }
 }
 
@@ -2218,7 +2423,8 @@ pub struct ChatStore {
     pub presences: CompletionMap<OwnedUserId, PresenceState>,
 
     /// In-progress and completed verifications.
-    pub verifications: HashMap<String, SasVerification>,
+    /// The map key is the `flow_id`.
+    pub verifications: CompletionMap<String, VerificationRequest>,
 
     /// Settings for the current profile loaded from config file.
     pub settings: ApplicationSettings,
@@ -2408,7 +2614,7 @@ impl ChatStore {
 
     /// Create a new [ChatStore].
     pub fn new(worker: Requester, settings: ApplicationSettings) -> Self {
-        let picker = picker_from_settings(&settings);
+        let previews = PreviewManager::new(&settings);
         let (reports, reports_rx) = unbounded_channel();
 
         ChatStore {
@@ -2420,7 +2626,7 @@ impl ChatStore {
             settings,
             snooze: SnoozeStore::default(),
             snooze_dirty: Default::default(),
-            previews: PreviewManager::new(picker),
+            previews,
             cmds: crate::commands::setup_commands(),
 
             collator: Default::default(),
@@ -2535,6 +2741,11 @@ impl ChatStore {
         }
     }
 
+    /// Get the alias for a room if it has one (and the client knows it).
+    pub fn get_joined_room_alias(&self, room_id: &RoomId) -> Option<OwnedRoomAliasId> {
+        self.worker.client.get_room(room_id).and_then(|r| r.canonical_alias())
+    }
+
     /// Get the title for a room.
     pub fn get_room_title(&self, room_id: &RoomId) -> String {
         self.rooms
@@ -2552,13 +2763,6 @@ impl ChatStore {
     /// Set the name for a room.
     pub fn set_room_name(&mut self, room_id: &RoomId, name: &str) {
         self.rooms.get_or_default(room_id.to_owned()).name = name.to_string().into();
-    }
-
-    /// Insert a new E2EE verification.
-    pub fn insert_sas(&mut self, sas: SasVerification) {
-        let key = format!("{}/{}", sas.other_user_id(), sas.other_device().device_id());
-
-        self.verifications.insert(key, sas);
     }
 }
 
@@ -2848,6 +3052,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::MessageSearch(term.into_owned()))
             },
+            Some("mentions") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://mentions takes no path"));
+                }
+
+                Ok(IambId::MentionList)
+            },
             Some(s) => Err(E::custom(format!("{s:?} is not a valid window"))),
             None => Err(E::custom("Invalid iamb window URL")),
         }
@@ -2997,252 +3208,6 @@ impl ApplicationInfo for IambInfo {
     }
 }
 
-pub struct IambCompleter;
-
-impl Completer<IambInfo> for IambCompleter {
-    fn complete(
-        &mut self,
-        text: &EditRope,
-        cursor: &mut Cursor,
-        content: &IambBufferId,
-        store: &mut ChatStore,
-    ) -> Vec<String> {
-        match content {
-            IambBufferId::Command(CommandType::Command) => complete_cmdbar(text, cursor, store),
-            IambBufferId::Command(CommandType::Search) => vec![],
-            IambBufferId::Room(room_id, _, RoomFocus::MessageBar) => {
-                complete_msgbar(text, cursor, room_id, store)
-            },
-            IambBufferId::Room(_, _, RoomFocus::Scrollback) => vec![],
-
-            IambBufferId::DirectList => vec![],
-            IambBufferId::MemberList(_) => vec![],
-            IambBufferId::RoomList => vec![],
-            IambBufferId::SpaceList => vec![],
-            IambBufferId::VerifyList => vec![],
-            IambBufferId::Welcome => vec![],
-            IambBufferId::ChatList => vec![],
-            IambBufferId::SnoozeList => vec![],
-            IambBufferId::UnreadList => vec![],
-            IambBufferId::ThreadList => vec![],
-            IambBufferId::UnreadThreadList => vec![],
-            IambBufferId::MentionList => vec![],
-            IambBufferId::CommandPaletteList => vec![],
-            IambBufferId::CommandPaletteFilter => vec![],
-            IambBufferId::QuickSwitcherList => vec![],
-            IambBufferId::QuickSwitcherFilter => vec![],
-            IambBufferId::MessageSearchList => vec![],
-            IambBufferId::MessageSearchFilter => vec![],
-        }
-    }
-}
-
-/// Tab completion for user IDs.
-fn complete_users(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    store
-        .presences
-        .complete(id.as_ref())
-        .into_iter()
-        .map(|i| i.to_string())
-        .collect()
-}
-
-/// Whether somebody with this membership is still around for a mention to reach.
-fn is_mentionable(membership: &MembershipState) -> bool {
-    matches!(membership, MembershipState::Join | MembershipState::Invite)
-}
-
-/// Completion for mentioning somebody in the room being composed in.
-///
-/// The candidates come from the same place the `:members` window gets its list, so anybody who can
-/// be seen in that window can be mentioned, not just the people who happen to have spoken in the
-/// loaded scrollback. Unlike that window, though, people who have left or been banned are left out:
-/// there is no point offering to notify somebody who is no longer here.
-fn complete_mention(needle: &str, room_id: &RoomId, store: &ChatStore) -> Vec<String> {
-    let Ok(members) = store.worker.members(room_id.to_owned()) else {
-        return vec![];
-    };
-
-    let candidates = members
-        .into_iter()
-        .filter(|member| is_mentionable(member.membership()))
-        .map(|member| {
-            let display_name = member.display_name().map(ToString::to_string);
-
-            MentionCandidate::new(
-                member.user_id().to_owned(),
-                display_name,
-                member.name_ambiguous(),
-            )
-        })
-        .collect();
-
-    complete_mentions(needle, candidates)
-}
-
-/// Tab completion within the message bar.
-fn complete_msgbar(
-    text: &EditRope,
-    cursor: &mut Cursor,
-    room_id: &RoomId,
-    store: &ChatStore,
-) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    match id.chars().next() {
-        // Complete room aliases.
-        Some('#') => {
-            return store.names.complete(id.as_ref());
-        },
-
-        // Complete room identifiers.
-        Some('!') => {
-            return store
-                .rooms
-                .complete(id.as_ref())
-                .into_iter()
-                .map(|i| i.to_string())
-                .collect();
-        },
-
-        // Complete Emoji shortcodes.
-        Some(EMOJI_SIGIL) => {
-            return complete_emojis(id.as_ref());
-        },
-
-        // Complete a mention of somebody in this room.
-        Some(MENTION_SIGIL) => {
-            return complete_mention(id.as_ref(), room_id, store);
-        },
-
-        // Complete usernames when there's nothing to go on but the cursor position.
-        None => {
-            return store
-                .presences
-                .complete(id.as_ref())
-                .into_iter()
-                .map(|i| i.to_string())
-                .collect();
-        },
-
-        // Unknown sigil.
-        Some(_) => return vec![],
-    }
-}
-
-/// Tab completion for Matrix identifiers (usernames, room aliases, etc.)
-fn complete_matrix_names(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    let list = store.names.complete(id.as_ref());
-    if !list.is_empty() {
-        return list;
-    }
-
-    let list = store.presences.complete(id.as_ref());
-    if !list.is_empty() {
-        return list.into_iter().map(|i| i.to_string()).collect();
-    }
-
-    store
-        .rooms
-        .complete(id.as_ref())
-        .into_iter()
-        .map(|i| i.to_string())
-        .collect()
-}
-
-/// Tab completion for Emoji shortcode names.
-///
-/// The word style is the one used for Matrix identifiers because it treats `:` as part of a word,
-/// which lets the argument be written either as `smile` or as `:smile`. The sigil is optional here
-/// since the command already says an Emoji is what is wanted.
-fn complete_emoji(text: &EditRope, cursor: &mut Cursor) -> Vec<String> {
-    let sc = text.get_prefix_word_mut(cursor, &MATRIX_ID_WORD);
-    let sc = sc.unwrap_or_else(EditRope::empty);
-    let sc = Cow::from(&sc);
-
-    complete_emoji_names(sc.as_ref())
-}
-
-/// Tab completion for command names.
-fn complete_cmdname(
-    desc: CommandDescription,
-    text: &EditRope,
-    cursor: &mut Cursor,
-    store: &ChatStore,
-) -> Vec<String> {
-    // Complete command name and set cursor position.
-    let _ = text.get_prefix_word_mut(cursor, &WordStyle::Little);
-    store.cmds.complete_name(desc.command.as_str())
-}
-
-/// Tab completion for command arguments.
-fn complete_cmdarg(
-    desc: CommandDescription,
-    text: &EditRope,
-    cursor: &mut Cursor,
-    store: &ChatStore,
-) -> Vec<String> {
-    let cmd = match store.cmds.get(desc.command.as_str()) {
-        Ok(cmd) => cmd,
-        Err(_) => return vec![],
-    };
-
-    match cmd.name.as_str() {
-        "cancel" | "dms" | "edit" | "redact" | "reply" => vec![],
-        "members" | "rooms" | "spaces" | "welcome" => vec![],
-        "download" | "keys" | "open" | "upload" => complete_path(text, cursor),
-        "react" | "unreact" => complete_emoji(text, cursor),
-
-        "invite" => complete_users(text, cursor, store),
-        "join" | "split" | "vsplit" | "tabedit" => complete_matrix_names(text, cursor, store),
-        "room" => vec![],
-        "verify" => vec![],
-        "vertical" | "horizontal" | "aboveleft" | "belowright" | "tab" => {
-            complete_cmd(desc.arg.text.as_str(), text, cursor, store)
-        },
-        _ => vec![],
-    }
-}
-
-/// Tab completion for commands.
-fn complete_cmd(cmd: &str, text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    match CommandDescription::from_str(cmd) {
-        Ok(desc) => {
-            if desc.arg.untrimmed.is_empty() {
-                complete_cmdname(desc, text, cursor, store)
-            } else {
-                // Complete command argument.
-                complete_cmdarg(desc, text, cursor, store)
-            }
-        },
-
-        // Can't parse command text, so return zero completions.
-        Err(_) => vec![],
-    }
-}
-
-/// Tab completion for the command bar.
-fn complete_cmdbar(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let eo = text.cursor_to_offset(cursor);
-    let slice = text.slice(..eo);
-    let cow = Cow::from(&slice);
-
-    complete_cmd(cow.as_ref(), text, cursor, store)
-}
-
 #[cfg(test)]
 pub mod tests {
     use std::iter::FromIterator as _;
@@ -3251,11 +3216,10 @@ pub mod tests {
     use crate::config::user_style_from_color;
     use crate::tests::*;
     use matrix_sdk::ruma::{
+        MilliSecondsSinceUnixEpoch,
         events::{reaction::ReactionEventContent, relation::Annotation},
         owned_event_id,
         server_name,
-        MilliSecondsSinceUnixEpoch,
-        UInt,
     };
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
@@ -3273,24 +3237,22 @@ pub mod tests {
         let mut room = RoomInfo::default();
 
         let insert = |info: &mut RoomInfo, key: MessageKey, sender: OwnedUserId, body: &str| {
-            let content = MessageEvent::Local(
-                key.1.clone(),
-                RoomMessageEventContent::text_plain(body).into(),
-            );
-            let root = match info.keys.get(&key.1) {
+            let event_id = key.id.as_origin().expect("test messages are sent").to_owned();
+            let root = match info.keys.get(&event_id) {
                 Some(EventLocation::Message(root, _)) => root.clone(),
                 _ => None,
             };
-            info.get_thread_mut(root)
-                .insert(key.clone(), Message::new(content, sender, key.0));
+            let content = RoomMessageEventContent::text_plain(body);
+            let msg = mock_room1_message(content, sender, key.clone());
+
+            info.get_thread_mut(root).insert(key, msg);
         };
 
         // Both thread roots live in the main scrollback.
         let roots: Vec<OwnedEventId> = vec![followed_root.clone(), ignored_root.clone()];
 
         for (i, root) in roots.iter().enumerate() {
-            let ts = MessageTimeStamp::OriginServer(UInt::new(i as u64 + 1).unwrap());
-            let key: MessageKey = (ts, root.clone());
+            let key = key_at(i as u64 + 1, root.clone());
             room.keys.insert(root.clone(), EventLocation::Message(None, key.clone()));
             insert(&mut room, key, stranger.clone(), "thread root");
         }
@@ -3300,8 +3262,7 @@ pub mod tests {
 
         for (i, (root, sender)) in roots.iter().zip(repliers).enumerate() {
             let reply_id = EventId::new_v1(server_name!("example.com"));
-            let ts = MessageTimeStamp::OriginServer(UInt::new(i as u64 + 10).unwrap());
-            let key: MessageKey = (ts, reply_id.clone());
+            let key = key_at(i as u64 + 10, reply_id.clone());
             room.keys
                 .insert(reply_id, EventLocation::Message(Some(root.clone()), key.clone()));
             insert(&mut room, key, sender, "reply");
@@ -3335,7 +3296,7 @@ pub mod tests {
         let last_reply = room
             .get_thread(Some(&ignored_root))
             .and_then(|t| t.last_key_value())
-            .map(|((_, event_id), _)| event_id.clone())
+            .and_then(|(key, _)| key.id.as_origin().map(ToOwned::to_owned))
             .unwrap();
         room.set_receipt(ReceiptThread::Thread(ignored_root.clone()), user_id, last_reply);
 
@@ -3371,7 +3332,7 @@ pub mod tests {
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(room.first_unread(None, &user_id).as_ref(), Some(key));
 
-            room.mark_read_at(&user_id, key.1.clone());
+            room.mark_read_at(&user_id, key.id.as_origin().unwrap().to_owned());
 
             // Reading one message leaves the next one unread, rather than the whole room read.
             assert_eq!(room.first_unread(None, &user_id).as_ref(), keys.get(i + 1));
@@ -3393,7 +3354,8 @@ pub mod tests {
 
         // A client that only advances the main receipt has still read the thread, exactly as
         // `thread_unreads` counts it.
-        room.set_receipt(ReceiptThread::Main, user_id.clone(), last_reply.1.clone());
+        let last_reply_id = last_reply.id.as_origin().unwrap().to_owned();
+        room.set_receipt(ReceiptThread::Main, user_id.clone(), last_reply_id);
 
         assert_eq!(room.first_unread(Some(&followed_root), &user_id), None);
     }
@@ -3407,7 +3369,7 @@ pub mod tests {
             .threads
             .get(&followed_root)
             .and_then(|replies| replies.first_key_value())
-            .map(|((_, event_id), _)| event_id.clone())
+            .and_then(|(key, _)| key.id.as_origin().map(ToOwned::to_owned))
             .unwrap();
 
         room.mark_read_at(&user_id, reply.clone());
@@ -3449,7 +3411,7 @@ pub mod tests {
         let last_reply = room
             .get_thread(Some(&followed_root))
             .and_then(|t| t.last_key_value())
-            .map(|((_, event_id), _)| event_id.clone())
+            .and_then(|(key, _)| key.id.as_origin().map(ToOwned::to_owned))
             .unwrap();
         room.set_receipt(ReceiptThread::Main, user_id, last_reply);
 
@@ -3465,12 +3427,11 @@ pub mod tests {
         let root_id = EventId::new_v1(server_name!("example.com"));
         let reply_id = EventId::new_v1(server_name!("example.com"));
 
-        let root_key: MessageKey =
-            (MessageTimeStamp::OriginServer(UInt::new(1).unwrap()), root_id.clone());
-        let reply_key: MessageKey =
-            (MessageTimeStamp::OriginServer(UInt::new(2).unwrap()), reply_id.clone());
+        let root_key = key_at(1, root_id.clone());
+        let reply_key = key_at(2, reply_id.clone());
 
-        room.keys.insert(root_id.clone(), EventLocation::Message(None, root_key.clone()));
+        room.keys
+            .insert(root_id.clone(), EventLocation::Message(None, root_key.clone()));
         room.get_thread_mut(None).insert(
             root_key.clone(),
             mock_room1_message(
@@ -3511,14 +3472,19 @@ pub mod tests {
 
     /// The text that a preview of this event shows the user.
     fn shown_body(room: &RoomInfo, event_id: &EventId) -> String {
-        room.get_event(event_id).expect("the event is in the room").event.body().to_string()
+        room.get_event(event_id)
+            .expect("the event is in the room")
+            .event
+            .body()
+            .to_string()
     }
 
     fn edit(room: &mut RoomInfo, event_id: &OwnedEventId, body: &str) {
-        room.insert_edit(Replacement::new(
-            event_id.clone(),
-            RoomMessageEventContent::text_plain(body).into(),
-        ));
+        let edit_id = EventId::new_v1(server_name!("example.com"));
+        let content = RoomMessageEventContent::text_plain(body);
+        let edit_msg = mock_text_event(&edit_id, 100, serde_json::to_value(&content).unwrap());
+
+        room.insert_edit(edit_msg, Replacement::new(event_id.clone(), content.into()));
     }
 
     #[test]
@@ -3652,7 +3618,7 @@ pub mod tests {
         // Marking the room read with no thread covers every thread in it.
         room.mark_read(&user_id, None);
         assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
-        assert!(!room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_none());
     }
 
     #[test]
@@ -3661,13 +3627,13 @@ pub mod tests {
         let user_id = settings.profile.user_id.clone();
 
         room.mark_read(&user_id, None);
-        assert!(!room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_none());
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
 
         // Scrollback fetches and ephemeral receipt events replay whatever the server knows,
         // which can be a receipt we have already advanced past locally.
         room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root.clone());
-        assert!(!room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_none());
 
         room.set_receipt(
             ReceiptThread::Thread(followed_root.clone()),
@@ -3677,13 +3643,13 @@ pub mod tests {
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
 
         // Receipts that genuinely move forward still apply.
-        let (mut room, settings, followed_root, ignored_root) = mock_room_with_threads();
+        let (mut room, _, followed_root, ignored_root) = mock_room_with_threads();
 
         room.set_receipt(ReceiptThread::Main, user_id.clone(), followed_root);
-        assert!(room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_some());
 
-        room.set_receipt(ReceiptThread::Main, user_id, ignored_root);
-        assert!(!room.unreads(false, &settings).is_unread());
+        room.set_receipt(ReceiptThread::Main, user_id.clone(), ignored_root);
+        assert!(room.first_unread(None, &user_id).is_none());
     }
 
     #[test]
@@ -3798,11 +3764,11 @@ pub mod tests {
         let settings = store.settings.clone();
 
         store.record_read(vec![room_id.clone()], |app| {
-            app.rooms.get_or_default(room_id.clone()).fully_read(&user_id);
+            app.rooms.get_or_default(room_id.clone()).fully_read_all(&user_id);
         });
 
         let room = store.rooms.get(&room_id).unwrap();
-        assert!(!room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_none());
         assert!(!room.thread_unreads(&followed_root, &settings).is_unread());
         assert!(!room.thread_unreads(&ignored_root, &settings).is_unread());
 
@@ -3814,7 +3780,7 @@ pub mod tests {
         assert!(entry.targets.iter().all(|t| t.previous.is_none()));
 
         let room = store.rooms.get(&room_id).unwrap();
-        assert!(room.unreads(false, &settings).is_unread());
+        assert!(room.first_unread(None, &user_id).is_some());
         assert!(room.thread_unreads(&followed_root, &settings).is_unread());
         assert!(room.thread_unreads(&ignored_root, &settings).is_unread());
     }
@@ -3921,7 +3887,7 @@ pub mod tests {
         for i in 0..3 {
             let event_id = format!("$house_{i}");
             let react = create_reaction_event(&content, &event_id, "@foo:example.com");
-            info.insert_reaction(react);
+            info.insert_reaction(react, None);
         }
 
         let content = ReactionEventContent::new(Annotation::new(
@@ -3932,19 +3898,21 @@ pub mod tests {
         for i in 0..2 {
             let event_id = format!("$smile_{i}");
             let react = create_reaction_event(&content, &event_id, "@foo:example.com");
-            info.insert_reaction(react);
+            info.insert_reaction(react, None);
         }
 
         for i in 2..4 {
             let event_id = format!("$smile2_{i}");
             let react = create_reaction_event(&content, &event_id, "@bar:example.com");
-            info.insert_reaction(react);
+            info.insert_reaction(react, None);
         }
 
-        assert_eq!(info.get_reactions(&owned_event_id!("$my_reaction")), vec![
-            ("🏠", 1),
-            ("🙂", 2)
-        ]);
+        let reacts: Vec<_> = info
+            .get_reactions(&owned_event_id!("$my_reaction"))
+            .into_iter()
+            .map(|(key, count, _)| (key, count))
+            .collect();
+        assert_eq!(reacts, vec![("🏠", 1), ("🙂", 2)]);
     }
 
     #[test]
@@ -4037,115 +4005,6 @@ pub mod tests {
             room_id,
             Need { members: true, messages: Some(Vec::new()) }
         )],);
-    }
-
-    #[tokio::test]
-    async fn test_complete_msgbar() {
-        let store = mock_store().await;
-        let store = store.application;
-
-        let room_id = TEST_ROOM1_ID.as_ref();
-
-        let text = EditRope::from("going for a walk :walk ");
-        let mut cursor = Cursor::new(0, 22);
-        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        // Fuzzy matching finds looser matches too -- "walk" is a subsequence of "woman health
-        // worker" -- but they rank below the shortcodes that actually start with what was typed.
-        assert_eq!(res[..3], [":walking:", ":walking_man:", ":walking_woman:"]);
-        assert_eq!(cursor, Cursor::new(0, 17));
-
-        // A ":" in the middle of a word belongs to that word, so a time is not a shortcode.
-        let text = EditRope::from("see you at 10:30 ");
-        let mut cursor = Cursor::new(0, 16);
-        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        assert_eq!(res, Vec::<String>::new());
-
-        // Nor is the ":" in a URL.
-        let text = EditRope::from("read https://iamb.chat ");
-        let mut cursor = Cursor::new(0, 22);
-        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        assert_eq!(res, Vec::<String>::new());
-
-        // An "@" in the middle of a word belongs to that word, so an email address is not a
-        // mention and does not go looking for room members.
-        let text = EditRope::from("mail me at daniel@lyte.dev ");
-        let mut cursor = Cursor::new(0, 25);
-        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        assert_eq!(res, Vec::<String>::new());
-
-        // Completing a real "@" is mention completion, which needs the worker thread to hand over
-        // the room's members. See [crate::message::mention] for its tests.
-
-        let text = EditRope::from("see #room ");
-        let mut cursor = Cursor::new(0, 9);
-        let res = complete_msgbar(&text, &mut cursor, room_id, &store);
-        assert_eq!(res, vec!["#room1:example.com"]);
-        assert_eq!(cursor, Cursor::new(0, 4));
-    }
-
-    #[tokio::test]
-    async fn test_complete_cmdbar() {
-        let store = mock_store().await;
-        let store = store.application;
-        let users = vec![
-            "@user1:example.com",
-            "@user2:example.com",
-            "@user3:example.com",
-            "@user4:example.com",
-            "@user5:example.com",
-        ];
-
-        let text = EditRope::from("invite    ");
-        let mut cursor = Cursor::new(0, 7);
-        let id = text
-            .get_prefix_word_mut(&mut cursor, &MATRIX_ID_WORD)
-            .unwrap_or_else(EditRope::empty);
-        assert_eq!(id.to_string(), "");
-        assert_eq!(cursor, Cursor::new(0, 7));
-
-        let text = EditRope::from("invite    ");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
-
-        let text = EditRope::from("invite ignored");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
-
-        let text = EditRope::from("invite @user1ignored");
-        let mut cursor = Cursor::new(0, 13);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["@user1:example.com"]);
-
-        let text = EditRope::from("abo hor");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["horizontal"]);
-
-        let text = EditRope::from("abo hor inv");
-        let mut cursor = Cursor::new(0, 11);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["invite"]);
-
-        let text = EditRope::from("abo hor invite \n");
-        let mut cursor = Cursor::new(0, 15);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
-
-        // A reaction can be named with or without the shortcode sigil, and either way it is the
-        // bare name that gets inserted, since that is what the command wants.
-        let text = EditRope::from("react polrbear");
-        let mut cursor = Cursor::new(0, 14);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res.first().map(String::as_str), Some("polar_bear"));
-        assert_eq!(cursor, Cursor::new(0, 6));
-
-        let text = EditRope::from("react :polrbear");
-        let mut cursor = Cursor::new(0, 15);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res.first().map(String::as_str), Some("polar_bear"));
-        assert_eq!(cursor, Cursor::new(0, 6));
     }
 
     #[test]
