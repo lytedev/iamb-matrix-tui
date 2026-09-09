@@ -115,6 +115,11 @@ That is the oldest unread message of the room or thread being viewed, and when
 there is none left there, the oldest unread message of whichever room or thread
 has gone unread the longest \(em the entry at the bottom of
 .Sy ":unreadsandthreads" .
+A deferred entry is skipped, including the one being viewed, so
+.Sy ":snooze"
+followed by
+.Sy ":nextunread"
+moves on rather than returning to the message that was just deferred.
 It reports an error when nothing is left unread anywhere.
 .It Sy ":rooms"
 View a list of joined rooms.
