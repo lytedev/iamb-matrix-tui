@@ -1968,6 +1968,23 @@ impl RoomInfo {
         self.fetch_last.is_some_and(|i| i.elapsed() < ROOM_FETCH_DEBOUNCE)
     }
 
+    /// Whether this room is waiting on the server for messages.
+    ///
+    /// True while a fetch is out, and also through the pause that [ROOM_FETCH_DEBOUNCE] puts
+    /// between fetches. Paging a long way back takes several rounds with a wait in between, and an
+    /// indicator that went out during each wait would read as the client giving up rather than as
+    /// it still working.
+    ///
+    /// A room whose history has been fetched to the beginning is never waiting, so the pause after
+    /// the last round of a walk backwards does not keep it spinning.
+    pub fn awaiting_messages(&self) -> bool {
+        if self.fetching {
+            return true;
+        }
+
+        self.recently_fetched() && !matches!(self.fetch_id, RoomFetchStatus::Done)
+    }
+
     fn clear_receipt(&mut self, thread: &ReceiptThread, user_id: &OwnedUserId) -> Option<()> {
         let old_event_id =
             self.user_receipts.get(thread).and_then(|receipts| receipts.get(user_id))?;
@@ -2605,6 +2622,19 @@ impl ChatStore {
 
         parse_when(when, self.now_ms(), self.settings.tunables.snooze_tomorrow_hour)
             .map_err(|e| IambError::BadSnoozeDuration(e.to_string()))
+    }
+
+    /// Whether any room is waiting on the server for messages right now.
+    ///
+    /// This is what the spinner in the status bar answers. It covers the scrollback fetches that a
+    /// room or a thread makes when it is opened, or scrolled to the top, which is the wait that
+    /// has nothing else on screen to show for it: the pane simply sits there, and a thread whose
+    /// replies have not arrived looks the same as a thread that has none.
+    ///
+    /// Member lists, searches and the backfill say when they are done by themselves, so they are
+    /// deliberately not counted here.
+    pub fn awaiting_messages(&self) -> bool {
+        self.rooms.iter().any(|(_, info)| info.awaiting_messages())
     }
 
     /// Whether an inbox entry is deferred right now.
@@ -3990,6 +4020,55 @@ pub mod tests {
                 Span::from(" is typing...")
             ])
         );
+    }
+
+    mod awaiting_messages {
+        use super::*;
+
+        #[test]
+        fn a_room_nobody_has_asked_about_is_not_waiting() {
+            assert!(!RoomInfo::default().awaiting_messages());
+        }
+
+        #[test]
+        fn a_room_with_a_fetch_out_is_waiting() {
+            let room = RoomInfo { fetching: true, ..Default::default() };
+
+            assert!(room.awaiting_messages());
+        }
+
+        #[test]
+        fn a_room_waits_through_the_pause_between_fetches() {
+            let room = RoomInfo {
+                fetch_last: Some(Instant::now()),
+                fetch_id: RoomFetchStatus::HaveMore("next".to_string()),
+                ..Default::default()
+            };
+
+            assert!(room.awaiting_messages());
+        }
+
+        #[test]
+        fn a_room_fetched_to_the_beginning_stops_waiting_at_once() {
+            let room = RoomInfo {
+                fetch_last: Some(Instant::now()),
+                fetch_id: RoomFetchStatus::Done,
+                ..Default::default()
+            };
+
+            assert!(!room.awaiting_messages());
+        }
+
+        #[test]
+        fn a_room_left_alone_for_longer_than_the_pause_stops_waiting() {
+            let room = RoomInfo {
+                fetch_last: Instant::now().checked_sub(ROOM_FETCH_DEBOUNCE),
+                fetch_id: RoomFetchStatus::HaveMore("next".to_string()),
+                ..Default::default()
+            };
+
+            assert!(!room.awaiting_messages());
+        }
     }
 
     #[test]

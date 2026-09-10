@@ -1,5 +1,6 @@
 //! # Utility functions
 use std::borrow::Cow;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::{Regex, RegexBuilder};
 use unicode_segmentation::UnicodeSegmentation;
@@ -291,5 +292,62 @@ pub mod tests {
         assert_eq!(iter.next(), Some((Cow::Borrowed("ＫＥ"), 4)));
         assert_eq!(iter.next(), Some((Cow::Borrowed("Ｎ"), 2)));
         assert_eq!(iter.next(), None);
+    }
+}
+
+/// The frames of the spinner shown while iamb waits on the server.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long each frame of the spinner is shown for.
+pub const SPINNER_FRAME: Duration = Duration::from_millis(100);
+
+/// The frame of the spinner to show at `at`.
+///
+/// The time is the only input, so there is no animation to step and nothing to keep in sync: a
+/// redraw that arrives late shows the frame for when it arrived rather than rewinding, and two
+/// spinners drawn in the same pass agree without being told about each other.
+pub fn spinner_frame(at: SystemTime) -> &'static str {
+    let millis = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let frame = millis / SPINNER_FRAME.as_millis();
+
+    SPINNER_FRAMES[(frame % SPINNER_FRAMES.len() as u128) as usize]
+}
+
+#[cfg(test)]
+mod spinner {
+    use super::*;
+
+    #[test]
+    fn it_advances_one_frame_per_interval() {
+        let start = UNIX_EPOCH + SPINNER_FRAME * 40;
+
+        assert_eq!(spinner_frame(start), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(start + SPINNER_FRAME), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_frame(start + SPINNER_FRAME * 9), SPINNER_FRAMES[9]);
+    }
+
+    #[test]
+    fn it_starts_over_after_the_last_frame() {
+        let start = UNIX_EPOCH + SPINNER_FRAME * 40;
+
+        assert_eq!(spinner_frame(start + SPINNER_FRAME * 10), SPINNER_FRAMES[0]);
+    }
+
+    /// Two draws within one interval must agree, or the spinner flickers between frames instead of
+    /// turning.
+    #[test]
+    fn it_holds_a_frame_for_the_whole_interval() {
+        let start = UNIX_EPOCH + SPINNER_FRAME * 40;
+        let nearly_over = start + SPINNER_FRAME - Duration::from_millis(1);
+
+        assert_eq!(spinner_frame(start), spinner_frame(nearly_over));
+    }
+
+    /// Every frame is one column wide, so the spinner cannot push what shares its row around.
+    #[test]
+    fn every_frame_takes_one_column() {
+        for frame in SPINNER_FRAMES {
+            assert_eq!(UnicodeWidthStr::width(frame), 1, "{frame:?}");
+        }
     }
 }

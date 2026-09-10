@@ -25,7 +25,7 @@ use std::ops::DerefMut;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::{CommandFactory, Parser};
 use matrix_sdk::ruma::UserId;
@@ -66,6 +66,7 @@ use modalkit::crossterm::{
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType, CrosstermBackend},
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
@@ -113,6 +114,7 @@ use crate::{
     },
     completions::IambCompleter,
     config::{ApplicationSettings, Iamb},
+    util::{SPINNER_FRAME, spinner_frame},
     windows::IambWindow,
     worker::{ClientWorker, LoginStyle, Requester, create_room},
 };
@@ -286,19 +288,42 @@ struct Application {
     dirty: bool,
 }
 
+/// The single cell in the bottom right of `area`, or [None] when there is no room for one.
+fn bottom_right(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(area.right() - 1, area.bottom() - 1, 1, 1))
+}
+
 /// Clear the screen and make the next draw repaint all of it.
 ///
 /// [Terminal::clear] asks the terminal where its cursor is, so that it can put it back afterwards,
 /// and waits two seconds for an answer. Not every terminal answers: iamb sits behind a multiplexer
 /// often enough that the question goes unanswered, and the error it returns then arrives at the
-/// first thing `run` does, so iamb exits before it has drawn anything.
+/// first thing `run` does, so iamb exits before it has drawn anything. Where the cursor was is
+/// worth nothing here anyway, because the draw that follows moves it.
 ///
-/// Where the cursor was is worth nothing here — the draw that follows moves it — so the clear is
-/// done without asking. The two swaps reset both buffers and leave the current one where it
-/// started, which is what makes the next draw a full repaint rather than a diff against what the
-/// screen used to hold.
+/// Asking the terminal to clear itself is a request it can ignore, so the blank screen is also
+/// written out cell by cell, which it cannot. Both buffers are then reset, so the draw that
+/// follows writes every cell that is not blank rather than a difference against what the pane used
+/// to hold.
 fn clear_screen<B: Backend>(term: &mut Terminal<B>) -> Result<(), B::Error> {
     term.backend_mut().clear_region(ClearType::All)?;
+
+    let area = term.get_frame().area();
+    let blank = Buffer::empty(area);
+    let cells = blank.content.iter().enumerate().map(|(i, cell)| {
+        let i = i as u16;
+
+        (area.x + i % area.width, area.y + i / area.width, cell)
+    });
+
+    term.backend_mut().draw(cells)?;
+
+    // Two swaps: the first resets the buffer that the next draw compares against, and the second
+    // puts the buffer that it renders into back where it started.
     term.swap_buffers();
     term.swap_buffers();
 
@@ -353,6 +378,9 @@ impl Application {
             clear_screen(term)?;
         }
 
+        // Read before the draw, because the screen widget borrows the store for the whole of it.
+        let fetching = store.application.awaiting_messages();
+
         term.draw(|f| {
             let area = f.area();
 
@@ -373,6 +401,15 @@ impl Application {
                 .tab_style_focused(Style::default().remove_modifier(Modifier::DIM))
                 .focus(focused);
             f.render_stateful_widget(screen, area, sstate);
+
+            // The last column of the last row: the command bar's own text starts at the left, and
+            // a message long enough to reach here is rare enough to be worth the corner.
+            if fetching && let Some(corner) = bottom_right(area) {
+                let style = Style::default().add_modifier(Modifier::DIM);
+                let span = Span::styled(spinner_frame(SystemTime::now()), style);
+
+                f.render_widget(Paragraph::new(span), corner);
+            }
 
             if hide_cursor {
                 return;
@@ -424,7 +461,15 @@ impl Application {
                 return Ok(Step::Actions(vec![(switch.into(), ctx.clone()), (select.into(), ctx)]));
             }
 
-            if !poll(Duration::from_secs(1))? {
+            // A spinner that moves once a second reads as a hang rather than as progress, so the
+            // wait shortens to one frame while there is something for it to say.
+            let waiting = if self.store.lock().await.application.awaiting_messages() {
+                SPINNER_FRAME
+            } else {
+                Duration::from_secs(1)
+            };
+
+            if !poll(waiting)? {
                 // Redraw in case there's new messages to show.
                 continue;
             }
@@ -1464,34 +1509,117 @@ fn main() {
 mod clear_screen {
     use super::*;
 
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
     use ratatui::widgets::Widget;
 
-    /// Draw `text` across the top row, then clear with `clear`, then draw nothing, and say what the
-    /// terminal is left showing.
-    fn screen_after<F>(text: &str, clear: F) -> String
+    /// A terminal that ignores being told to clear itself, as one behind a multiplexer can.
+    struct KeepsWhatItHas(TestBackend);
+
+    impl Backend for KeepsWhatItHas {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.0.draw(content).unwrap();
+
+            Ok(())
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn clear_region(&mut self, _: ClearType) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.hide_cursor().unwrap();
+
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.0.show_cursor().unwrap();
+
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            Ok(self.0.get_cursor_position().unwrap())
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, pos: P) -> Result<(), Self::Error> {
+            self.0.set_cursor_position(pos).unwrap();
+
+            Ok(())
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            Ok(self.0.size().unwrap())
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            Ok(self.0.window_size().unwrap())
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().unwrap();
+
+            Ok(())
+        }
+    }
+
+    fn shown(backend: &TestBackend) -> String {
+        backend.buffer().content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// Draw `text` across the top row, then clear with `clear`, then draw nothing.
+    fn screen_after<B, F>(backend: B, text: &str, clear: F) -> Terminal<B>
     where
-        F: FnOnce(&mut Terminal<TestBackend>) -> Result<(), std::convert::Infallible>,
+        B: Backend,
+        B::Error: std::fmt::Debug,
+        F: FnOnce(&mut Terminal<B>) -> Result<(), B::Error>,
     {
-        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        let mut term = Terminal::new(backend).unwrap();
 
         term.draw(|f| text.render(f.area(), f.buffer_mut())).unwrap();
         clear(&mut term).unwrap();
         term.draw(|_| {}).unwrap();
 
-        term.backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+        term
     }
 
     #[test]
     fn it_leaves_the_screen_the_way_terminal_clear_does() {
         let blank = " ".repeat(36);
 
-        assert_eq!(screen_after("hello", |t| t.clear()), blank);
-        assert_eq!(screen_after("hello", clear_screen), blank);
+        let term = screen_after(TestBackend::new(12, 3), "hello", |t| t.clear());
+        assert_eq!(shown(term.backend()), blank);
+
+        let term = screen_after(TestBackend::new(12, 3), "hello", clear_screen);
+        assert_eq!(shown(term.backend()), blank);
+    }
+
+    #[test]
+    fn a_terminal_that_ignores_the_clear_still_ends_up_blank() {
+        let backend = KeepsWhatItHas(TestBackend::new(12, 3));
+        let term = screen_after(backend, "hello", clear_screen);
+
+        assert_eq!(shown(&term.backend().0), " ".repeat(36));
+    }
+
+    /// The failure this guards against: [Terminal::clear] only asks, so a terminal that does not
+    /// listen keeps showing what it had.
+    #[test]
+    fn terminal_clear_alone_would_leave_it_behind() {
+        let backend = KeepsWhatItHas(TestBackend::new(12, 3));
+        let term = screen_after(backend, "hello", |t| t.clear());
+
+        assert!(shown(&term.backend().0).starts_with("hello"));
     }
 }
