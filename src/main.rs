@@ -65,7 +65,7 @@ use modalkit::crossterm::{
 
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, ClearType, CrosstermBackend},
     layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
@@ -146,7 +146,6 @@ use modalkit::{
 
 use modalkit_ratatui::{
     TerminalCursor,
-    TerminalExtOps,
     Window,
     cmdbar::CommandBarState,
     screen::{Screen, ScreenState, TabbedLayoutDescription},
@@ -287,6 +286,25 @@ struct Application {
     dirty: bool,
 }
 
+/// Clear the screen and make the next draw repaint all of it.
+///
+/// [Terminal::clear] asks the terminal where its cursor is, so that it can put it back afterwards,
+/// and waits two seconds for an answer. Not every terminal answers: iamb sits behind a multiplexer
+/// often enough that the question goes unanswered, and the error it returns then arrives at the
+/// first thing `run` does, so iamb exits before it has drawn anything.
+///
+/// Where the cursor was is worth nothing here — the draw that follows moves it — so the clear is
+/// done without asking. The two swaps reset both buffers and leave the current one where it
+/// started, which is what makes the next draw a full repaint rather than a diff against what the
+/// screen used to hold.
+fn clear_screen<B: Backend>(term: &mut Terminal<B>) -> Result<(), B::Error> {
+    term.backend_mut().clear_region(ClearType::All)?;
+    term.swap_buffers();
+    term.swap_buffers();
+
+    Ok(())
+}
+
 impl Application {
     pub async fn new(
         settings: ApplicationSettings,
@@ -332,7 +350,7 @@ impl Application {
         }
 
         if full {
-            term.clear()?;
+            clear_screen(term)?;
         }
 
         term.draw(|f| {
@@ -565,7 +583,7 @@ impl Application {
                 None
             },
             Action::Suspend => {
-                self.terminal.program_suspend()?;
+                self.suspend()?;
 
                 None
             },
@@ -953,8 +971,31 @@ impl Application {
         }
     }
 
+    /// Hand the terminal back to the shell until the user resumes iamb.
+    ///
+    /// [TerminalExtOps::program_suspend] does this too, but it clears the screen on the way back
+    /// with [Terminal::clear], which asks the terminal where its cursor is. A terminal that never
+    /// answers that question turns `<C-Z>` into a way to lose the session, so the clear is done
+    /// here instead. See [clear_screen].
+    fn suspend(&mut self) -> Result<(), std::io::Error> {
+        crossterm::terminal::disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(process::id() as i32, libc::SIGTSTP);
+        }
+
+        crossterm::terminal::enable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        clear_screen(&mut self.terminal)?;
+
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
-        self.terminal.clear()?;
+        clear_screen(&mut self.terminal)?;
 
         let store = self.store.clone();
 
@@ -1417,4 +1458,40 @@ fn main() {
     }
 
     drop(guard);
+}
+
+#[cfg(test)]
+mod clear_screen {
+    use super::*;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Widget;
+
+    /// Draw `text` across the top row, then clear with `clear`, then draw nothing, and say what the
+    /// terminal is left showing.
+    fn screen_after<F>(text: &str, clear: F) -> String
+    where
+        F: FnOnce(&mut Terminal<TestBackend>) -> Result<(), std::convert::Infallible>,
+    {
+        let mut term = Terminal::new(TestBackend::new(12, 3)).unwrap();
+
+        term.draw(|f| text.render(f.area(), f.buffer_mut())).unwrap();
+        clear(&mut term).unwrap();
+        term.draw(|_| {}).unwrap();
+
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn it_leaves_the_screen_the_way_terminal_clear_does() {
+        let blank = " ".repeat(36);
+
+        assert_eq!(screen_after("hello", |t| t.clear()), blank);
+        assert_eq!(screen_after("hello", clear_screen), blank);
+    }
 }
