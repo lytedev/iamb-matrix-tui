@@ -619,7 +619,18 @@ impl Application {
             Action::Macro(act) => self.bindings.macro_command(&act, &ctx, store)?,
             Action::Scroll(style) => self.screen.scroll(&style, &ctx, store)?,
             Action::ShowInfoMessage(info) => Some(info),
-            Action::Window(cmd) => self.screen.window_command(&cmd, &ctx, store)?,
+            Action::Window(cmd) => {
+                // Moving between windows repaints every cell rather than the difference. What is
+                // on screen is only ever what iamb believes is on screen if nothing else has
+                // written there, and iamb is not the only thing that writes to its own pane: image
+                // previews put escape sequences on the terminal that its buffers know nothing
+                // about, and a terminal that drops part of a write leaves cells that iamb has
+                // already crossed off. Neither is visible until the pane is reused for something
+                // else, which is exactly here.
+                self.dirty = true;
+
+                self.screen.window_command(&cmd, &ctx, store)?
+            },
 
             Action::Jump(l, dir, count) => {
                 let count = ctx.resolve(&count);
@@ -638,6 +649,9 @@ impl Application {
                 if let TabAction::Close(_, _) = &cmd {
                     self.last_layout = self.screen.as_description().into();
                 }
+
+                // Changing tabs reuses the whole pane. See [Action::Window] above.
+                self.dirty = true;
 
                 self.screen.tab_command(&cmd, &ctx, store)?
             },
