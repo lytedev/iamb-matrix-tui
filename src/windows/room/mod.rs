@@ -10,6 +10,7 @@ use matrix_sdk::{
     ruma::{
         OwnedEventId,
         OwnedRoomAliasId,
+        OwnedRoomId,
         OwnedUserId,
         RoomId,
         api::{
@@ -116,6 +117,23 @@ fn hist_visibility_mode(name: impl Into<String>) -> IambResult<HistoryVisibility
     };
 
     Ok(mode)
+}
+
+/// Whether the unread walk stays inside the room or thread on screen rather than hopping away.
+///
+/// A snoozed entry is out of the walk entirely, the same way it is out of `:unreadsandthreads`,
+/// so that snoozing what is on screen and then asking for the next unread message moves on.
+/// [RoomAction::GotoFirstUnread] cannot hop by definition, so it always stays.
+fn unread_walk_stays_here(
+    act: &RoomAction,
+    room_id: &OwnedRoomId,
+    thread: Option<&OwnedEventId>,
+    store: &ProgramStore,
+) -> bool {
+    match act {
+        RoomAction::NextUnread => !store.application.is_deferred(room_id, thread),
+        _ => true,
+    }
 }
 
 pub async fn room_command(
@@ -981,15 +999,18 @@ impl RoomState {
 
                 if let RoomState::Chat(chat) = self {
                     let thread = chat.thread().cloned();
-                    let info = store.application.rooms.get_or_default(room_id.clone());
-                    let first = info.first_unread(thread.as_deref(), &user_id);
 
-                    if let Some(event_id) =
-                        first.and_then(|key| key.id.as_origin().map(ToOwned::to_owned))
-                    {
-                        chat.select_unread_message(event_id, store);
+                    if unread_walk_stays_here(&act, &room_id, thread.as_ref(), store) {
+                        let info = store.application.rooms.get_or_default(room_id.clone());
+                        let first = info.first_unread(thread.as_deref(), &user_id);
 
-                        return Ok(vec![]);
+                        if let Some(event_id) =
+                            first.and_then(|key| key.id.as_origin().map(ToOwned::to_owned))
+                        {
+                            chat.select_unread_message(event_id, store);
+
+                            return Ok(vec![]);
+                        }
                     }
                 }
 
@@ -1248,5 +1269,50 @@ mod tests {
         assert!(notification_mode("invalid").is_err());
         assert!(notification_mode("not a level").is_err());
         assert!(notification_mode("@user:example.com").is_err());
+    }
+
+    mod unread_walk_stays_here {
+        use super::*;
+
+        use crate::snooze::SnoozeKey;
+        use crate::tests::{TEST_ROOM1_ID, mock_store};
+
+        const AN_HOUR: u64 = 60 * 60 * 1000;
+
+        #[tokio::test]
+        async fn a_room_with_no_snooze_keeps_the_walk_where_it_is() {
+            let store = mock_store().await;
+            let act = RoomAction::NextUnread;
+
+            assert!(unread_walk_stays_here(&act, &TEST_ROOM1_ID, None, &store));
+        }
+
+        #[tokio::test]
+        async fn a_snoozed_room_sends_the_walk_elsewhere() {
+            let mut store = mock_store().await;
+            let wake_at = store.application.now_ms() + AN_HOUR;
+            let act = RoomAction::NextUnread;
+
+            store
+                .application
+                .snooze
+                .set(SnoozeKey::room(TEST_ROOM1_ID.clone()), wake_at);
+
+            assert!(!unread_walk_stays_here(&act, &TEST_ROOM1_ID, None, &store));
+        }
+
+        #[tokio::test]
+        async fn a_snoozed_room_still_answers_a_jump_that_cannot_leave_it() {
+            let mut store = mock_store().await;
+            let wake_at = store.application.now_ms() + AN_HOUR;
+            let act = RoomAction::GotoFirstUnread;
+
+            store
+                .application
+                .snooze
+                .set(SnoozeKey::room(TEST_ROOM1_ID.clone()), wake_at);
+
+            assert!(unread_walk_stays_here(&act, &TEST_ROOM1_ID, None, &store));
+        }
     }
 }
