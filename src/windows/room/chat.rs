@@ -1023,6 +1023,12 @@ impl ChatState {
     /// and the walk exists to read rather than to write. Without this the message is selected but
     /// `<Enter>` still goes to the message bar, so opening the thread the jump landed on sends an
     /// empty message instead.
+    /// Read in the scrollback rather than type in the message bar. See
+    /// [RoomAction::FocusScrollback].
+    pub fn focus_scrollback(&mut self) {
+        self.focus = RoomFocus::Scrollback;
+    }
+
     pub fn select_unread_message(&mut self, event_id: OwnedEventId, store: &mut ProgramStore) {
         self.focus = RoomFocus::Scrollback;
         self.select_message_inner(event_id, true, store)

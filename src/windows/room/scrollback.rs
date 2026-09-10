@@ -43,12 +43,14 @@ use modalkit::prelude::*;
 
 use crate::{
     base::{
+        IambAction,
         IambBufferId,
         IambId,
         IambInfo,
         IambResult,
         ProgramContext,
         ProgramStore,
+        RoomAction,
         RoomFetchStatus,
         RoomFocus,
         RoomInfo,
@@ -1397,7 +1399,13 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                     let room_id = self.room_id.clone();
                     let id = IambId::Room(room_id, Some(root.to_owned()));
                     let open = WindowAction::Switch(OpenTarget::Application(id));
-                    Ok(vec![(open.into(), ctx.clone())])
+
+                    // A thread is opened from the message it is about, so it is opened to be
+                    // read. Without this the window arrives focused on its message bar, and the
+                    // first key meant to move through the replies is spent moving the focus.
+                    let focus = IambAction::Room(RoomAction::FocusScrollback);
+
+                    Ok(vec![(open.into(), ctx.clone()), (focus.into(), ctx.clone())])
                 }
             },
             PromptAction::Abort(..) => {
@@ -2270,7 +2278,12 @@ mod tests {
             IambId::Room(TEST_ROOM1_ID.clone(), order[2].id.as_origin().map(ToOwned::to_owned));
         let open = WindowAction::Switch(OpenTarget::Application(thread));
 
-        assert_eq!(acts, vec![(open.into(), ctx)]);
+        // The thread is opened to be read, so it also asks to be focused where the reading
+        // happens. A window arrives focused on its message bar otherwise, and the first key meant
+        // to move through the replies is spent moving the focus instead.
+        let focus = IambAction::Room(RoomAction::FocusScrollback);
+
+        assert_eq!(acts, vec![(open.into(), ctx.clone()), (focus.into(), ctx)]);
     }
 
     #[tokio::test]
@@ -2365,6 +2378,35 @@ mod tests {
         // Can't go any further.
         scrollback.search(next, 2.into(), &ctx, &mut store).unwrap();
         assert_eq!(scrollback.cursor, MSG1_KEY.clone().into());
+    }
+
+    /// The message a thread is about is drawn above the first reply, so moving back through a
+    /// thread has to be able to reach it. Anything less leaves the top of a thread unselectable.
+    #[tokio::test]
+    async fn moving_back_through_a_thread_reaches_its_root() {
+        let room_id = TEST_ROOM1_ID.clone();
+        let mut store = mock_store().await;
+        let ctx = ProgramContext::default();
+
+        let replies = {
+            let info = store.application.rooms.get_or_default(room_id.clone());
+
+            mock_thread(info, 3)
+        };
+
+        let mut scrollback = ScrollbackState::new(room_id, Some(MSG2_EVID.clone()));
+        let prev = |n: usize| EditTarget::Motion(MoveType::Line(MoveDir1D::Previous), n.into());
+
+        assert_eq!(scrollback.cursor, MessageCursor::latest());
+
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, replies[1].clone().into());
+
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, replies[0].clone().into());
+
+        scrollback.edit(&EditAction::Motion, &prev(1), &ctx, &mut store).unwrap();
+        assert_eq!(scrollback.cursor, MSG2_KEY.clone().into());
     }
 
     #[tokio::test]

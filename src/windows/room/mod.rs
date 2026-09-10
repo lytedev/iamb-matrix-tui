@@ -156,6 +156,7 @@ pub async fn room_command(
         // [RoomState::room_command] runs them before it delegates here.
         RoomAction::MarkRead |
         RoomAction::MarkReadHere |
+        RoomAction::FocusScrollback |
         RoomAction::GotoFirstUnread |
         RoomAction::Snooze(_) |
         RoomAction::Unsnooze |
@@ -990,6 +991,13 @@ impl RoomState {
                 store.application.record_read(vec![room_id.clone()], |app| {
                     app.rooms.get_or_default(room_id.clone()).mark_read_at(&user_id, event_id);
                 });
+
+                Ok(vec![])
+            },
+            RoomAction::FocusScrollback => {
+                if let RoomState::Chat(chat) = self {
+                    chat.focus_scrollback();
+                }
 
                 Ok(vec![])
             },

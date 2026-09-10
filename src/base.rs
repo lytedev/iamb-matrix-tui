@@ -573,6 +573,14 @@ pub enum RoomAction {
     /// entire inbox a message at a time.
     NextUnread,
 
+    /// Put the focus on the scrollback rather than the message bar.
+    ///
+    /// A room window is created focused on its message bar, which is right for a room opened to
+    /// say something in and wrong for one opened to read. The window that a jump lands on is
+    /// focused where the reading happens; so is a thread, which is opened from the message it is
+    /// about.
+    FocusScrollback,
+
     /// Move to the oldest unread message of the room or thread being viewed, and no further.
     ///
     /// This is [RoomAction::NextUnread] without the hop to another room, and exists so that the
