@@ -194,9 +194,11 @@ impl SwitchItem {
                 let room_id = room.room_id();
                 let alias = room.canonical_alias();
 
+                let user_id = store.application.settings.profile.user_id.clone();
+
                 let info = store.application.rooms.get_or_default(room_id.to_owned());
                 let name = info.name.clone().unwrap_or_else(|| room_id.to_string());
-                let unread = info.unreads(room);
+                let unread = info.unreads(room, &user_id);
 
                 items.push(SwitchItem {
                     name,

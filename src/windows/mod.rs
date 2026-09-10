@@ -1926,11 +1926,12 @@ impl GenericChatItem {
         let wake_at = store.application.snooze.wake_at(&room_id.to_owned(), None);
         let deferred = wake_at.is_some_and(|w| w > now);
         let mentions = unread_mentions(room);
+        let user_id = store.application.settings.profile.user_id.clone();
 
         let info = store.application.rooms.get_or_default(room_id.to_owned());
         let name = info.name.clone().unwrap_or_default();
         let alias = room.canonical_alias();
-        let unread = info.unreads(room).with_wake_time(wake_at);
+        let unread = info.unreads(room, &user_id).with_wake_time(wake_at);
         info.tags.clone_from(&room_info.deref().1);
 
         if let Some(alias) = &alias {
@@ -2069,10 +2070,12 @@ impl RoomItem {
         let room = &room_info.deref().0;
         let room_id = room.room_id();
 
+        let user_id = store.application.settings.profile.user_id.clone();
+
         let info = store.application.rooms.get_or_default(room_id.to_owned());
         let name = info.name.clone().unwrap_or_default();
         let alias = room.canonical_alias();
-        let unread = info.unreads(room);
+        let unread = info.unreads(room, &user_id);
         info.tags.clone_from(&room_info.deref().1);
 
         if let Some(alias) = &alias {
@@ -2192,9 +2195,11 @@ impl DirectItem {
         let room_id = room_info.0.room_id().to_owned();
         let alias = room_info.0.canonical_alias();
 
+        let user_id = store.application.settings.profile.user_id.clone();
+
         let info = store.application.rooms.get_or_default(room_id);
         let name = info.name.clone().unwrap_or_default();
-        let unread = info.unreads(&room_info.0);
+        let unread = info.unreads(&room_info.0, &user_id);
         info.tags.clone_from(&room_info.deref().1);
 
         DirectItem { room_info, name, alias, unread }
@@ -2892,6 +2897,7 @@ mod tests {
             name: "Room 1",
             unread: UnreadInfo {
                 latest: None,
+                unread: false,
                 unread_mark: false,
                 unread_messages: 0,
                 unread_notifications: 0,
@@ -2907,6 +2913,7 @@ mod tests {
             name: "Room 2",
             unread: UnreadInfo {
                 latest: Some(MessageTimeStamp(MilliSecondsSinceUnixEpoch(40u32.into()))),
+                unread: false,
                 unread_mark: false,
                 unread_messages: 0,
                 unread_notifications: 0,
@@ -2922,6 +2929,7 @@ mod tests {
             name: "Room 3",
             unread: UnreadInfo {
                 latest: Some(MessageTimeStamp(MilliSecondsSinceUnixEpoch(20u32.into()))),
+                unread: false,
                 unread_mark: false,
                 unread_messages: 0,
                 unread_notifications: 0,

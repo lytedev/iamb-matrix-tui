@@ -1159,6 +1159,16 @@ pub enum EchoLocation {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnreadInfo {
+    /// Whether the messages this client holds go past the user's read receipt.
+    ///
+    /// This is what the inbox windows and `:nextunread` both go by, and they have to go by the
+    /// same thing. The server's own counts answer a different question: they do not know about a
+    /// receipt this client has only just moved, and they do not go quiet for a room read with
+    /// `:read` until the server has seen that receipt. An inbox built on them lists rooms that
+    /// `:nextunread` then jumps to and finds nothing unread in, which is how it came to report
+    /// that nothing was left unread with a screen full of unread rooms behind it.
+    pub(crate) unread: bool,
+
     pub(crate) unread_mark: bool,
     pub(crate) unread_messages: u64,
     pub(crate) unread_notifications: u64,
@@ -1168,7 +1178,7 @@ pub struct UnreadInfo {
 
 impl UnreadInfo {
     pub fn is_unread(&self) -> bool {
-        self.unread_mark || self.unread_notifications > 0 || self.unread_mentions > 0
+        self.unread || self.unread_mark
     }
 
     pub fn has_mention(&self) -> bool {
@@ -1186,7 +1196,8 @@ impl UnreadInfo {
     /// newest reply is the only thing that can answer for one.
     pub(crate) fn from_receipt(unread: bool, latest: Option<MessageTimeStamp>) -> Self {
         UnreadInfo {
-            unread_mark: unread,
+            unread,
+            unread_mark: false,
             unread_messages: u64::from(unread),
             unread_notifications: 0,
             unread_mentions: 0,
@@ -1840,14 +1851,35 @@ impl RoomInfo {
     }
 
     /// Indicates whether this room has unread messages.
-    pub fn unreads(&self, room: &matrix_sdk::Room) -> UnreadInfo {
+    /// What the inbox windows show for a room.
+    ///
+    /// The counts come from the server, because a mention in a message this client has not loaded
+    /// is still a mention. Whether the room is unread does not: see [UnreadInfo::unread].
+    pub fn unreads(&self, room: &matrix_sdk::Room, user_id: &UserId) -> UnreadInfo {
         let last_message = self
             .messages
             .iter()
             .rev()
             .find(|(_, msg)| !matches!(&msg.event, MessageEvent::State(..)));
 
+        let read = [ReceiptThread::Main, ReceiptThread::Unthreaded]
+            .iter()
+            .filter_map(|thread| self.receipt_key(thread, user_id))
+            .max();
+
+        let unread = match (last_message.map(|(key, _)| key), read) {
+            (Some(key), Some(read)) => key > read,
+
+            // A room whose receipt has never been seen, or whose receipt is older than the oldest
+            // message still loaded, is worth showing: there is something here to land on.
+            (Some(_), None) => true,
+
+            // Nothing loaded is nothing to walk to, whatever the server says.
+            (None, _) => false,
+        };
+
         UnreadInfo {
+            unread,
             unread_mark: room.is_marked_unread(),
             unread_messages: room.num_unread_messages(),
             unread_notifications: room.num_unread_notifications(),
@@ -4020,6 +4052,56 @@ pub mod tests {
                 Span::from(" is typing...")
             ])
         );
+    }
+
+    mod is_unread {
+        use super::*;
+
+        /// The inbox windows and `:nextunread` have to agree about what is unread, and the
+        /// server's counts are not a second opinion on it. A room they call unread that this
+        /// client has read is one the walk jumps to and finds nothing to land on in, which is how
+        /// `:nextunread` came to report that nothing was left unread with a list of unread rooms
+        /// still on the screen behind it.
+        #[test]
+        fn the_servers_counts_do_not_make_a_read_room_unread() {
+            let info = UnreadInfo {
+                unread: false,
+                unread_mark: false,
+                unread_messages: 12,
+                unread_notifications: 5,
+                unread_mentions: 1,
+                latest: None,
+            };
+
+            assert!(!info.is_unread());
+        }
+
+        /// The counts still answer for mentions, because a mention in a message that has not been
+        /// loaded is still a mention.
+        #[test]
+        fn the_servers_counts_still_answer_for_mentions() {
+            let info = UnreadInfo {
+                unread_mentions: 1,
+                ..UnreadInfo::from_receipt(false, None)
+            };
+
+            assert!(info.has_mention());
+        }
+
+        #[test]
+        fn messages_past_the_receipt_are_unread() {
+            assert!(UnreadInfo::from_receipt(true, None).is_unread());
+        }
+
+        #[test]
+        fn a_room_marked_unread_by_hand_is_unread() {
+            let info = UnreadInfo {
+                unread_mark: true,
+                ..UnreadInfo::from_receipt(false, None)
+            };
+
+            assert!(info.is_unread());
+        }
     }
 
     mod awaiting_messages {
