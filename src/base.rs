@@ -1261,6 +1261,9 @@ pub struct ThreadSummary {
 
     /// Whether the thread has activity the user hasn't read yet.
     pub unread: UnreadInfo,
+
+    /// Whether anything unread in the thread names the user.
+    pub has_unread_mention: bool,
 }
 
 /// Track the display names for users and render any needed disambiguation for
@@ -1486,9 +1489,26 @@ impl RoomInfo {
                     root: root.clone(),
                     preview: self.thread_preview(root),
                     unread: self.thread_unreads(root, settings),
+                    has_unread_mention: self.thread_has_unread_mention(root, user_id),
                 }
             })
             .collect()
+    }
+
+    /// Whether anything unread in the thread rooted at `root` names the user.
+    ///
+    /// The room-wide highlight counts cannot answer this, since they say nothing about where in
+    /// the room the mention was, so the thread's own messages are read instead.
+    fn thread_has_unread_mention(&self, root: &EventId, user_id: &UserId) -> bool {
+        let read = self.thread_receipt_key(root, user_id);
+        let root_message = self.get_message_key(root).zip(self.get_event(root));
+        let replies = self.threads.get(root).into_iter().flat_map(|replies| replies.iter());
+
+        root_message
+            .into_iter()
+            .chain(replies)
+            .filter(|(key, _)| read.is_none_or(|read| *key > read))
+            .any(|(_, msg)| msg.sender != user_id && msg.names_user(user_id))
     }
 
     /// Whether the user follows the thread rooted at `root`.
@@ -1498,7 +1518,9 @@ impl RoomInfo {
     ///
     /// - the user started the thread, or replied in it (participation), or
     /// - the user has a thread-scoped read receipt for it, which is how another client records
-    ///   that it was tracking the thread on their behalf (subscription proxy).
+    ///   that it was tracking the thread on their behalf (subscription proxy), or
+    /// - somebody named the user in it, which asks for their attention whether or not they have
+    ///   ever posted there.
     fn follows_thread(&self, root: &EventId, user_id: &UserId) -> bool {
         let sent_root = self.get_event(root).is_some_and(|msg| msg.sender == user_id);
 
@@ -1512,7 +1534,12 @@ impl RoomInfo {
             .get(&ReceiptThread::Thread(root.to_owned()))
             .is_some_and(|receipts| receipts.contains_key(user_id));
 
-        sent_root || sent_reply || has_thread_receipt
+        let names_user = self
+            .threads
+            .get(root)
+            .is_some_and(|replies| replies.values().any(|msg| msg.names_user(user_id)));
+
+        sent_root || sent_reply || has_thread_receipt || names_user
     }
 
     /// A short, single-line preview of the message that started a thread.
@@ -1549,20 +1576,28 @@ impl RoomInfo {
             .map(|(key, _)| key)
             .or_else(|| self.get_message_key(root));
 
-        let last_receipt = [
-            ReceiptThread::Thread(root.to_owned()),
-            ReceiptThread::Main,
-            ReceiptThread::Unthreaded,
-        ]
-        .iter()
-        .filter_map(|thread| self.receipt_key(thread, user_id))
-        .max();
+        let last_receipt = self.thread_receipt_key(root, user_id);
 
         match (last_message, last_receipt) {
             (Some(key), Some(read)) => UnreadInfo::from_receipt(key > read, Some(key.ts)),
             (Some(key), None) => UnreadInfo::from_receipt(true, Some(key.ts)),
             (None, _) => UnreadInfo::default(),
         }
+    }
+
+    /// How far the user has read in the thread rooted at `root`.
+    ///
+    /// A receipt on the main timeline counts, since reading the room past the thread's newest
+    /// reply leaves nothing in the thread to come back to.
+    fn thread_receipt_key(&self, root: &EventId, user_id: &UserId) -> Option<&MessageKey> {
+        [
+            ReceiptThread::Thread(root.to_owned()),
+            ReceiptThread::Main,
+            ReceiptThread::Unthreaded,
+        ]
+        .iter()
+        .filter_map(|thread| self.receipt_key(thread, user_id))
+        .max()
     }
 
     /// Where a user's most recent read receipt for a receipt thread sits in the scrollback.
@@ -3287,7 +3322,7 @@ pub mod tests {
     use crate::tests::*;
     use matrix_sdk::ruma::{
         MilliSecondsSinceUnixEpoch,
-        events::{reaction::ReactionEventContent, relation::Annotation},
+        events::{Mentions, reaction::ReactionEventContent, relation::Annotation},
         owned_event_id,
         server_name,
     };
@@ -3377,6 +3412,102 @@ pub mod tests {
 
         let subscribed = followed.iter().find(|t| t.root == ignored_root).unwrap();
         assert!(!subscribed.unread.is_unread());
+    }
+
+    /// Add a reply to a thread, sent by `sender`, saying whatever `content` says.
+    fn reply_in_thread(
+        room: &mut RoomInfo,
+        root: &EventId,
+        sender: OwnedUserId,
+        content: RoomMessageEventContent,
+        millis: u64,
+    ) -> OwnedEventId {
+        let reply_id = EventId::new_v1(server_name!("example.com"));
+        let key = key_at(millis, reply_id.clone());
+
+        room.keys
+            .insert(reply_id.clone(), EventLocation::Message(Some(root.to_owned()), key.clone()));
+        room.get_thread_mut(Some(root.to_owned()))
+            .insert(key.clone(), mock_room1_message(content, sender, key));
+
+        reply_id
+    }
+
+    /// A message that names `user_id` the way any current client would.
+    fn naming(user_id: &UserId) -> RoomMessageEventContent {
+        RoomMessageEventContent::text_plain("are you there?")
+            .add_mentions(Mentions::with_user_ids([user_id.to_owned()]))
+    }
+
+    #[test]
+    fn test_being_named_in_a_thread_is_enough_to_follow_it() {
+        let (mut room, settings, _, ignored_root) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        reply_in_thread(&mut room, &ignored_root, TEST_USER2.clone(), naming(&user_id), 20);
+
+        let followed = room.followed_threads(&settings);
+        let named = followed.iter().find(|t| t.root == ignored_root).unwrap();
+
+        assert!(named.unread.is_unread());
+        assert!(named.has_unread_mention);
+    }
+
+    #[test]
+    fn test_a_thread_that_names_nobody_carries_no_mention() {
+        let (room, settings, followed_root, _) = mock_room_with_threads();
+
+        let followed = room.followed_threads(&settings);
+        let plain = followed.iter().find(|t| t.root == followed_root).unwrap();
+
+        assert!(plain.unread.is_unread());
+        assert!(!plain.has_unread_mention);
+    }
+
+    #[test]
+    fn test_a_thread_mention_that_has_been_read_carries_no_mention() {
+        let (mut room, settings, _, ignored_root) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        let reply_id =
+            reply_in_thread(&mut room, &ignored_root, TEST_USER2.clone(), naming(&user_id), 20);
+        room.set_receipt(ReceiptThread::Thread(ignored_root.clone()), user_id, reply_id);
+
+        let followed = room.followed_threads(&settings);
+        let named = followed.iter().find(|t| t.root == ignored_root).unwrap();
+
+        // Still followed, because being named is what put the thread on the list, and reading it
+        // does not take it back off.
+        assert!(!named.unread.is_unread());
+        assert!(!named.has_unread_mention);
+    }
+
+    #[test]
+    fn test_the_user_naming_themselves_carries_no_mention() {
+        let (mut room, settings, followed_root, _) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        reply_in_thread(&mut room, &followed_root, user_id.clone(), naming(&user_id), 20);
+
+        let followed = room.followed_threads(&settings);
+        let own = followed.iter().find(|t| t.root == followed_root).unwrap();
+
+        assert!(!own.has_unread_mention);
+    }
+
+    /// Why a mention in a thread needs a thread entry of its own: the room's unread state is
+    /// worked out from the main scrollback, which a threaded reply never lands in, so the room's
+    /// own entry cannot stand in for the thread's.
+    #[test]
+    fn test_a_thread_mention_stays_out_of_the_main_scrollback() {
+        let (mut room, settings, _, ignored_root) = mock_room_with_threads();
+        let user_id = settings.profile.user_id.clone();
+
+        let reply_id =
+            reply_in_thread(&mut room, &ignored_root, TEST_USER2.clone(), naming(&user_id), 20);
+
+        assert!(room.get_event(&reply_id).unwrap().names_user(&user_id));
+        assert!(!room.messages.values().any(|msg| msg.names_user(&user_id)));
     }
 
     #[test]

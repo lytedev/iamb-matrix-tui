@@ -29,8 +29,10 @@ use matrix_sdk::ruma::{
     OwnedEventId,
     OwnedUserId,
     UInt,
+    UserId,
     events::{
         AnySyncStateEvent,
+        Mentions,
         RedactedUnsigned,
         relation::Thread,
         room::{
@@ -611,6 +613,24 @@ impl MessageEvent {
         }
     }
 
+    /// The `m.mentions` of the message as it stands, edits included.
+    fn mentions(&self) -> Option<&Mentions> {
+        match self {
+            MessageEvent::Original(ev, edits) => {
+                match edits.last_key_value() {
+                    Some((_, edit)) => edit.mentions.as_ref(),
+                    None => ev.content.mentions.as_ref(),
+                }
+            },
+            MessageEvent::Local(_, _, content) => content.mentions.as_ref(),
+            MessageEvent::EncryptedOriginal(_) |
+            MessageEvent::EncryptedRedacted(_) |
+            MessageEvent::Redacted(..) |
+            MessageEvent::State(_) |
+            MessageEvent::Sticker(..) => None,
+        }
+    }
+
     pub fn html(&self) -> Option<StyleTree> {
         if let MessageEvent::State(ev) = self {
             return Some(html_state(ev));
@@ -1150,6 +1170,21 @@ impl Message {
         let downloaded = false;
 
         Message { event, sender, timestamp, downloaded, html }
+    }
+
+    /// Whether this message names `user_id`, either by mentioning them or by pinging the room.
+    ///
+    /// A client that sets `m.mentions` is taken at its word, so text that merely quotes a user ID
+    /// is not a mention when the sender said which users it meant. Only a message from a client
+    /// old enough to send no `m.mentions` at all falls back to looking for the user ID in the
+    /// text, which is how those clients marked a mention before [MSC3952].
+    ///
+    /// [MSC3952]: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/3952-intentional-mentions.md
+    pub fn names_user(&self, user_id: &UserId) -> bool {
+        match self.event.mentions() {
+            Some(mentions) => mentions.room || mentions.user_ids.contains(user_id),
+            None => self.event.body().contains(user_id.as_str()),
+        }
     }
 
     pub fn reply_to(&self) -> Option<OwnedEventId> {
@@ -1858,6 +1893,66 @@ pub mod tests {
             color: None,
             name: Some(name.to_string()),
         });
+    }
+
+    /// A message sent by [TEST_USER2] saying whatever `content` says.
+    fn sent(content: RoomMessageEventContent) -> Message {
+        mock_room1_message(content, TEST_USER2.clone(), MSG1_KEY.clone())
+    }
+
+    #[test]
+    fn test_an_intentional_mention_names_the_user() {
+        let msg = sent(
+            RoomMessageEventContent::text_plain("ping")
+                .add_mentions(Mentions::with_user_ids([TEST_USER1.clone()])),
+        );
+
+        assert!(msg.names_user(&TEST_USER1));
+        assert!(!msg.names_user(&TEST_USER3));
+    }
+
+    #[test]
+    fn test_a_room_ping_names_everybody_in_the_room() {
+        let msg = sent(RoomMessageEventContent::text_plain("everyone").add_mentions({
+            let mut mentions = Mentions::new();
+            mentions.room = true;
+            mentions
+        }));
+
+        assert!(msg.names_user(&TEST_USER1));
+        assert!(msg.names_user(&TEST_USER3));
+    }
+
+    /// A sender who said which users they meant has said it: quoting somebody else's user ID in
+    /// the text does not name them as well.
+    #[test]
+    fn test_a_quoted_user_id_is_not_a_mention_when_the_sender_said_who_they_meant() {
+        let body = format!("{} asked about this", &*TEST_USER3);
+        let msg = sent(
+            RoomMessageEventContent::text_plain(body)
+                .add_mentions(Mentions::with_user_ids([TEST_USER1.clone()])),
+        );
+
+        assert!(msg.names_user(&TEST_USER1));
+        assert!(!msg.names_user(&TEST_USER3));
+    }
+
+    /// Clients older than intentional mentions send no `m.mentions` at all, and wrote the user ID
+    /// into the text instead.
+    #[test]
+    fn test_a_message_without_intentional_mentions_falls_back_to_its_text() {
+        let body = format!("{}: ping", &*TEST_USER1);
+        let msg = sent(RoomMessageEventContent::text_plain(body));
+
+        assert!(msg.names_user(&TEST_USER1));
+        assert!(!msg.names_user(&TEST_USER3));
+    }
+
+    #[test]
+    fn test_a_message_that_names_nobody() {
+        let msg = sent(RoomMessageEventContent::text_plain("no names here"));
+
+        assert!(!msg.names_user(&TEST_USER1));
     }
 
     /// A wide pane keeps the configured column, so a cap that is never reached costs nothing.
