@@ -622,8 +622,9 @@ impl IambWindow {
             match self {
                 IambWindow::DirectList(l) => mark_selection_read(l, store)?,
                 IambWindow::RoomList(l) => mark_selection_read(l, store)?,
-                IambWindow::ChatList(l) |
-                IambWindow::UnreadList(l) |
+                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
+                    mark_selection_read(l, store)?
+                },
                 IambWindow::MentionList(l) => mark_selection_read(l, store)?,
                 IambWindow::ThreadList(l) => mark_selection_read(l, store)?,
                 IambWindow::UnreadThreadList(l) => mark_selection_read(l, store)?,
@@ -639,8 +640,9 @@ impl IambWindow {
             match self {
                 IambWindow::DirectList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::RoomList(l) => snooze_selection(l, &act, store)?,
-                IambWindow::ChatList(l) |
-                IambWindow::UnreadList(l) |
+                IambWindow::ChatList(l) | IambWindow::UnreadList(l) => {
+                    snooze_selection(l, &act, store)?
+                },
                 IambWindow::MentionList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::ThreadList(l) => snooze_selection(l, &act, store)?,
                 IambWindow::SnoozeList(l) => snooze_selection(l, &act, store)?,
@@ -658,8 +660,9 @@ impl IambWindow {
             IambWindow::DirectList(state) => state.get().map(|state| state.room_id()),
             IambWindow::RoomList(state) => state.get().map(|state| state.room_id()),
             IambWindow::SpaceList(state) => state.get().map(|state| state.room_id()),
-            IambWindow::ChatList(state) |
-            IambWindow::UnreadList(state) |
+            IambWindow::ChatList(state) | IambWindow::UnreadList(state) => {
+                state.get().map(|state| state.room_id())
+            },
             IambWindow::MentionList(state) => state.get().map(|state| state.room_id()),
 
             _ => None,
@@ -694,7 +697,7 @@ pub type UnreadListState = ListState<GenericChatItem, IambInfo>;
 pub type ThreadListState = ListState<ThreadItem, IambInfo>;
 pub type SnoozeListState = ListState<SnoozeItem, IambInfo>;
 pub type UnreadThreadListState = ListState<UnreadThreadItem, IambInfo>;
-pub type MentionListState = ListState<GenericChatItem, IambInfo>;
+pub type MentionListState = ListState<UnreadThreadItem, IambInfo>;
 pub type SpaceListState = ListState<SpaceItem, IambInfo>;
 pub type VerifyListState = ListState<VerifyItem, IambInfo>;
 
@@ -1059,8 +1062,21 @@ impl IambWindow {
                 sorted!(state, items, chats);
             },
             IambWindow::MentionList(state) => {
-                let items =
-                    chat_items(store).into_iter().filter(is_unread_mention).collect::<Vec<_>>();
+                // Threads are listed beside rooms here for the same reason `:unreadthreads` lists
+                // them: a room's own unread state is worked out from its main timeline, so a
+                // mention that arrived in a thread has no room row to show up as.
+                let mut items = chat_items(store)
+                    .into_iter()
+                    .filter(is_unread_mention)
+                    .map(UnreadThreadItem::Chat)
+                    .collect::<Vec<_>>();
+
+                let threads = followed_thread_items(store)
+                    .into_iter()
+                    .filter(is_unread_mention)
+                    .map(UnreadThreadItem::Thread);
+
+                items.extend(threads);
 
                 // The same sort as the other inbox windows, so that one room does not sit in a
                 // different place here than it does there.
@@ -1508,8 +1524,8 @@ fn followed_thread_items(store: &mut ProgramStore) -> Vec<ThreadItem> {
     let room_infos = sync_info
         .rooms
         .iter()
-        .chain(sync_info.dms.iter())
-        .cloned()
+        .map(|room_info| (room_info.clone(), false))
+        .chain(sync_info.dms.iter().map(|room_info| (room_info.clone(), true)))
         .collect::<Vec<_>>();
 
     // The snooze cache is a third field borrow beside rooms and settings, which is why it lives on
@@ -1519,7 +1535,7 @@ fn followed_thread_items(store: &mut ProgramStore) -> Vec<ThreadItem> {
 
     room_infos
         .into_iter()
-        .flat_map(|room_info| {
+        .flat_map(|(room_info, is_dm)| {
             let room = &room_info.deref().0;
             let alias = room.canonical_alias();
             let info = rooms.get_or_default(room.room_id().to_owned());
@@ -1535,6 +1551,7 @@ fn followed_thread_items(store: &mut ProgramStore) -> Vec<ThreadItem> {
                         room_name.clone(),
                         alias.clone(),
                         summary,
+                        is_dm,
                         wake_at,
                         now,
                     )
@@ -1553,6 +1570,10 @@ pub struct ThreadItem {
     thread_root: OwnedEventId,
     preview: String,
     unread: UnreadInfo,
+    /// Whether anything unread in this thread names the user.
+    has_unread_mention: bool,
+    /// Whether the thread is in a DM, where everything said is addressed to the user.
+    is_dm: bool,
     /// True while a snooze on this thread, or on its room, is still running.
     deferred: bool,
 }
@@ -1563,10 +1584,11 @@ impl ThreadItem {
         room_name: String,
         alias: Option<OwnedRoomAliasId>,
         summary: ThreadSummary,
+        is_dm: bool,
         wake_at: Option<WakeTime>,
         now: WakeTime,
     ) -> Self {
-        let ThreadSummary { root, preview, unread } = summary;
+        let ThreadSummary { root, preview, unread, has_unread_mention } = summary;
 
         ThreadItem {
             room_info,
@@ -1575,6 +1597,8 @@ impl ThreadItem {
             thread_root: root,
             preview,
             unread: unread.with_wake_time(wake_at),
+            has_unread_mention,
+            is_dm,
             deferred: wake_at.is_some_and(|w| w > now),
         }
     }
@@ -1582,6 +1606,12 @@ impl ThreadItem {
     #[inline]
     fn room(&self) -> &MatrixRoom {
         &self.room_info.deref().0
+    }
+}
+
+impl AddressedItem for ThreadItem {
+    fn is_addressed_to_the_user(&self) -> bool {
+        self.is_dm || self.has_unread_mention
     }
 }
 
@@ -1813,6 +1843,12 @@ macro_rules! delegate_unread_thread {
             UnreadThreadItem::Thread($item) => $e,
         }
     };
+}
+
+impl AddressedItem for UnreadThreadItem {
+    fn is_addressed_to_the_user(&self) -> bool {
+        delegate_unread_thread!(self, item => item.is_addressed_to_the_user())
+    }
 }
 
 impl RoomLikeItem for UnreadThreadItem {

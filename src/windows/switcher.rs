@@ -229,6 +229,7 @@ impl SwitchItem {
                     root: item.thread_root,
                     preview: item.preview,
                     unread: item.unread,
+                    has_unread_mention: item.has_unread_mention,
                 })
             })
             .collect()
@@ -241,7 +242,7 @@ impl SwitchItem {
     /// second name, because the user who wants "that thread in #general" remembers the room long
     /// after they forget how the thread opened.
     fn thread(room_name: String, room_id: OwnedRoomId, summary: ThreadSummary) -> SwitchItem {
-        let ThreadSummary { root, preview, unread } = summary;
+        let ThreadSummary { root, preview, unread, has_unread_mention: _ } = summary;
 
         SwitchItem {
             name: preview,
@@ -518,6 +519,7 @@ mod tests {
             root: event_id!("$thread:example.com").to_owned(),
             preview: preview.to_string(),
             unread: UnreadInfo::from_receipt(unread, None),
+            has_unread_mention: false,
         })
     }
 
