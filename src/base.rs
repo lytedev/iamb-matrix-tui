@@ -2582,6 +2582,13 @@ pub struct ChatStore {
     /// The receiving end of [ChatStore::reports].
     reports_rx: UnboundedReceiver<BackgroundReport>,
 
+    /// How much of the unread traffic the `:activity` feed could actually show.
+    ///
+    /// Left here as the feed's rows are built and read back when its title is drawn, for the same
+    /// reason as [ChatStore::list_counts]: a title is drawn from the window, and a window cannot
+    /// look inside its own list.
+    pub unread_feed_reach: Reach,
+
     /// How many entries each list window last put in its list.
     ///
     /// A window title is drawn from the window, which cannot look inside its own list, so the
@@ -2594,6 +2601,32 @@ pub struct ChatStore {
     /// Shared with the background task that walks the history, which is why it is behind an Arc:
     /// the commands that watch and stop the walk run on the main loop, and the walk does not.
     pub backfill: Arc<Backfill>,
+}
+
+/// What the `:activity` feed could not show, so that its title can say so.
+///
+/// A feed of unread messages that silently showed a fraction of them would be worse than no feed:
+/// the user would read it to the end and believe they were done. Both numbers here exist to stop
+/// that, and both are reported in the window's title.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Reach {
+    /// How many rooms or threads have unread messages older than the client has loaded.
+    pub entries_cut_short: usize,
+
+    /// Whether whole runs were left out because the feed hit the most rows it draws.
+    pub rows_left_out: bool,
+}
+
+impl Reach {
+    /// What to add to the window title, when there is something to admit.
+    pub fn note(&self) -> Option<String> {
+        match (self.entries_cut_short, self.rows_left_out) {
+            (0, false) => None,
+            (0, true) => Some("more than fits".to_string()),
+            (entries, false) => Some(format!("{entries} reach further back")),
+            (entries, true) => Some(format!("{entries} reach further back, more than fits")),
+        }
+    }
 }
 
 /// What a list window holds, as its title reports it.
@@ -2727,6 +2760,7 @@ impl ChatStore {
             reports_rx,
             backfill: Default::default(),
             list_counts: Default::default(),
+            unread_feed_reach: Default::default(),
             worker,
             settings,
             snooze: SnoozeStore::default(),
@@ -2915,6 +2949,9 @@ pub enum IambId {
     /// The `:unreadmentions` window.
     MentionList,
 
+    /// The `:activity` window.
+    ActivityList,
+
     /// The `:commands` window.
     CommandPalette,
 
@@ -2951,6 +2988,7 @@ impl Display for IambId {
             IambId::SnoozeList => f.write_str("iamb://snoozed"),
             IambId::UnreadThreadList => f.write_str("iamb://unreads-and-threads"),
             IambId::MentionList => f.write_str("iamb://unread-mentions"),
+            IambId::ActivityList => f.write_str("iamb://activity"),
             IambId::CommandPalette => f.write_str("iamb://commands"),
             IambId::QuickSwitcher => f.write_str("iamb://switch"),
             IambId::MessageSearch(term) => f.write_str(search_url(term).as_str()),
@@ -3135,6 +3173,13 @@ impl Visitor<'_> for IambIdVisitor {
 
                 Ok(IambId::MentionList)
             },
+            Some("activity") => {
+                if url.path() != "" {
+                    return Err(E::custom("iamb://activity takes no path"));
+                }
+
+                Ok(IambId::ActivityList)
+            },
             Some("commands") => {
                 if url.path() != "" {
                     return Err(E::custom("iamb://commands takes no path"));
@@ -3247,6 +3292,12 @@ pub enum IambBufferId {
     /// The `:unreadmentions` window.
     MentionList,
 
+    /// The `:activity` window's message list.
+    ActivityList,
+
+    /// The `:activity` window's filter bar.
+    ActivityFilter,
+
     /// The command palette's entry list.
     CommandPaletteList,
 
@@ -3284,6 +3335,8 @@ impl IambBufferId {
             IambBufferId::SnoozeList => IambId::SnoozeList,
             IambBufferId::UnreadThreadList => IambId::UnreadThreadList,
             IambBufferId::MentionList => IambId::MentionList,
+            IambBufferId::ActivityList => IambId::ActivityList,
+            IambBufferId::ActivityFilter => IambId::ActivityList,
             IambBufferId::CommandPaletteList => IambId::CommandPalette,
             IambBufferId::CommandPaletteFilter => IambId::CommandPalette,
             IambBufferId::QuickSwitcherList => IambId::QuickSwitcher,
@@ -4022,11 +4075,33 @@ pub mod tests {
     }
 
     #[test]
+    fn test_a_feed_that_reached_everything_says_nothing() {
+        assert_eq!(Reach::default().note(), None);
+    }
+
+    #[test]
+    fn test_a_feed_says_how_many_rooms_it_could_not_reach_the_start_of() {
+        let reach = Reach { entries_cut_short: 3, rows_left_out: false };
+
+        assert_eq!(reach.note().unwrap(), "3 reach further back");
+    }
+
+    #[test]
+    fn test_a_feed_says_when_it_left_whole_runs_out() {
+        let capped = Reach { entries_cut_short: 0, rows_left_out: true };
+        let both = Reach { entries_cut_short: 2, rows_left_out: true };
+
+        assert_eq!(capped.note().unwrap(), "more than fits");
+        assert_eq!(both.note().unwrap(), "2 reach further back, more than fits");
+    }
+
+    #[test]
     fn test_thread_window_urls() {
         for (id, url) in [
             (IambId::ThreadList, "iamb://threads"),
             (IambId::UnreadThreadList, "iamb://unreads-and-threads"),
             (IambId::MentionList, "iamb://unread-mentions"),
+            (IambId::ActivityList, "iamb://activity"),
         ] {
             assert_eq!(id.to_string(), url);
 

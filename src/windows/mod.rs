@@ -84,6 +84,7 @@ use crate::snooze::{SnoozeKey, WakeTime, describe};
 use crate::windows::room::room_command;
 
 use self::{
+    activity::ActivityState,
     palette::CommandPaletteState,
     room::RoomState,
     search::{Found, MessageSearchState},
@@ -94,6 +95,7 @@ use self::{
 use crate::message::MessageTimeStamp;
 use feruca::Collator;
 
+pub mod activity;
 pub mod filtered;
 pub mod palette;
 pub mod room;
@@ -525,6 +527,7 @@ macro_rules! delegate {
             IambWindow::SnoozeList($id) => $e,
             IambWindow::UnreadThreadList($id) => $e,
             IambWindow::MentionList($id) => $e,
+            IambWindow::ActivityList($id) => $e,
             IambWindow::CommandPalette($id) => $e,
             IambWindow::QuickSwitcher($id) => $e,
             IambWindow::MessageSearch($id, _) => $e,
@@ -546,6 +549,7 @@ pub enum IambWindow {
     SnoozeList(SnoozeListState),
     UnreadThreadList(UnreadThreadListState),
     MentionList(MentionListState),
+    ActivityList(ActivityState),
     CommandPalette(CommandPaletteState),
     QuickSwitcher(QuickSwitcherState),
 
@@ -628,6 +632,10 @@ impl IambWindow {
                 IambWindow::MentionList(l) => mark_selection_read(l, store)?,
                 IambWindow::ThreadList(l) => mark_selection_read(l, store)?,
                 IambWindow::UnreadThreadList(l) => mark_selection_read(l, store)?,
+
+                // The feed's rows are messages rather than rooms, so reading one reads up to that
+                // message instead of clearing everything behind it.
+                IambWindow::ActivityList(feed) => mark_selected_message_read(feed, store)?,
                 _ => return Err(IambError::NoSelectedRoomOrSpace.into()),
             }
 
@@ -994,6 +1002,10 @@ impl IambWindow {
                 state.rebuild(store);
                 record!(state.len(), 0, state.is_filtered());
             },
+            IambWindow::ActivityList(state) => {
+                state.rebuild(store);
+                record!(state.len(), 0, state.is_filtered());
+            },
 
             IambWindow::DirectList(state) => {
                 let items = store.application.sync_info.dms.clone();
@@ -1134,6 +1146,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::CommandPalette(state) => return state.draw(area, buf, focused, store),
             IambWindow::QuickSwitcher(state) => return state.draw(area, buf, focused, store),
             IambWindow::MessageSearch(state, _) => return state.draw(area, buf, focused, store),
+            IambWindow::ActivityList(state) => return state.draw(area, buf, focused, store),
             _ => {},
         }
 
@@ -1187,7 +1200,8 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::Welcome(_) |
             IambWindow::CommandPalette(_) |
             IambWindow::QuickSwitcher(_) |
-            IambWindow::MessageSearch(..) => {},
+            IambWindow::MessageSearch(..) |
+            IambWindow::ActivityList(_) => {},
         }
     }
 
@@ -1213,6 +1227,7 @@ impl WindowOps<IambInfo> for IambWindow {
             IambWindow::SnoozeList(w) => IambWindow::SnoozeList(w.dup(store)),
             IambWindow::UnreadThreadList(w) => IambWindow::UnreadThreadList(w.dup(store)),
             IambWindow::MentionList(w) => IambWindow::MentionList(w.dup(store)),
+            IambWindow::ActivityList(w) => IambWindow::ActivityList(w.dup(store)),
         }
     }
 
@@ -1277,6 +1292,55 @@ fn search_title(
     }
 
     Line::from(spans)
+}
+
+/// The title of the `:activity` feed: how many messages are in it, and what it could not reach.
+///
+/// What it could not reach belongs in the title and nowhere else. A row is one message, so unread
+/// messages the client has not loaded have no row to appear on, and their absence would otherwise
+/// read as an inbox the user has finished.
+fn activity_title(counts: Option<ListCounts>, store: &ProgramStore) -> Line<'static> {
+    let mut spans = vec![bold_span("Activity")];
+
+    if let Some(counts) = counts {
+        spans.push(Span::styled(format!(" [{}]", counts.total), bold_style()));
+
+        if counts.filtered {
+            spans.push(filtered_note());
+        }
+    }
+
+    if let Some(note) = store.application.unread_feed_reach.note() {
+        spans.push(Span::styled(
+            format!(" ({note})"),
+            Style::default().add_modifier(StyleModifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Move the user's receipt up to the message selected in the `:activity` feed.
+///
+/// A row there is one message rather than a whole room, so reading is per-message: everything up
+/// to and including it becomes read, and the rest of the room stays waiting. That is what makes
+/// the feed a queue the user can work down.
+fn mark_selected_message_read(feed: &ActivityState, store: &mut ProgramStore) -> IambResult<()> {
+    let Some(item) = feed.selected() else {
+        return Err(IambError::NoSelectedRoom.into());
+    };
+
+    let (room_id, event_id) = item.read_at();
+    let user_id = store.application.settings.profile.user_id.clone();
+
+    store.application.record_read(vec![room_id.clone()], |app| {
+        app.rooms.get_or_default(room_id.clone()).mark_read_at(&user_id, event_id);
+    });
+
+    // Any notification we showed for this room may be for a message that is now read.
+    store.application.open_notifications.remove(&room_id);
+
+    Ok(())
 }
 
 fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
@@ -1370,6 +1434,11 @@ fn open_empty(id: IambId, store: &mut ProgramStore) -> IambResult<IambWindow> {
 
             Ok(IambWindow::MentionList(list))
         },
+        IambId::ActivityList => {
+            let feed = ActivityState::new((), store);
+
+            Ok(IambWindow::ActivityList(feed))
+        },
     }
 }
 
@@ -1389,6 +1458,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::SnoozeList(_) => IambId::SnoozeList,
             IambWindow::UnreadThreadList(_) => IambId::UnreadThreadList,
             IambWindow::MentionList(_) => IambId::MentionList,
+            IambWindow::ActivityList(_) => IambId::ActivityList,
             IambWindow::CommandPalette(_) => IambId::CommandPalette,
             IambWindow::QuickSwitcher(_) => IambId::QuickSwitcher,
             IambWindow::MessageSearch(_, term) => IambId::MessageSearch(term.clone()),
@@ -1416,6 +1486,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::MentionList(_) => {
                 self.list_title("Unread Mentions & DMs", Counted::Total, store)
             },
+            IambWindow::ActivityList(_) => activity_title(self.counts(store), store),
             IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
             IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
             IambWindow::MessageSearch(state, term) => search_title(state, term, self.counts(store)),
@@ -1459,6 +1530,7 @@ impl Window<IambInfo> for IambWindow {
             IambWindow::MentionList(_) => {
                 self.list_title("Unread Mentions & DMs", Counted::Total, store)
             },
+            IambWindow::ActivityList(_) => activity_title(self.counts(store), store),
             IambWindow::CommandPalette(_) => self.list_title("Commands", Counted::Total, store),
             IambWindow::QuickSwitcher(_) => self.list_title("Jump to", Counted::Total, store),
             IambWindow::MessageSearch(state, term) => search_title(state, term, self.counts(store)),
@@ -1516,6 +1588,26 @@ impl Window<IambInfo> for IambWindow {
     fn unnamed(store: &mut ProgramStore) -> IambResult<Self> {
         Self::open(IambId::RoomList, store)
     }
+}
+
+/// Every room and followed thread with unread traffic in it, as the inbox windows see them.
+///
+/// This is what `:activity` walks to find messages. It goes through the same entries the inbox
+/// windows list, so a room the inbox hides -- a snoozed one -- has no messages in the feed either,
+/// and the two cannot disagree about what is waiting.
+pub(crate) fn unread_entries(store: &mut ProgramStore) -> Vec<(OwnedRoomId, Option<OwnedEventId>)> {
+    let chats = chat_items(store)
+        .into_iter()
+        .filter(|item| item.is_unread() && !item.is_deferred())
+        .map(|item| (item.room_id().to_owned(), None))
+        .collect::<Vec<_>>();
+
+    let threads = followed_thread_items(store)
+        .into_iter()
+        .filter(|item| item.is_unread() && !item.is_deferred())
+        .map(|item| (item.room_id().to_owned(), Some(item.thread_root.clone())));
+
+    chats.into_iter().chain(threads).collect()
 }
 
 /// Gather the threads the user follows across every joined room and DM.
@@ -2701,6 +2793,7 @@ mod tests {
             IambId::DirectList,
             IambId::UnreadThreadList,
             IambId::MentionList,
+            IambId::ActivityList,
         ] {
             assert!(IambWindow::open(id, &mut store).is_ok());
         }

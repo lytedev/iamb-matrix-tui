@@ -115,6 +115,15 @@ impl<T: FilteredItem> FilteredListState<T> {
         self.list.len()
     }
 
+    /// The row the user has selected, if the list has any.
+    ///
+    /// A command that acts on the selection needs this: submitting a row goes through
+    /// [Promptable], but `:read` and its like are commands about the window, and reach the window
+    /// rather than the row.
+    pub fn selected(&self) -> Option<&T> {
+        self.list.get()
+    }
+
     /// Type `text` into the filter bar, as the user would.
     #[cfg(test)]
     pub fn set_filter(&mut self, text: &str) {

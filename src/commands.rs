@@ -621,6 +621,17 @@ fn iamb_unreads_and_threads(desc: CommandDescription, ctx: &mut ProgContext) -> 
     return Ok(step);
 }
 
+fn iamb_activity(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    if !desc.arg.text.is_empty() {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    let open = ctx.switch(OpenTarget::Application(IambId::ActivityList));
+    let step = CommandStep::Continue(open, ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_unread_mentions(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     if !desc.arg.text.is_empty() {
         return Result::Err(CommandError::InvalidArgument);
@@ -1685,6 +1696,15 @@ pub const IAMB_COMMANDS: &[IambCommandInfo] = &[
         ],
     },
     IambCommandInfo {
+        name: "activity",
+        aliases: &["unreadswithcontext"],
+        f: iamb_activity,
+        forms: &[opens(
+            "Read every unread message across rooms and threads, newest first",
+            IambId::ActivityList,
+        )],
+    },
+    IambCommandInfo {
         name: "unreadmentions",
         aliases: &[],
         f: iamb_unread_mentions,
@@ -1885,6 +1905,21 @@ mod tests {
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
         assert!(cmds.input_cmd(":switch foo", ctx).is_err());
+    }
+
+    #[test]
+    fn test_cmd_activity() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+        let act = WindowAction::Switch(OpenTarget::Application(IambId::ActivityList));
+
+        let res = cmds.input_cmd(":activity", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.clone().into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":unreadswithcontext", ctx.clone()).unwrap();
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        assert!(cmds.input_cmd(":activity foo", ctx).is_err());
     }
 
     #[test]

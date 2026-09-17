@@ -644,10 +644,10 @@ fn complete_cmdarg(
         "snooze" | "search" | "pipe" => vec![],
 
         // These have no arguments
-        "cancel" | "chats" | "commands" | "context" | "dms" | "editor" | "edit" | "forget" |
-        "leave" | "members" | "mentions" | "nextunread" | "replied" | "reply" | "rooms" |
-        "snoozed" | "spaces" | "switch" | "threads" | "undoread" | "unreadmentions" |
-        "unreadsandthreads" | "unsnooze" | "welcome" => vec![],
+        "activity" | "cancel" | "chats" | "commands" | "context" | "dms" | "editor" | "edit" |
+        "forget" | "leave" | "members" | "mentions" | "nextunread" | "replied" | "reply" |
+        "rooms" | "snoozed" | "spaces" | "switch" | "threads" | "undoread" | "unreadmentions" |
+        "unreadsandthreads" | "unreadswithcontext" | "unsnooze" | "welcome" => vec![],
 
         "abo" | "aboveleft" | "bel" | "belowright" | "hor" | "horizontal" | "lefta" |
         "leftabove" | "rightb" | "rightbelow" | "tab" | "vert" | "vertical" => {
@@ -830,6 +830,8 @@ impl Completer<IambInfo> for IambCompleter {
             IambBufferId::ThreadList => vec![],
             IambBufferId::UnreadThreadList => vec![],
             IambBufferId::MentionList => vec![],
+            IambBufferId::ActivityList => vec![],
+            IambBufferId::ActivityFilter => vec![],
             IambBufferId::CommandPaletteList => vec![],
             IambBufferId::CommandPaletteFilter => vec![],
             IambBufferId::QuickSwitcherList => vec![],

@@ -183,6 +183,7 @@ pub fn mock_tunables() -> TunableValues {
         input_prompt: None,
         log_level: "warn".into(),
         snooze_default: "1h".into(),
+        unread_context_messages: 2,
         snooze_tomorrow_hour: 9,
         max_log_files: 7,
         message_full_wrap: false,

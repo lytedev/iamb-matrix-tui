@@ -97,6 +97,11 @@ In a list window
 this instead marks the currently selected entry as read.
 Only the selected entry is affected; there is no way to mark a range of entries
 read at once.
+In
+.Sy ":activity" ,
+where a row is one message rather than a whole room, it moves your read marker
+to the selected message instead: everything up to and including it becomes read,
+and the rest of the room stays waiting.
 Bound to
 .Sy <C-W>r .
 .It Sy ":read all"
@@ -296,15 +301,45 @@ Restoring a read marker also cannot always be made to stick on the server:
 Synapse ignores a read receipt that points at an event older than the one it
 already has for you, so after a restart the room may read as read again.
 .It Sy ":unreadmentions"
-View a list of the unread rooms that mention you, and the unread direct
-messages.
+View a list of the unread rooms and followed threads that mention you, and the
+unread direct messages.
 This is the narrow inbox: it holds only what is addressed to you, where
 .Sy ":unreadsandthreads"
 holds everything you have not read.
 A room is here when the server or the client counts an unread message in it that
 highlights you, so the room does not have to be one you are otherwise reading.
+A thread is here when something unread in it names you, or when it is in a
+direct message.
+Threads are listed in their own right because a room's unread state comes from
+its main scrollback, which a threaded reply never lands in, so a mention inside
+a thread has no room entry to appear as.
+Being named in a thread is also enough to follow it, so a mention reaches you in
+a thread you have never posted in.
 Entries are sorted the same way as in the other unread windows, and a deferred
 entry is left out until it wakes.
+.It Sy ":activity" , Sy ":unreadswithcontext"
+Read every unread message across every room and followed thread, one row per
+message, without opening any of them.
+Rows are grouped by the room or thread they are in, and those groups are ordered
+by their newest message, so the newest traffic is at the top and a conversation
+stays readable on the way down.
+Each group begins with the
+.Sy unread_context_messages
+messages that came before its unread ones, drawn dim.
+Messages you sent yourself are not listed, though they do appear as context.
+.Pp
+Typing narrows the rows by body, sender or room.
+.Sy <Enter>
+opens the message where it lives and selects it there, and
+.Sy ":read"
+moves your read marker to the selected message, which is what makes the window a
+queue you can work down.
+A deferred room or thread is left out, the same as in the other unread windows.
+.Pp
+The rows come from the scrollback this client has loaded, so a room with more
+unread messages than that reaches further back than the window can see.
+The title says how many rooms are in that position, and whether whole groups
+were left out because there were more rows than the window draws.
 .It Sy ":unreads"
 View a list of unread rooms.
 .It Sy ":unreads clear"

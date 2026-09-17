@@ -362,6 +362,15 @@ The column is the smaller of
 .Sy user_gutter_width
 and this share, so that a narrow pane keeps room for the message.
 Defaults to 25.
+.It Sy unread_context_messages
+How many messages
+.Sy ":activity"
+draws in front of a room or thread's unread ones, to place them.
+An unread reply is often an answer, and an answer without the question is not
+worth reading.
+The context is drawn dim, and a run can only show as much of it as is loaded.
+Defaults to 2.
+Set it to 0 for unread messages alone.
 .It Sy tabstop
 Number of spaces that a <Tab> counts for.
 Defaults to 4.
