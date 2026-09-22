@@ -1,9 +1,9 @@
 //! # Unread Message Feed
 //!
 //! The `:activity` window is every unread message in every room and followed thread, one row per
-//! message, newest conversation first. The other inbox windows answer "where is there something to
-//! read"; this one answers "what does it say", which is the question the user actually has when
-//! they come back to a client that has been running all day.
+//! message, newest first. The other inbox windows answer "where is there something to read"; this
+//! one answers "what does it say", which is the question the user actually has when they come back
+//! to a client that has been running all day.
 //!
 //! It is shaped like the [`:search` window][crate::windows::search]: a filter bar over rows of
 //! room, sender, time and body, where taking a row goes to that message where it lives. What
@@ -11,22 +11,12 @@
 //! these rows are read out of the scrollback the client already holds, and rebuilt on every draw,
 //! so a message that arrives while the window is open appears in it.
 //!
-//! ## Runs, not a flat stream
+//! ## One order, and it is time
 //!
-//! Rows are grouped into runs -- one run per room or thread that has unread messages -- and the
-//! runs are ordered by their newest message, newest first. Inside a run the messages stay in the
-//! order they were sent.
-//!
-//! Sorting every message by time on its own would interleave conversations, and three words from
-//! one room between two halves of another is not readable. Ordering runs by recency still puts
-//! the newest traffic at the top, which is what recency is wanted for.
-//!
-//! ## Context
-//!
-//! A run begins with the [ApplicationSettings::unread_context_messages] messages that come before
-//! its first unread one, drawn dim. An unread reply is very often an answer, and an answer without
-//! the question is not worth reading. Context messages include the user's own, because "what I
-//! last said here" is most of what places a reply.
+//! Rows are sorted by when they were sent, newest first, across every room and thread together.
+//! Nothing groups them: the window is a stream of what has come in, and a stream that reorders
+//! itself to keep rooms together stops answering "what is the newest thing I have not read",
+//! which is the question it is open for.
 //!
 //! Unread messages the user sent themselves are left out. Their own message is not incoming
 //! traffic, and a client that advances a receipt on send would not have shown it here anyway.
@@ -96,21 +86,15 @@ const MIN_BODY_COLUMN_WIDTH: usize = 16;
 /// The narrowest the room and sender columns are drawn, when the terminal has no room for more.
 const MIN_LABEL_COLUMN_WIDTH: usize = 8;
 
-/// Drawn in front of a message that has not been read.
-const UNREAD_MARK: &str = "●";
-
-/// Drawn in front of a message that is only there to place the unread ones.
-const CONTEXT_MARK: &str = " ";
-
 /// The most rows the feed draws.
 ///
 /// The list is rebuilt on every draw, so its size is paid for again on every keystroke and every
 /// message that arrives. An account that has gone unread for a month would otherwise rebuild many
-/// thousands of rows to show the twenty that fit on screen. The newest runs are kept, since those
-/// are the ones being read.
+/// thousands of rows to show the twenty that fit on screen. The newest messages are kept, since
+/// those are the ones being read.
 const MAX_ROWS: usize = 500;
 
-/// One message in the feed: unread, or context for the unread ones under it.
+/// One unread message in the feed.
 #[derive(Clone)]
 pub struct ActivityItem {
     /// The room the message is in, by the name the user knows it under.
@@ -125,8 +109,11 @@ pub struct ActivityItem {
     /// What it said.
     body: String,
 
-    /// Whether this message is unread, rather than context drawn to place the unread ones.
-    unread: bool,
+    /// Where the message sits in its room, which is what orders the feed.
+    ///
+    /// The timestamp alone cannot: two messages sent in the same millisecond in different rooms
+    /// would have no order at all, and the feed would shuffle them on every redraw.
+    key: MessageKey,
 
     /// The room the message lives in.
     room_id: OwnedRoomId,
@@ -160,111 +147,83 @@ impl ActivityItem {
     }
 }
 
-/// One room or thread with unread messages, and the context that places them.
-struct Run {
-    /// The context messages, oldest first, followed by the unread ones.
+/// What one room or thread has waiting in it.
+struct Unread {
+    /// Its unread messages, as rows.
     rows: Vec<ActivityItem>,
 
-    /// When the newest message in the run was sent, which is what orders the runs.
-    newest: MessageKey,
-
-    /// Whether the run may reach further back than the client has loaded.
+    /// Whether it may reach further back than the client has loaded.
     cut_short: bool,
 }
 
-/// Every unread message worth a row, newest run first, and what the feed could not reach.
+/// Every unread message worth a row, newest first, and what the feed could not reach.
 pub fn rows(store: &mut ProgramStore) -> (Vec<ActivityItem>, Reach) {
-    let context = store.application.settings.tunables.unread_context_messages;
     let user_id = store.application.settings.profile.user_id.clone();
 
-    let mut runs = unread_entries(store)
+    let unread = unread_entries(store)
         .into_iter()
-        .filter_map(|(room_id, thread)| run(&room_id, thread, &user_id, context, store))
+        .filter_map(|(room_id, thread)| unread_in(&room_id, thread, &user_id, store))
         .collect::<Vec<_>>();
 
-    order_runs(&mut runs);
+    let entries_cut_short = unread.iter().filter(|unread| unread.cut_short).count();
+    let mut rows = unread.into_iter().flat_map(|unread| unread.rows).collect::<Vec<_>>();
 
-    let entries_cut_short = runs.iter().filter(|run| run.cut_short).count();
-    let mut rows = Vec::new();
-    let mut rows_left_out = false;
+    newest_first(&mut rows);
 
-    for run in runs {
-        if rows.len() + run.rows.len() > MAX_ROWS {
-            rows_left_out = true;
-            break;
-        }
-
-        rows.extend(run.rows);
-    }
+    // Everything past the cap is older than everything kept, because the sort ran first.
+    let rows_left_out = rows.len() > MAX_ROWS;
+    rows.truncate(MAX_ROWS);
 
     (rows, Reach { entries_cut_short, rows_left_out })
 }
 
-/// Put the runs in the order the feed shows them: the one with the newest message first.
-///
-/// A run is kept whole rather than having its messages sorted in among another run's. Newest-first
-/// still puts the newest traffic at the top of the window, which is what the user is looking for,
-/// and a conversation stays readable on the way down.
-fn order_runs(runs: &mut [Run]) {
-    runs.sort_by(|a, b| b.newest.cmp(&a.newest));
+/// Put the messages in the order the feed shows them: the newest one first.
+fn newest_first(rows: &mut [ActivityItem]) {
+    rows.sort_by(|a, b| b.key.cmp(&a.key));
 }
 
-/// The run for one room or thread, if it still has an unread message worth showing.
-fn run(
+/// The unread messages in one room or thread, oldest first.
+fn unread_in(
     room_id: &OwnedRoomId,
     thread: Option<OwnedEventId>,
     user_id: &UserId,
-    context: usize,
     store: &mut ProgramStore,
-) -> Option<Run> {
+) -> Option<Unread> {
     let title = store.application.get_room_title(room_id);
     let info = store.application.rooms.get(room_id)?;
     let first_unread = info.first_unread(thread.as_deref(), user_id)?;
     let messages = info.get_thread(thread.as_deref())?;
 
-    let row = |key: &MessageKey, msg: &Message, unread: bool| {
-        Some(ActivityItem {
-            room: title.clone(),
-            sender: sender_name(info, msg),
-            timestamp: timestamp(key),
-            body: msg.event.body().to_string(),
-            unread,
-            room_id: room_id.clone(),
-            thread: thread.clone(),
-            event_id: msg.event.event_id()?.to_owned(),
+    let rows = messages
+        .range(first_unread.clone()..)
+        .filter(|(_, msg)| is_worth_a_row(msg) && msg.sender != user_id)
+        .filter_map(|(key, msg)| {
+            Some(ActivityItem {
+                room: title.clone(),
+                sender: sender_name(info, msg),
+                timestamp: timestamp(key),
+                body: msg.event.body().to_string(),
+                key: key.clone(),
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                event_id: msg.event.event_id()?.to_owned(),
+            })
         })
-    };
-
-    let incoming = || {
-        messages
-            .range(first_unread.clone()..)
-            .filter(|(_, msg)| is_worth_a_row(msg) && msg.sender != user_id)
-    };
-
-    // A run with nothing incoming left in it -- every unread message is one the user sent
-    // themselves -- has nothing to put in a feed of incoming messages.
-    let newest = incoming().next_back().map(|(key, _)| key.clone())?;
-
-    let unread = incoming().filter_map(|(key, msg)| row(key, msg, true)).collect::<Vec<_>>();
-
-    let mut rows = messages
-        .range(..first_unread.clone())
-        .rev()
-        .filter(|(_, msg)| is_worth_a_row(msg))
-        .filter_map(|(key, msg)| row(key, msg, false))
-        .take(context)
         .collect::<Vec<_>>();
 
-    rows.reverse();
-    rows.extend(unread);
+    // Everything unread here is the user's own, so there is nothing incoming to put in a feed of
+    // incoming messages.
+    if rows.is_empty() {
+        return None;
+    }
 
-    // A run that starts at the oldest message the client holds has nothing above it to show, and
-    // there is more to fetch, so the messages it cannot reach are real.
+    // A run of unread messages that starts at the oldest message the client holds has nothing
+    // above it to show, and there is more to fetch, so the messages it cannot reach are real.
     let oldest_loaded = messages.first_key_value().map(|(key, _)| key == &first_unread);
     let cut_short =
         oldest_loaded.unwrap_or(false) && !matches!(info.fetch_id, RoomFetchStatus::Done);
 
-    Some(Run { rows, newest, cut_short })
+    Some(Unread { rows, cut_short })
 }
 
 /// Whether a message belongs in a feed of what people said.
@@ -346,8 +305,8 @@ fn column_widths(viewport: &ViewportContext<ListCursor>) -> (usize, usize) {
         return (ROOM_COLUMN_WIDTH, SENDER_COLUMN_WIDTH);
     }
 
-    // The mark and each of the four columns are followed by a space.
-    let fixed = UNREAD_MARK.len() + TIME_COLUMN_WIDTH + MIN_BODY_COLUMN_WIDTH + 5;
+    // Each of the four columns is followed by a space.
+    let fixed = TIME_COLUMN_WIDTH + MIN_BODY_COLUMN_WIDTH + 4;
     let labels = available.saturating_sub(fixed);
     let wanted = ROOM_COLUMN_WIDTH + SENDER_COLUMN_WIDTH;
 
@@ -368,38 +327,20 @@ impl ListItem<IambInfo> for ActivityItem {
         viewport: &ViewportContext<ListCursor>,
         _: &mut ProgramStore,
     ) -> Text<'_> {
-        let mut style = if selected {
+        let style = if selected {
             Style::default().add_modifier(StyleModifier::REVERSED)
         } else {
             Style::default()
         };
 
-        // A context row is drawn dim as a whole: it is there to be read past, and nothing on it is
-        // the thing the user came for.
-        if !self.unread {
-            style = style.add_modifier(StyleModifier::DIM);
-        }
-
         let (room_width, sender_width) = column_widths(viewport);
-        let mark = if self.unread {
-            UNREAD_MARK
-        } else {
-            CONTEXT_MARK
-        };
         let room = format!("{} ", fit(&self.room, room_width));
         let sender = format!("{} ", fit(&self.sender, sender_width));
         let when = self.timestamp.format(TIMESTAMP_FORMAT).to_string();
         let when = format!("{} ", fit(&when, TIME_COLUMN_WIDTH));
 
-        let room_style = if self.unread {
-            style.add_modifier(StyleModifier::BOLD)
-        } else {
-            style
-        };
-
         let spans = vec![
-            Span::styled(format!("{mark} "), style),
-            Span::styled(room, room_style),
+            Span::styled(room, style.add_modifier(StyleModifier::BOLD)),
             Span::styled(sender, style),
             Span::styled(when, style.add_modifier(StyleModifier::DIM)),
             Span::styled(self.body.as_str(), style),
@@ -497,16 +438,16 @@ mod tests {
         info.set_receipt(ReceiptThread::Main, user_id, event_ids[index].clone());
     }
 
-    /// The run for the test room, as the feed builds it.
-    fn feed(store: &mut ProgramStore, context: usize) -> Option<Run> {
+    /// What the test room has waiting, as the feed reads it.
+    fn waiting(store: &mut ProgramStore) -> Option<Unread> {
         let user_id = store.application.settings.profile.user_id.clone();
 
-        run(&TEST_ROOM1_ID.clone(), None, &user_id, context, store)
+        unread_in(&TEST_ROOM1_ID.clone(), None, &user_id, store)
     }
 
-    /// Every row in the run, as "body" and whether it is unread.
-    fn rows_of(run: &Run) -> Vec<(&str, bool)> {
-        run.rows.iter().map(|row| (row.body.as_str(), row.unread)).collect()
+    /// The bodies of some rows, in the order they are in.
+    fn bodies(rows: &[ActivityItem]) -> Vec<&str> {
+        rows.iter().map(|row| row.body.as_str()).collect()
     }
 
     /// Somebody other than the user, so that their messages are incoming traffic.
@@ -520,38 +461,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_feed_shows_what_is_unread_under_the_messages_that_place_it() {
+    async fn test_a_room_offers_everything_past_the_read_receipt() {
         let (mut store, event_ids) = store_with(vec![stranger(); 5]).await;
         read_through(&mut store, &event_ids, 2);
 
-        let run = feed(&mut store, 2).expect("the room has unread messages");
+        let unread = waiting(&mut store).expect("the room has unread messages");
 
-        // The context comes first and in the order it was sent, so the run reads downwards like
-        // the conversation it is.
-        assert_eq!(rows_of(&run), vec![("2", false), ("3", false), ("4", true), ("5", true),]);
+        assert_eq!(bodies(&unread.rows), vec!["4", "5"]);
     }
 
-    #[tokio::test]
-    async fn test_the_context_is_as_long_as_the_setting_says() {
-        let (mut store, event_ids) = store_with(vec![stranger(); 5]).await;
-        read_through(&mut store, &event_ids, 3);
+    /// The whole point of the window: the newest message is the first row, whichever room it is
+    /// in, so the feed reads as a stream of what has come in.
+    #[test]
+    fn test_the_newest_message_comes_first_whatever_room_it_is_in() {
+        let rows = vec![
+            row_at(1, "ops", "older"),
+            row_at(9, "general", "newest"),
+            row_at(5, "ops", "middle"),
+        ];
+        let mut rows = rows;
 
-        let none = feed(&mut store, 0).expect("the room has unread messages");
-        assert_eq!(rows_of(&none), vec![("5", true)]);
+        newest_first(&mut rows);
 
-        // The context is the three messages before the first unread one, which is "5".
-        let long = feed(&mut store, 3).expect("the room has unread messages");
-        assert_eq!(rows_of(&long), vec![("2", false), ("3", false), ("4", false), ("5", true),]);
+        assert_eq!(bodies(&rows), vec!["newest", "middle", "older"]);
     }
 
-    #[tokio::test]
-    async fn test_the_context_can_only_be_as_long_as_the_room_is() {
-        let (mut store, event_ids) = store_with(vec![stranger(); 3]).await;
-        read_through(&mut store, &event_ids, 1);
+    /// Two messages sent in the same millisecond still have an order, and it is the same one on
+    /// every redraw.
+    #[test]
+    fn test_messages_sent_in_the_same_millisecond_keep_a_stable_order() {
+        let first = row_at(7, "ops", "one");
+        let second = row_at(7, "general", "two");
 
-        let run = feed(&mut store, 10).expect("the room has unread messages");
+        let mut one_way = vec![first.clone(), second.clone()];
+        let mut other_way = vec![second, first];
 
-        assert_eq!(rows_of(&run), vec![("1", false), ("2", false), ("3", true)]);
+        newest_first(&mut one_way);
+        newest_first(&mut other_way);
+
+        assert_eq!(bodies(&one_way), bodies(&other_way));
+    }
+
+    /// A row built by hand, sent `millis` since the epoch.
+    fn row_at(millis: u64, room: &str, body: &str) -> ActivityItem {
+        let event_id = EventId::new_v1(server_name!("example.com"));
+
+        ActivityItem {
+            room: room.to_string(),
+            sender: "somebody".to_string(),
+            timestamp: Default::default(),
+            body: body.to_string(),
+            key: key_at(millis, event_id.clone()),
+            room_id: TEST_ROOM1_ID.clone(),
+            thread: None,
+            event_id,
+        }
     }
 
     /// The feed is for incoming traffic, and the user's own message is not that.
@@ -560,63 +524,44 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(), own(), stranger()]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let run = feed(&mut store, 0).expect("somebody else's message is still unread");
+        let unread = waiting(&mut store).expect("somebody else's message is still unread");
 
-        assert_eq!(rows_of(&run), vec![("3", true)]);
+        assert_eq!(bodies(&unread.rows), vec!["3"]);
     }
 
     /// A room whose only unread messages are the user's own has nothing to say here.
     #[tokio::test]
-    async fn test_a_room_the_user_last_spoke_in_has_no_run() {
+    async fn test_a_room_the_user_last_spoke_in_offers_nothing() {
         let (mut store, event_ids) = store_with(vec![stranger(), own()]).await;
         read_through(&mut store, &event_ids, 0);
 
-        assert!(feed(&mut store, 2).is_none());
+        assert!(waiting(&mut store).is_none());
     }
 
     #[tokio::test]
-    async fn test_a_read_room_has_no_run() {
+    async fn test_a_read_room_offers_nothing() {
         let (mut store, event_ids) = store_with(vec![stranger(); 3]).await;
         read_through(&mut store, &event_ids, 2);
 
-        assert!(feed(&mut store, 2).is_none());
+        assert!(waiting(&mut store).is_none());
     }
 
-    /// The run starts at the oldest message the client holds and there is more to fetch, so there
-    /// may be unread messages the feed cannot show. The title has to say so.
+    /// The unread messages start at the oldest message the client holds and there is more to
+    /// fetch, so there may be unread messages the feed cannot show. The title has to say so.
     #[tokio::test]
-    async fn test_a_run_that_reaches_the_end_of_what_is_loaded_is_cut_short() {
+    async fn test_a_room_that_reaches_the_end_of_what_is_loaded_is_cut_short() {
         let (mut store, _) = store_with(vec![stranger(); 3]).await;
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.fetch_id = RoomFetchStatus::HaveMore("more".into());
 
-        let run = feed(&mut store, 2).expect("nothing has been read");
-        assert!(run.cut_short);
+        let unread = waiting(&mut store).expect("nothing has been read");
+        assert!(unread.cut_short);
 
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.fetch_id = RoomFetchStatus::Done;
 
-        let run = feed(&mut store, 2).expect("nothing has been read");
-        assert!(!run.cut_short, "a room loaded to its start is not cut short");
-    }
-
-    #[tokio::test]
-    async fn test_the_run_with_the_newest_message_comes_first() {
-        let (mut store, event_ids) = store_with(vec![stranger(); 3]).await;
-        read_through(&mut store, &event_ids, 0);
-
-        let oldest = feed(&mut store, 0).expect("the room has unread messages");
-        let newest = Run {
-            rows: vec![],
-            newest: key_at(9_000, EventId::new_v1(server_name!("example.com"))),
-            cut_short: false,
-        };
-        let expected = vec![newest.newest.clone(), oldest.newest.clone()];
-
-        let mut runs = vec![oldest, newest];
-        order_runs(&mut runs);
-
-        assert_eq!(runs.iter().map(|run| run.newest.clone()).collect::<Vec<_>>(), expected);
+        let unread = waiting(&mut store).expect("nothing has been read");
+        assert!(!unread.cut_short, "a room loaded to its start is not cut short");
     }
 
     #[tokio::test]
@@ -624,8 +569,8 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let run = feed(&mut store, 0).expect("the room has unread messages");
-        let row = &run.rows[0];
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        let row = &unread.rows[0];
 
         assert!(row.matches("2"), "the body is matched");
         assert!(row.matches(&stranger().localpart().to_lowercase()), "the sender is matched");
@@ -638,8 +583,8 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let run = feed(&mut store, 0).expect("the room has unread messages");
-        let row = &run.rows[0];
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        let row = &unread.rows[0];
 
         assert_eq!(row.jump().event_id, event_ids[1]);
         assert_eq!(row.read_at(), (TEST_ROOM1_ID.clone(), event_ids[1].clone()));

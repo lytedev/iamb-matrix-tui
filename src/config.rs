@@ -1009,8 +1009,6 @@ pub struct TunableValues {
     pub read_receipt_send: bool,
     /// The duration `:snooze` uses when given no argument.
     pub snooze_default: String,
-    /// How many messages `:activity` draws in front of a run of unread ones, to place them.
-    pub unread_context_messages: usize,
     /// The local hour that `:snooze tomorrow` resolves to.
     pub snooze_tomorrow_hour: u32,
     pub read_receipt_trigger: ReadReceiptTrigger,
@@ -1078,7 +1076,6 @@ pub struct Tunables {
     pub reaction_shortcode_display: Option<bool>,
     pub read_receipt_send: Option<bool>,
     pub snooze_default: Option<String>,
-    pub unread_context_messages: Option<usize>,
     pub snooze_tomorrow_hour: Option<u32>,
     pub read_receipt_trigger: Option<ReadReceiptTrigger>,
     pub read_receipt_display: Option<bool>,
@@ -1135,7 +1132,6 @@ impl Tunables {
                 .or(other.reaction_shortcode_display),
             read_receipt_send: self.read_receipt_send.or(other.read_receipt_send),
             snooze_default: self.snooze_default.or(other.snooze_default),
-            unread_context_messages: self.unread_context_messages.or(other.unread_context_messages),
             snooze_tomorrow_hour: self.snooze_tomorrow_hour.or(other.snooze_tomorrow_hour),
             read_receipt_trigger: self.read_receipt_trigger.or(other.read_receipt_trigger),
             read_receipt_display: self.read_receipt_display.or(other.read_receipt_display),
@@ -1192,9 +1188,6 @@ impl Tunables {
             // An hour is long enough to clear a distraction and short enough that a forgotten
             // snooze surfaces the same day.
             snooze_default: self.snooze_default.unwrap_or_else(|| "1h".into()),
-            // Two messages is enough to tell whether an unread reply is answering something, and
-            // little enough that the unread messages still outnumber the context in the feed.
-            unread_context_messages: self.unread_context_messages.unwrap_or(2),
             // The start of a working day, so that "tomorrow" means "when I next sit down".
             snooze_tomorrow_hour: self.snooze_tomorrow_hour.unwrap_or(9).min(23),
             read_receipt_trigger: self.read_receipt_trigger.unwrap_or_default(),

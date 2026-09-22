@@ -320,13 +320,9 @@ entry is left out until it wakes.
 .It Sy ":activity" , Sy ":unreadswithcontext"
 Read every unread message across every room and followed thread, one row per
 message, without opening any of them.
-Rows are grouped by the room or thread they are in, and those groups are ordered
-by their newest message, so the newest traffic is at the top and a conversation
-stays readable on the way down.
-Each group begins with the
-.Sy unread_context_messages
-messages that came before its unread ones, drawn dim.
-Messages you sent yourself are not listed, though they do appear as context.
+Rows are sorted by when they were sent, newest first, with no regard for which
+room they are in: the window is a stream of what has come in.
+Messages you sent yourself are not listed.
 .Pp
 Typing narrows the rows by body, sender or room.
 .Sy <Enter>
@@ -338,8 +334,8 @@ A deferred room or thread is left out, the same as in the other unread windows.
 .Pp
 The rows come from the scrollback this client has loaded, so a room with more
 unread messages than that reaches further back than the window can see.
-The title says how many rooms are in that position, and whether whole groups
-were left out because there were more rows than the window draws.
+The title says how many rooms are in that position, and whether older messages
+were left out because there were more of them than the window draws.
 .It Sy ":unreads"
 View a list of unread rooms.
 .It Sy ":unreads clear"
