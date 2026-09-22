@@ -324,6 +324,18 @@ Rows are sorted by when they were sent, newest first, with no regard for which
 room they are in: the window is a stream of what has come in.
 Messages you sent yourself are not listed.
 .Pp
+Senders are named the way they are everywhere else, by
+.Sy username_display
+and any
+.Sy [settings.users]
+override.
+A room is only asked for its member list when you open it, so the window looks
+up the senders it draws, one at a time, in the client's own state store first,
+which already holds a name for most of them, and holds it across restarts.
+Only a room it can name nobody in is asked for its full member list.
+Each sender is looked up once per session, so a name that cannot be found stays
+a user ID until the next start.
+.Pp
 Typing narrows the rows by body, sender or room.
 .Sy <Enter>
 opens the message where it lives and selects it there, and

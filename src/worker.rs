@@ -349,6 +349,7 @@ async fn flush_snoozes(client: &Client, store: &AsyncProgramStore) {
 enum Plan {
     Messages(OwnedRoomId, Option<String>, Vec<MessageNeed>),
     Members(OwnedRoomId),
+    SenderNames(OwnedRoomId, Vec<OwnedUserId>),
 }
 
 async fn load_plans(store: &AsyncProgramStore) -> Vec<Plan> {
@@ -376,6 +377,9 @@ async fn load_plans(store: &AsyncProgramStore) -> Vec<Plan> {
         if need.members {
             plan.push(Plan::Members(room_id.to_owned()));
         }
+        if let Some(senders) = need.senders {
+            plan.push(Plan::SenderNames(room_id.to_owned(), senders));
+        }
     }
 
     return plan;
@@ -400,6 +404,12 @@ async fn run_plan(client: &Client, store: &AsyncProgramStore, plan: Plan, permit
             let res = members_load(client, &room_id).await;
             let mut locked = store.lock().await;
             members_insert(room_id, res, locked.deref_mut());
+        },
+        Plan::SenderNames(room_id, senders) => {
+            let found = sender_names_load(client, &room_id, &senders).await;
+            let mut locked = store.lock().await;
+
+            sender_names_insert(&room_id, found, locked.deref_mut());
         },
     }
     drop(permit);
@@ -537,6 +547,77 @@ async fn load_older(client: &Client, store: &AsyncProgramStore) -> usize {
         .collect::<FuturesUnordered<_>>()
         .count()
         .await
+}
+
+/// The name each of `senders` goes by in a room, as far as the client's own state store knows.
+///
+/// This asks the store and never the homeserver. Servers lazy-load members, but they send the
+/// member event of whoever sent a message along with the message, so the store usually already
+/// holds a name for the very users a message list needs one for -- and it holds them across
+/// restarts, since the state store is on disk.
+///
+/// A user the store has never heard of comes back as `None`, which is what sends the room to
+/// [members_load] for the full list.
+async fn sender_names_load(
+    client: &Client,
+    room_id: &RoomId,
+    senders: &[OwnedUserId],
+) -> Vec<(OwnedUserId, Option<String>)> {
+    let Some(room) = client.get_room(room_id) else {
+        return vec![];
+    };
+
+    let mut found = Vec::with_capacity(senders.len());
+
+    for user_id in senders {
+        let name = match room.get_member_no_sync(user_id).await {
+            Ok(Some(member)) => member.display_name().map(ToOwned::to_owned),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    room_id = room_id.as_str(),
+                    err = e.to_string(),
+                    "Failed to read a sender's name from the store"
+                );
+                None
+            },
+        };
+
+        found.push((user_id.to_owned(), name));
+    }
+
+    found
+}
+
+/// Record the names that came back, and ask for the member list if the store knew none of them.
+///
+/// Every user asked about is marked as sought, found or not, so that a window rebuilding itself
+/// on every draw asks once rather than forever. The full member list is a last resort: it is one
+/// request per room and can be thousands of members long, so it is only worth it for a room whose
+/// senders the store cannot name at all.
+fn sender_names_insert(
+    room_id: &RoomId,
+    found: Vec<(OwnedUserId, Option<String>)>,
+    store: &mut ProgramStore,
+) {
+    if found.is_empty() {
+        return;
+    }
+
+    let nothing_known = found.iter().all(|(_, name)| name.is_none());
+    let info = store.application.rooms.get_or_default(room_id.to_owned());
+
+    for (user_id, name) in found {
+        info.display_names_sought.insert(user_id.clone());
+
+        if name.is_some() {
+            info.display_names.set(user_id, name);
+        }
+    }
+
+    if nothing_known {
+        store.application.need_load.need_members(room_id.to_owned());
+    }
 }
 
 async fn members_load(client: &Client, room_id: &RoomId) -> IambResult<Vec<RoomMember>> {
@@ -1928,5 +2009,77 @@ impl ClientWorker {
         if let Some(room) = self.client.get_room(room_id.as_ref()) {
             let _ = room.typing_notice(true).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::base::Need;
+    use crate::tests::{TEST_ROOM1_ID, TEST_USER1, TEST_USER2, mock_store};
+
+    #[tokio::test]
+    async fn test_a_name_the_store_knew_is_kept() {
+        let mut store = mock_store().await;
+        let found = vec![(TEST_USER1.clone(), Some("Ada Lovelace".to_string()))];
+
+        sender_names_insert(&TEST_ROOM1_ID, found, &mut store);
+
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        assert_eq!(info.display_names.get(&TEST_USER1).unwrap().as_ref(), "Ada Lovelace");
+        assert!(info.display_names_sought.contains(&*TEST_USER1));
+    }
+
+    /// Somebody the store cannot name has still been looked for, and saying so is what stops the
+    /// window asking about them on every draw for the rest of the session.
+    #[tokio::test]
+    async fn test_a_name_the_store_did_not_know_is_not_asked_for_again() {
+        let mut store = mock_store().await;
+        let found = vec![
+            (TEST_USER1.clone(), Some("Ada Lovelace".to_string())),
+            (TEST_USER2.clone(), None),
+        ];
+
+        sender_names_insert(&TEST_ROOM1_ID, found, &mut store);
+
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        assert!(info.display_names.get(&TEST_USER2).is_none());
+        assert!(info.display_names_sought.contains(&*TEST_USER2));
+    }
+
+    /// One user the store could name is enough to say the room's members are loaded well enough,
+    /// and the full member list is a request worth avoiding.
+    #[tokio::test]
+    async fn test_a_room_the_store_can_name_somebody_in_is_left_alone() {
+        let mut store = mock_store().await;
+        let found = vec![
+            (TEST_USER1.clone(), Some("Ada Lovelace".to_string())),
+            (TEST_USER2.clone(), None),
+        ];
+
+        sender_names_insert(&TEST_ROOM1_ID, found, &mut store);
+
+        assert_eq!(store.application.need_load.rooms(), 0);
+    }
+
+    /// A room whose senders the store cannot name at all is one whose members were never synced,
+    /// and the member list is the only thing left that can name them.
+    #[tokio::test]
+    async fn test_a_room_the_store_can_name_nobody_in_asks_for_its_members() {
+        let mut store = mock_store().await;
+        let found = vec![(TEST_USER1.clone(), None), (TEST_USER2.clone(), None)];
+
+        sender_names_insert(&TEST_ROOM1_ID, found, &mut store);
+
+        let needs = std::mem::take(&mut store.application.need_load)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(needs, vec![(TEST_ROOM1_ID.clone(), Need {
+            members: true,
+            messages: None,
+            senders: None,
+        })]);
     }
 }

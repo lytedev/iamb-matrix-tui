@@ -36,7 +36,9 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, UserId};
+use std::collections::HashMap;
+
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
 
 use modalkit::{
     actions::{PromptAction, Promptable},
@@ -47,6 +49,7 @@ use modalkit::{
 use modalkit_ratatui::list::{ListCursor, ListItem};
 
 use crate::base::{
+    ChatStore,
     IambBufferId,
     IambInfo,
     MessageJump,
@@ -55,8 +58,8 @@ use crate::base::{
     ProgramStore,
     Reach,
     RoomFetchStatus,
-    RoomInfo,
 };
+use crate::config::UserDisplayStyle;
 use crate::message::{Message, MessageEvent, MessageKey};
 use crate::util::fit;
 use crate::windows::filtered::{FilteredItem, FilteredListState};
@@ -102,6 +105,9 @@ pub struct ActivityItem {
 
     /// Who sent it, by display name where one is known.
     sender: String,
+
+    /// Who sent it.
+    sender_id: OwnedUserId,
 
     /// When it was sent, in the user's own time zone.
     timestamp: DateTime<LocalTz>,
@@ -174,7 +180,46 @@ pub fn rows(store: &mut ProgramStore) -> (Vec<ActivityItem>, Reach) {
     let rows_left_out = rows.len() > MAX_ROWS;
     rows.truncate(MAX_ROWS);
 
+    seek_missing_names(&rows, store);
+
     (rows, Reach { entries_cut_short, rows_left_out })
+}
+
+/// Ask for the name of anybody on screen the client cannot name yet.
+///
+/// The feed lists rooms the user has never opened, and a room is only asked for its member list
+/// when it is opened, so without this the feed draws a user ID for everybody in those rooms and
+/// goes on doing so however long it is left open.
+///
+/// Only the senders actually on a row are asked about, which bounds this by what fits in the
+/// window rather than by how many people are in the rooms. Each one is asked about once: the
+/// worker records every user it looked for, found or not, and this skips them from then on.
+fn seek_missing_names(rows: &[ActivityItem], store: &mut ProgramStore) {
+    // Nothing to look up when the setting draws user IDs anyway.
+    if !matches!(
+        store.application.settings.tunables.username_display,
+        UserDisplayStyle::DisplayName
+    ) {
+        return;
+    }
+
+    let mut wanted: HashMap<OwnedRoomId, Vec<OwnedUserId>> = HashMap::new();
+
+    for row in rows {
+        let info = store.application.rooms.get_or_default(row.room_id.clone());
+
+        if info.display_names.get(&row.sender_id).is_some() ||
+            !info.display_names_sought.insert(row.sender_id.clone())
+        {
+            continue;
+        }
+
+        wanted.entry(row.room_id.clone()).or_default().push(row.sender_id.clone());
+    }
+
+    for (room_id, senders) in wanted {
+        store.application.need_load.need_sender_names(room_id, senders);
+    }
 }
 
 /// Put the messages in the order the feed shows them: the newest one first.
@@ -190,7 +235,8 @@ fn unread_in(
     store: &mut ProgramStore,
 ) -> Option<Unread> {
     let title = store.application.get_room_title(room_id);
-    let info = store.application.rooms.get(room_id)?;
+    let ChatStore { rooms, settings, .. } = &mut store.application;
+    let info = rooms.get(room_id)?;
     let first_unread = info.first_unread(thread.as_deref(), user_id)?;
     let messages = info.get_thread(thread.as_deref())?;
 
@@ -200,7 +246,8 @@ fn unread_in(
         .filter_map(|(key, msg)| {
             Some(ActivityItem {
                 room: title.clone(),
-                sender: sender_name(info, msg),
+                sender: settings.get_user_name(&msg.sender, info).to_string(),
+                sender_id: msg.sender.clone(),
                 timestamp: timestamp(key),
                 body: msg.event.body().to_string(),
                 key: key.clone(),
@@ -232,14 +279,6 @@ fn unread_in(
 /// redacted message no longer says anything.
 fn is_worth_a_row(msg: &Message) -> bool {
     msg.event.event_id().is_some() && !matches!(msg.event, MessageEvent::State(_))
-}
-
-/// Who sent a message, by the name they go by in the room it was sent in.
-fn sender_name(info: &RoomInfo, msg: &Message) -> String {
-    info.display_names
-        .get(&msg.sender)
-        .map(|name| name.to_string())
-        .unwrap_or_else(|| msg.sender.to_string())
 }
 
 /// When a message was sent, in the user's own time zone.
@@ -396,8 +435,16 @@ mod tests {
         user_id,
     };
 
-    use crate::base::{EventLocation, RoomFetchStatus};
-    use crate::tests::{TEST_ROOM1_ID, TEST_USER1, key_at, mock_room1_message, mock_store};
+    use crate::base::{EventLocation, Need, RoomFetchStatus};
+    use crate::config::UserDisplayStyle;
+    use crate::tests::{
+        TEST_ROOM1_ID,
+        TEST_USER1,
+        TEST_USER5,
+        key_at,
+        mock_room1_message,
+        mock_store,
+    };
 
     /// A room holding `senders`, one message each, in the order given, with nothing read yet.
     ///
@@ -509,6 +556,7 @@ mod tests {
         ActivityItem {
             room: room.to_string(),
             sender: "somebody".to_string(),
+            sender_id: TEST_USER1.clone(),
             timestamp: Default::default(),
             body: body.to_string(),
             key: key_at(millis, event_id.clone()),
@@ -562,6 +610,112 @@ mod tests {
 
         let unread = waiting(&mut store).expect("nothing has been read");
         assert!(!unread.cut_short, "a room loaded to its start is not cut short");
+    }
+
+    /// The feed names people the way the rest of the client does, rather than working it out for
+    /// itself: `username_display` and a `[settings.users]` override both decide what it draws.
+    #[tokio::test]
+    async fn test_a_sender_is_named_the_way_the_settings_say() {
+        let (mut store, event_ids) = store_with(vec![stranger(), TEST_USER5.clone()]).await;
+        read_through(&mut store, &event_ids, 0);
+
+        // mock_settings displays usernames, and overrides this one user's name.
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        assert_eq!(unread.rows[0].sender, "USER 5");
+
+        store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        info.display_names.set(TEST_USER5.clone(), Some("Ada Lovelace".into()));
+
+        // The override still wins over the display name, as it does in a room.
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        assert_eq!(unread.rows[0].sender, "USER 5");
+    }
+
+    /// A room whose members have not been loaded has no display names to draw, and the user ID is
+    /// what is left to tell people apart.
+    #[tokio::test]
+    async fn test_a_sender_with_no_display_name_yet_is_named_by_their_user_id() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 0);
+        store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
+
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        assert_eq!(unread.rows[0].sender, stranger().as_str());
+
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        info.display_names.set(stranger(), Some("Ada Lovelace".into()));
+
+        // Loading the members is what resolves it, and the feed picks that up on its next build.
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        assert_eq!(unread.rows[0].sender, "Ada Lovelace");
+    }
+
+    /// Every sender the feed draws as a user ID is one it wants a name for.
+    #[tokio::test]
+    async fn test_a_sender_without_a_name_is_asked_about() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 0);
+        store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
+
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        seek_missing_names(&unread.rows, &mut store);
+
+        let needs = std::mem::take(&mut store.application.need_load)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(needs, vec![(TEST_ROOM1_ID.clone(), Need {
+            members: false,
+            messages: None,
+            senders: Some(vec![stranger()]),
+        })]);
+    }
+
+    /// The feed rebuilds on every draw, so asking has to be a once-only thing or the same missing
+    /// name is asked for forever.
+    #[tokio::test]
+    async fn test_a_sender_is_only_asked_about_once() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 0);
+        store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
+
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        seek_missing_names(&unread.rows, &mut store);
+        let _ = std::mem::take(&mut store.application.need_load);
+
+        // A second build of the same rows, as the next draw would do.
+        seek_missing_names(&unread.rows, &mut store);
+
+        assert_eq!(store.application.need_load.rooms(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_sender_who_already_has_a_name_is_not_asked_about() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 0);
+        store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
+
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+        info.display_names.set(stranger(), Some("Ada Lovelace".into()));
+
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        seek_missing_names(&unread.rows, &mut store);
+
+        assert_eq!(store.application.need_load.rooms(), 0);
+    }
+
+    /// Nothing is worth asking for when the setting draws user IDs anyway.
+    #[tokio::test]
+    async fn test_nobody_is_asked_about_when_user_ids_are_what_is_drawn() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 0);
+
+        // mock_settings displays usernames.
+        let unread = waiting(&mut store).expect("the room has unread messages");
+        seek_missing_names(&unread.rows, &mut store);
+
+        assert_eq!(store.application.need_load.rooms(), 0);
     }
 
     #[tokio::test]

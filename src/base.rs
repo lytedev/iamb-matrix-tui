@@ -1397,6 +1397,13 @@ pub struct RoomInfo {
     /// The display names for users in this room.
     pub display_names: DisplayNameStore,
 
+    /// The users whose name this client has already gone looking for in this room.
+    ///
+    /// A name that was looked for and not found has to be remembered as well as one that was
+    /// found, or a window that rebuilds itself on every draw asks for the same missing name
+    /// forever. Somebody who has set no display name at all is the common case of that.
+    pub display_names_sought: HashSet<OwnedUserId>,
+
     /// The last time the room was rendered, used to detect if it is currently open.
     pub draw_last: Option<Instant>,
 }
@@ -1419,6 +1426,7 @@ impl Default for RoomInfo {
             fetch_last: Default::default(),
             users_typing: Default::default(),
             display_names: Default::default(),
+            display_names_sought: Default::default(),
             draw_last: Default::default(),
             unloaded_edits: Default::default(),
         }
@@ -2447,6 +2455,14 @@ pub struct MessageNeed {
 pub struct Need {
     pub members: bool,
     pub messages: Option<Vec<MessageNeed>>,
+
+    /// The users whose name is wanted, without the whole member list being wanted.
+    ///
+    /// A window that lists messages from rooms the user has never opened needs a name for each
+    /// sender and nothing else. Asking the homeserver for every member of every such room to get
+    /// them would be hundreds of requests for lists thousands long, so these are looked up one at
+    /// a time in the client's own state store first.
+    pub senders: Option<Vec<OwnedUserId>>,
 }
 
 /// Things that need loading for different rooms.
@@ -2472,6 +2488,16 @@ impl RoomNeeds {
         let messages = &mut self.needs.entry(room_id).or_default().messages.get_or_insert_default();
 
         messages.push(MessageNeed { event_id, ttl: MESSAGE_NEED_TTL });
+    }
+
+    /// Mark a room for needing the names of the given users.
+    pub fn need_sender_names(&mut self, room_id: OwnedRoomId, senders: Vec<OwnedUserId>) {
+        self.needs
+            .entry(room_id)
+            .or_default()
+            .senders
+            .get_or_insert_default()
+            .extend(senders);
     }
 
     pub fn need_messages_all(&mut self, room_id: OwnedRoomId, message_needs: Vec<MessageNeed>) {
@@ -4378,7 +4404,11 @@ pub mod tests {
 
         assert_eq!(need_load.into_iter().collect::<Vec<(OwnedRoomId, Need)>>(), vec![(
             room_id,
-            Need { members: true, messages: Some(Vec::new()) }
+            Need {
+                members: true,
+                messages: Some(Vec::new()),
+                senders: None
+            }
         )],);
     }
 
