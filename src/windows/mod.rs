@@ -1590,24 +1590,59 @@ impl Window<IambInfo> for IambWindow {
     }
 }
 
-/// Every room and followed thread with unread traffic in it, as the inbox windows see them.
+/// Every room and thread with unread traffic in it, for `:activity` to read messages out of.
 ///
-/// This is what `:activity` walks to find messages. It goes through the same entries the inbox
-/// windows list, so a room the inbox hides -- a snoozed one -- has no messages in the feed either,
-/// and the two cannot disagree about what is waiting.
+/// Rooms come from the same entries the inbox windows list, so a room a snooze hides from the
+/// inbox has nothing in the feed either and the two cannot disagree about what is waiting.
+///
+/// Threads do not: every thread with something unread in it is here, not only the ones the user
+/// follows. A followed thread is the right set for `:threads`, which answers "what am I part of",
+/// but a feed of everything going on cannot leave out a conversation because the user has never
+/// spoken in it. A room's own unread state is worked out from its main scrollback, which a
+/// threaded reply never lands in, so there is no room entry standing in for those replies either.
 pub(crate) fn unread_entries(store: &mut ProgramStore) -> Vec<(OwnedRoomId, Option<OwnedEventId>)> {
-    let chats = chat_items(store)
+    let mut entries = chat_items(store)
         .into_iter()
         .filter(|item| item.is_unread() && !item.is_deferred())
         .map(|item| (item.room_id().to_owned(), None))
         .collect::<Vec<_>>();
 
-    let threads = followed_thread_items(store)
-        .into_iter()
-        .filter(|item| item.is_unread() && !item.is_deferred())
-        .map(|item| (item.room_id().to_owned(), Some(item.thread_root.clone())));
+    entries.extend(unread_threads(store));
 
-    chats.into_iter().chain(threads).collect()
+    entries
+}
+
+/// Every thread with something unread in it, whether or not the user follows it.
+fn unread_threads(store: &mut ProgramStore) -> Vec<(OwnedRoomId, Option<OwnedEventId>)> {
+    let sync_info = &store.application.sync_info;
+    let room_ids = sync_info
+        .rooms
+        .iter()
+        .chain(sync_info.dms.iter())
+        .map(|room_info| room_info.deref().0.room_id().to_owned())
+        .collect::<Vec<_>>();
+
+    let now = store.application.now_ms();
+    let ChatStore { rooms, settings, snooze, .. } = &mut store.application;
+
+    room_ids
+        .into_iter()
+        .flat_map(|room_id| {
+            let info = rooms.get_or_default(room_id.clone());
+            let roots = info.thread_roots().cloned().collect::<Vec<_>>();
+
+            roots
+                .into_iter()
+                .filter(|root| info.thread_unreads(root, settings).is_unread())
+                .filter(|root| {
+                    let wake_at = snooze.wake_at(&room_id, Some(root));
+
+                    wake_at.is_none_or(|wake_at| wake_at <= now)
+                })
+                .map(|root| (room_id.clone(), Some(root)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Gather the threads the user follows across every joined room and DM.

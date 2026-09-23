@@ -75,13 +75,15 @@ const ROOM_COLUMN_WIDTH: usize = 20;
 const SENDER_COLUMN_WIDTH: usize = 16;
 
 /// The width the timestamp column is drawn at, which is exactly what [TIMESTAMP_FORMAT] produces.
-const TIME_COLUMN_WIDTH: usize = 11;
+const TIME_COLUMN_WIDTH: usize = 16;
 
 /// How a row's timestamp is drawn.
 ///
-/// Everything here is unread, so it is recent, and the day and time of day are what place it. A
-/// full date would cost four columns that the body wants more.
-const TIMESTAMP_FORMAT: &str = "%a %H:%M";
+/// The full date, because unread is not the same as recent: a room can go unread for weeks, and a
+/// weekday and a time of day cannot tell this Tuesday from one three weeks ago. Rows in date order
+/// then read as though they were in no order at all, which is worse than the four columns the
+/// date costs.
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 /// The narrowest the body column is worth drawing at.
 const MIN_BODY_COLUMN_WIDTH: usize = 16;
@@ -92,10 +94,13 @@ const MIN_LABEL_COLUMN_WIDTH: usize = 8;
 /// The most rows the feed draws.
 ///
 /// The list is rebuilt on every draw, so its size is paid for again on every keystroke and every
-/// message that arrives. An account that has gone unread for a month would otherwise rebuild many
-/// thousands of rows to show the twenty that fit on screen. The newest messages are kept, since
-/// those are the ones being read.
-const MAX_ROWS: usize = 500;
+/// message that arrives, and an account that has gone unread for a month can hold far more unread
+/// messages than anybody will scroll through. The newest are kept, since those are the ones being
+/// read, and the title says when older ones were left out.
+///
+/// Only the messages that survive this are built into rows, so the cap bounds the drawing work
+/// rather than the finding work.
+const MAX_ROWS: usize = 2000;
 
 /// One unread message in the feed.
 #[derive(Clone)]
@@ -114,12 +119,6 @@ pub struct ActivityItem {
 
     /// What it said.
     body: String,
-
-    /// Where the message sits in its room, which is what orders the feed.
-    ///
-    /// The timestamp alone cannot: two messages sent in the same millisecond in different rooms
-    /// would have no order at all, and the feed would shuffle them on every redraw.
-    key: MessageKey,
 
     /// The room the message lives in.
     room_id: OwnedRoomId,
@@ -153,10 +152,22 @@ impl ActivityItem {
     }
 }
 
+/// One unread message, before there is any reason to build a row out of it.
+///
+/// The feed can hold far more unread messages than it will ever draw, and finding which ones are
+/// newest costs nothing but their keys. Bodies, names and titles are built only for the messages
+/// that survive [MAX_ROWS], so a backlog of thousands costs a sort rather than thousands of rows.
+#[derive(Clone)]
+struct UnreadMessage {
+    room_id: OwnedRoomId,
+    thread: Option<OwnedEventId>,
+    key: MessageKey,
+}
+
 /// What one room or thread has waiting in it.
 struct Unread {
-    /// Its unread messages, as rows.
-    rows: Vec<ActivityItem>,
+    /// Its unread messages.
+    messages: Vec<UnreadMessage>,
 
     /// Whether it may reach further back than the client has loaded.
     cut_short: bool,
@@ -172,17 +183,111 @@ pub fn rows(store: &mut ProgramStore) -> (Vec<ActivityItem>, Reach) {
         .collect::<Vec<_>>();
 
     let entries_cut_short = unread.iter().filter(|unread| unread.cut_short).count();
-    let mut rows = unread.into_iter().flat_map(|unread| unread.rows).collect::<Vec<_>>();
+    let mut messages = unread.into_iter().flat_map(|unread| unread.messages).collect::<Vec<_>>();
 
-    newest_first(&mut rows);
+    newest_first(&mut messages);
 
     // Everything past the cap is older than everything kept, because the sort ran first.
-    let rows_left_out = rows.len() > MAX_ROWS;
-    rows.truncate(MAX_ROWS);
+    let rows_left_out = messages.len() > MAX_ROWS;
+    messages.truncate(MAX_ROWS);
+
+    let rows = rows_for(messages, store);
 
     seek_missing_names(&rows, store);
 
     (rows, Reach { entries_cut_short, rows_left_out })
+}
+
+/// Put the messages in the order the feed shows them: the newest one first.
+fn newest_first(messages: &mut [UnreadMessage]) {
+    messages.sort_by(|a, b| b.key.cmp(&a.key));
+}
+
+/// Build the row for each message, in the order they were given.
+fn rows_for(messages: Vec<UnreadMessage>, store: &mut ProgramStore) -> Vec<ActivityItem> {
+    let mut titles = HashMap::new();
+
+    for message in &messages {
+        titles
+            .entry(message.room_id.clone())
+            .or_insert_with(|| store.application.get_room_title(&message.room_id));
+    }
+
+    let ChatStore { rooms, settings, .. } = &store.application;
+
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let info = rooms.get(&message.room_id)?;
+            let msg = info.get_thread(message.thread.as_deref())?.get(&message.key)?;
+
+            Some(ActivityItem {
+                room: titles.get(&message.room_id)?.clone(),
+                sender: settings.get_user_name(&msg.sender, info).to_string(),
+                sender_id: msg.sender.clone(),
+                timestamp: timestamp(&message.key),
+                body: msg.event.body().to_string(),
+                room_id: message.room_id.clone(),
+                thread: message.thread.clone(),
+                event_id: msg.event.event_id()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The unread messages in one room or thread, oldest first.
+fn unread_in(
+    room_id: &OwnedRoomId,
+    thread: Option<OwnedEventId>,
+    user_id: &UserId,
+    store: &mut ProgramStore,
+) -> Option<Unread> {
+    let info = store.application.rooms.get(room_id)?;
+    let first_unread = info.first_unread(thread.as_deref(), user_id)?;
+    let messages = info.get_thread(thread.as_deref())?;
+
+    let unread = messages
+        .range(first_unread.clone()..)
+        .filter(|(_, msg)| is_worth_a_row(msg) && msg.sender != user_id)
+        .map(|(key, _)| {
+            UnreadMessage {
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                key: key.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Everything unread here is the user's own, so there is nothing incoming to put in a feed of
+    // incoming messages.
+    if unread.is_empty() {
+        return None;
+    }
+
+    // A run of unread messages that starts at the oldest message the client holds has nothing
+    // above it to show, and there is more to fetch, so the messages it cannot reach are real.
+    let oldest_loaded = messages.first_key_value().map(|(key, _)| key == &first_unread);
+    let cut_short =
+        oldest_loaded.unwrap_or(false) && !matches!(info.fetch_id, RoomFetchStatus::Done);
+
+    Some(Unread { messages: unread, cut_short })
+}
+
+/// Whether a message belongs in a feed of what people said.
+///
+/// A state event is something that happened to a room rather than something somebody said, and a
+/// redacted message no longer says anything.
+fn is_worth_a_row(msg: &Message) -> bool {
+    msg.event.event_id().is_some() && !matches!(msg.event, MessageEvent::State(_))
+}
+
+/// When a message was sent, in the user's own time zone.
+fn timestamp(key: &MessageKey) -> DateTime<LocalTz> {
+    key.ts
+        .0
+        .to_system_time()
+        .map(DateTime::<LocalTz>::from)
+        .unwrap_or_default()
 }
 
 /// Ask for the name of anybody on screen the client cannot name yet.
@@ -220,74 +325,6 @@ fn seek_missing_names(rows: &[ActivityItem], store: &mut ProgramStore) {
     for (room_id, senders) in wanted {
         store.application.need_load.need_sender_names(room_id, senders);
     }
-}
-
-/// Put the messages in the order the feed shows them: the newest one first.
-fn newest_first(rows: &mut [ActivityItem]) {
-    rows.sort_by(|a, b| b.key.cmp(&a.key));
-}
-
-/// The unread messages in one room or thread, oldest first.
-fn unread_in(
-    room_id: &OwnedRoomId,
-    thread: Option<OwnedEventId>,
-    user_id: &UserId,
-    store: &mut ProgramStore,
-) -> Option<Unread> {
-    let title = store.application.get_room_title(room_id);
-    let ChatStore { rooms, settings, .. } = &mut store.application;
-    let info = rooms.get(room_id)?;
-    let first_unread = info.first_unread(thread.as_deref(), user_id)?;
-    let messages = info.get_thread(thread.as_deref())?;
-
-    let rows = messages
-        .range(first_unread.clone()..)
-        .filter(|(_, msg)| is_worth_a_row(msg) && msg.sender != user_id)
-        .filter_map(|(key, msg)| {
-            Some(ActivityItem {
-                room: title.clone(),
-                sender: settings.get_user_name(&msg.sender, info).to_string(),
-                sender_id: msg.sender.clone(),
-                timestamp: timestamp(key),
-                body: msg.event.body().to_string(),
-                key: key.clone(),
-                room_id: room_id.clone(),
-                thread: thread.clone(),
-                event_id: msg.event.event_id()?.to_owned(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Everything unread here is the user's own, so there is nothing incoming to put in a feed of
-    // incoming messages.
-    if rows.is_empty() {
-        return None;
-    }
-
-    // A run of unread messages that starts at the oldest message the client holds has nothing
-    // above it to show, and there is more to fetch, so the messages it cannot reach are real.
-    let oldest_loaded = messages.first_key_value().map(|(key, _)| key == &first_unread);
-    let cut_short =
-        oldest_loaded.unwrap_or(false) && !matches!(info.fetch_id, RoomFetchStatus::Done);
-
-    Some(Unread { rows, cut_short })
-}
-
-/// Whether a message belongs in a feed of what people said.
-///
-/// A state event is something that happened to a room rather than something somebody said, and a
-/// redacted message no longer says anything.
-fn is_worth_a_row(msg: &Message) -> bool {
-    msg.event.event_id().is_some() && !matches!(msg.event, MessageEvent::State(_))
-}
-
-/// When a message was sent, in the user's own time zone.
-fn timestamp(key: &MessageKey) -> DateTime<LocalTz> {
-    key.ts
-        .0
-        .to_system_time()
-        .map(DateTime::<LocalTz>::from)
-        .unwrap_or_default()
 }
 
 impl Display for ActivityItem {
@@ -462,39 +499,75 @@ mod tests {
 
         let mut event_ids = Vec::new();
 
-        for (i, sender) in senders.into_iter().enumerate() {
+        for (position, sender) in senders.into_iter().enumerate() {
             let event_id = EventId::new_v1(server_name!("example.com"));
-            let key = key_at(i as u64 + 1, event_id.clone());
-            let content = RoomMessageEventContent::text_plain((i + 1).to_string());
-            let msg = mock_room1_message(content, sender, key.clone());
+            let key = key_at(position as u64 + 1, event_id.clone());
+            let content = RoomMessageEventContent::text_plain((position + 1).to_string());
+            let message = mock_room1_message(content, sender, key.clone());
 
             info.keys
                 .insert(event_id.clone(), EventLocation::Message(None, key.clone()));
-            info.get_thread_mut(None).insert(key, msg);
+            info.get_thread_mut(None).insert(key, message);
             event_ids.push(event_id);
         }
 
         (store, event_ids)
     }
 
-    /// Read the room up to and including the message at `index`.
-    fn read_through(store: &mut ProgramStore, event_ids: &[OwnedEventId], index: usize) {
+    /// Add a reply to the thread rooted at `root`, sent by somebody other than the user.
+    fn reply_in_thread(
+        store: &mut ProgramStore,
+        root: &EventId,
+        body: &str,
+        millis: u64,
+    ) -> OwnedEventId {
+        let event_id = EventId::new_v1(server_name!("example.com"));
+        let key = key_at(millis, event_id.clone());
+        let content = RoomMessageEventContent::text_plain(body);
+        let message = mock_room1_message(content, stranger(), key.clone());
+        let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
+
+        info.keys
+            .insert(event_id.clone(), EventLocation::Message(Some(root.to_owned()), key.clone()));
+        info.get_thread_mut(Some(root.to_owned())).insert(key, message);
+
+        event_id
+    }
+
+    /// Read the room up to and including the message at `position`.
+    fn read_through(store: &mut ProgramStore, event_ids: &[OwnedEventId], position: usize) {
         let user_id = store.application.settings.profile.user_id.clone();
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
 
-        info.set_receipt(ReceiptThread::Main, user_id, event_ids[index].clone());
+        info.set_receipt(ReceiptThread::Main, user_id, event_ids[position].clone());
     }
 
-    /// What the test room has waiting, as the feed reads it.
+    /// What the test room's main scrollback has waiting, as the feed reads it.
     fn waiting(store: &mut ProgramStore) -> Option<Unread> {
         let user_id = store.application.settings.profile.user_id.clone();
 
         unread_in(&TEST_ROOM1_ID.clone(), None, &user_id, store)
     }
 
+    /// What the test room's main scrollback has waiting, drawn as rows.
+    fn waiting_rows(store: &mut ProgramStore) -> Vec<ActivityItem> {
+        let unread = waiting(store).expect("the test room has unread messages to draw");
+
+        rows_for(unread.messages, store)
+    }
+
     /// The bodies of some rows, in the order they are in.
     fn bodies(rows: &[ActivityItem]) -> Vec<&str> {
         rows.iter().map(|row| row.body.as_str()).collect()
+    }
+
+    /// An unread message sent `millis` since the epoch, with nothing else about it that matters.
+    fn unread_at(millis: u64) -> UnreadMessage {
+        UnreadMessage {
+            room_id: TEST_ROOM1_ID.clone(),
+            thread: None,
+            key: key_at(millis, EventId::new_v1(server_name!("example.com"))),
+        }
     }
 
     /// Somebody other than the user, so that their messages are incoming traffic.
@@ -512,33 +585,44 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 5]).await;
         read_through(&mut store, &event_ids, 2);
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
+        let rows = waiting_rows(&mut store);
+        let drawn = bodies(&rows);
 
-        assert_eq!(bodies(&unread.rows), vec!["4", "5"]);
+        assert_eq!(
+            drawn,
+            vec!["4", "5"],
+            "the receipt sits on the third of five messages, so the fourth and fifth are what is \
+             left unread, but the feed offered {drawn:?}"
+        );
     }
 
     /// The whole point of the window: the newest message is the first row, whichever room it is
     /// in, so the feed reads as a stream of what has come in.
     #[test]
     fn test_the_newest_message_comes_first_whatever_room_it_is_in() {
-        let rows = vec![
-            row_at(1, "ops", "older"),
-            row_at(9, "general", "newest"),
-            row_at(5, "ops", "middle"),
-        ];
-        let mut rows = rows;
+        let mut messages = vec![unread_at(1), unread_at(9), unread_at(5)];
 
-        newest_first(&mut rows);
+        newest_first(&mut messages);
 
-        assert_eq!(bodies(&rows), vec!["newest", "middle", "older"]);
+        let order = messages
+            .iter()
+            .map(|message| u64::from(message.key.ts.0.0))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            vec![9, 5, 1],
+            "messages must be ordered by when they were sent, newest first, but they came out in \
+             the order {order:?}"
+        );
     }
 
     /// Two messages sent in the same millisecond still have an order, and it is the same one on
-    /// every redraw.
+    /// every redraw, because the sort falls through to the event ID rather than giving up.
     #[test]
     fn test_messages_sent_in_the_same_millisecond_keep_a_stable_order() {
-        let first = row_at(7, "ops", "one");
-        let second = row_at(7, "general", "two");
+        let first = unread_at(7);
+        let second = unread_at(7);
 
         let mut one_way = vec![first.clone(), second.clone()];
         let mut other_way = vec![second, first];
@@ -546,24 +630,37 @@ mod tests {
         newest_first(&mut one_way);
         newest_first(&mut other_way);
 
-        assert_eq!(bodies(&one_way), bodies(&other_way));
+        let one_way = one_way.iter().map(|message| message.key.clone()).collect::<Vec<_>>();
+        let other_way = other_way.iter().map(|message| message.key.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            one_way, other_way,
+            "two messages sharing a timestamp must sort the same way whichever order they arrive \
+             in, or the feed shuffles them on every redraw"
+        );
     }
 
-    /// A row built by hand, sent `millis` since the epoch.
-    fn row_at(millis: u64, room: &str, body: &str) -> ActivityItem {
-        let event_id = EventId::new_v1(server_name!("example.com"));
+    /// A thread the user has never posted in is still somewhere unread messages can be, and a
+    /// feed of everything going on cannot leave it out.
+    #[tokio::test]
+    async fn test_a_thread_the_user_never_posted_in_offers_its_replies() {
+        let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
+        read_through(&mut store, &event_ids, 1);
+        reply_in_thread(&mut store, &event_ids[0], "in the thread", 20);
 
-        ActivityItem {
-            room: room.to_string(),
-            sender: "somebody".to_string(),
-            sender_id: TEST_USER1.clone(),
-            timestamp: Default::default(),
-            body: body.to_string(),
-            key: key_at(millis, event_id.clone()),
-            room_id: TEST_ROOM1_ID.clone(),
-            thread: None,
-            event_id,
-        }
+        let user_id = store.application.settings.profile.user_id.clone();
+        let root = event_ids[0].clone();
+        let unread = unread_in(&TEST_ROOM1_ID.clone(), Some(root), &user_id, &mut store)
+            .expect("the thread has an unread reply");
+        let rows = rows_for(unread.messages, &mut store);
+        let drawn = bodies(&rows);
+
+        assert_eq!(
+            drawn,
+            vec!["in the thread"],
+            "the reply is unread and was not sent by the user, so it belongs in the feed whether \
+             or not the user follows the thread, but the feed offered {drawn:?}"
+        );
     }
 
     /// The feed is for incoming traffic, and the user's own message is not that.
@@ -572,9 +669,15 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(), own(), stranger()]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let unread = waiting(&mut store).expect("somebody else's message is still unread");
+        let rows = waiting_rows(&mut store);
+        let drawn = bodies(&rows);
 
-        assert_eq!(bodies(&unread.rows), vec!["3"]);
+        assert_eq!(
+            drawn,
+            vec!["3"],
+            "the second message is the user's own, so only the third is incoming traffic, but the \
+             feed offered {drawn:?}"
+        );
     }
 
     /// A room whose only unread messages are the user's own has nothing to say here.
@@ -583,7 +686,11 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(), own()]).await;
         read_through(&mut store, &event_ids, 0);
 
-        assert!(waiting(&mut store).is_none());
+        assert!(
+            waiting(&mut store).is_none(),
+            "everything past the receipt is the user's own message, so the room has no incoming \
+             traffic and must not appear in the feed at all"
+        );
     }
 
     #[tokio::test]
@@ -591,7 +698,11 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 3]).await;
         read_through(&mut store, &event_ids, 2);
 
-        assert!(waiting(&mut store).is_none());
+        assert!(
+            waiting(&mut store).is_none(),
+            "the receipt sits on the last message, so nothing is unread and the room must not be \
+             in the feed"
+        );
     }
 
     /// The unread messages start at the oldest message the client holds and there is more to
@@ -602,14 +713,22 @@ mod tests {
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.fetch_id = RoomFetchStatus::HaveMore("more".into());
 
-        let unread = waiting(&mut store).expect("nothing has been read");
-        assert!(unread.cut_short);
+        let unread = waiting(&mut store).expect("nothing has been read, so everything is unread");
+        assert!(
+            unread.cut_short,
+            "the oldest unread message is the oldest message loaded and the room has more history \
+             to fetch, so the feed cannot claim to be showing all of it"
+        );
 
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.fetch_id = RoomFetchStatus::Done;
 
-        let unread = waiting(&mut store).expect("nothing has been read");
-        assert!(!unread.cut_short, "a room loaded to its start is not cut short");
+        let unread = waiting(&mut store).expect("nothing has been read, so everything is unread");
+        assert!(
+            !unread.cut_short,
+            "the room is loaded back to its very first message, so there is nothing out of reach \
+             and nothing to warn about"
+        );
     }
 
     /// The feed names people the way the rest of the client does, rather than working it out for
@@ -619,17 +738,23 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(), TEST_USER5.clone()]).await;
         read_through(&mut store, &event_ids, 0);
 
-        // mock_settings displays usernames, and overrides this one user's name.
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        assert_eq!(unread.rows[0].sender, "USER 5");
+        let drawn = waiting_rows(&mut store)[0].sender.clone();
+        assert_eq!(
+            drawn, "USER 5",
+            "the settings override this user's name, so the feed must draw the override rather \
+             than their user ID, but it drew {drawn:?}"
+        );
 
         store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.display_names.set(TEST_USER5.clone(), Some("Ada Lovelace".into()));
 
-        // The override still wins over the display name, as it does in a room.
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        assert_eq!(unread.rows[0].sender, "USER 5");
+        let drawn = waiting_rows(&mut store)[0].sender.clone();
+        assert_eq!(
+            drawn, "USER 5",
+            "an override beats a display name in a room, and the feed must not disagree with the \
+             room, but it drew {drawn:?}"
+        );
     }
 
     /// A room whose members have not been loaded has no display names to draw, and the user ID is
@@ -640,15 +765,23 @@ mod tests {
         read_through(&mut store, &event_ids, 0);
         store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        assert_eq!(unread.rows[0].sender, stranger().as_str());
+        let drawn = waiting_rows(&mut store)[0].sender.clone();
+        assert_eq!(
+            drawn,
+            stranger().as_str(),
+            "nothing knows this user's display name yet, so the user ID is all the feed can draw, \
+             but it drew {drawn:?}"
+        );
 
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.display_names.set(stranger(), Some("Ada Lovelace".into()));
 
-        // Loading the members is what resolves it, and the feed picks that up on its next build.
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        assert_eq!(unread.rows[0].sender, "Ada Lovelace");
+        let drawn = waiting_rows(&mut store)[0].sender.clone();
+        assert_eq!(
+            drawn, "Ada Lovelace",
+            "loading the members is what resolves a name, and the feed rebuilds on every draw, so \
+             the very next build must use it, but it drew {drawn:?}"
+        );
     }
 
     /// Every sender the feed draws as a user ID is one it wants a name for.
@@ -658,18 +791,23 @@ mod tests {
         read_through(&mut store, &event_ids, 0);
         store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        seek_missing_names(&unread.rows, &mut store);
+        let rows = waiting_rows(&mut store);
+        seek_missing_names(&rows, &mut store);
 
         let needs = std::mem::take(&mut store.application.need_load)
             .into_iter()
             .collect::<Vec<_>>();
 
-        assert_eq!(needs, vec![(TEST_ROOM1_ID.clone(), Need {
-            members: false,
-            messages: None,
-            senders: Some(vec![stranger()]),
-        })]);
+        assert_eq!(
+            needs,
+            vec![(TEST_ROOM1_ID.clone(), Need {
+                members: false,
+                messages: None,
+                senders: Some(vec![stranger()]),
+            })],
+            "the feed drew a user ID for this sender, so it must ask for their name, and for \
+             their name alone rather than the room's whole member list, but it asked for {needs:?}"
+        );
     }
 
     /// The feed rebuilds on every draw, so asking has to be a once-only thing or the same missing
@@ -680,14 +818,18 @@ mod tests {
         read_through(&mut store, &event_ids, 0);
         store.application.settings.tunables.username_display = UserDisplayStyle::DisplayName;
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        seek_missing_names(&unread.rows, &mut store);
+        let rows = waiting_rows(&mut store);
+        seek_missing_names(&rows, &mut store);
         let _ = std::mem::take(&mut store.application.need_load);
 
-        // A second build of the same rows, as the next draw would do.
-        seek_missing_names(&unread.rows, &mut store);
+        seek_missing_names(&rows, &mut store);
 
-        assert_eq!(store.application.need_load.rooms(), 0);
+        let asked_again = store.application.need_load.rooms();
+        assert_eq!(
+            asked_again, 0,
+            "the name was already asked for once, so the next draw must ask for nothing, but it \
+             asked about {asked_again} room(s)"
+        );
     }
 
     #[tokio::test]
@@ -699,10 +841,15 @@ mod tests {
         let info = store.application.rooms.get_or_default(TEST_ROOM1_ID.clone());
         info.display_names.set(stranger(), Some("Ada Lovelace".into()));
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        seek_missing_names(&unread.rows, &mut store);
+        let rows = waiting_rows(&mut store);
+        seek_missing_names(&rows, &mut store);
 
-        assert_eq!(store.application.need_load.rooms(), 0);
+        let asked = store.application.need_load.rooms();
+        assert_eq!(
+            asked, 0,
+            "this sender already has a name to draw, so nothing needs looking up, but the feed \
+             asked about {asked} room(s)"
+        );
     }
 
     /// Nothing is worth asking for when the setting draws user IDs anyway.
@@ -711,11 +858,15 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
         read_through(&mut store, &event_ids, 0);
 
-        // mock_settings displays usernames.
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        seek_missing_names(&unread.rows, &mut store);
+        let rows = waiting_rows(&mut store);
+        seek_missing_names(&rows, &mut store);
 
-        assert_eq!(store.application.need_load.rooms(), 0);
+        let asked = store.application.need_load.rooms();
+        assert_eq!(
+            asked, 0,
+            "the settings draw user IDs, so a display name would never be shown even if it were \
+             fetched, but the feed asked about {asked} room(s)"
+        );
     }
 
     #[tokio::test]
@@ -723,13 +874,22 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        let row = &unread.rows[0];
+        let rows = waiting_rows(&mut store);
+        let row = &rows[0];
 
-        assert!(row.matches("2"), "the body is matched");
-        assert!(row.matches(&stranger().localpart().to_lowercase()), "the sender is matched");
-        assert!(row.matches("watercooler"), "the room is matched");
-        assert!(!row.matches("zzzzzz"));
+        assert!(row.matches("2"), "the body is matched, and this row's body is \"2\"");
+        assert!(
+            row.matches(&stranger().localpart().to_lowercase()),
+            "the sender is matched, so that the feed can be narrowed to one person"
+        );
+        assert!(
+            row.matches("watercooler"),
+            "the room name is matched, so that the feed can be narrowed to one room"
+        );
+        assert!(
+            !row.matches("zzzzzz"),
+            "text that appears in no column must match nothing, or the filter narrows nothing"
+        );
     }
 
     #[tokio::test]
@@ -737,10 +897,18 @@ mod tests {
         let (mut store, event_ids) = store_with(vec![stranger(); 2]).await;
         read_through(&mut store, &event_ids, 0);
 
-        let unread = waiting(&mut store).expect("the room has unread messages");
-        let row = &unread.rows[0];
+        let rows = waiting_rows(&mut store);
+        let row = &rows[0];
 
-        assert_eq!(row.jump().event_id, event_ids[1]);
-        assert_eq!(row.read_at(), (TEST_ROOM1_ID.clone(), event_ids[1].clone()));
+        assert_eq!(
+            row.jump().event_id,
+            event_ids[1],
+            "taking a row must go to the message the row is drawn from"
+        );
+        assert_eq!(
+            row.read_at(),
+            (TEST_ROOM1_ID.clone(), event_ids[1].clone()),
+            "reading a row must move the receipt to the message the row is drawn from"
+        );
     }
 }

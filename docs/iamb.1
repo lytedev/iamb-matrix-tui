@@ -322,6 +322,9 @@ Read every unread message across every room and followed thread, one row per
 message, without opening any of them.
 Rows are sorted by when they were sent, newest first, with no regard for which
 room they are in: the window is a stream of what has come in.
+Every thread with something unread in it is here too, whether or not you follow
+it, since a room's own unread state comes from its main scrollback and cannot
+stand in for a thread's.
 Messages you sent yourself are not listed.
 .Pp
 Senders are named the way they are everywhere else, by
